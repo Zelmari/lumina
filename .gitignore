@@ -1,0 +1,192 @@
+# Lumina — SwiftPM packages, Xcode .app, signing, Homebrew ship.
+# Public product docs live in docs/. Spec/design drafts stay local.
+
+# --- Local product-contract drafts ---
+/SPEC_LUMINA.md
+/DESIGN_DOC_LUMINA.md
+/SPEC*.md
+/DESIGN*.md
+*.draft.md
+/drafts/
+/scratch/
+.scratch/
+
+# --- macOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+.localized
+._*
+*.icloud
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.com.apple.timemachine.supported
+.PKInstallSandboxManager
+.PKInstallSandboxManager-SystemSoftware
+.hotfiles.btree
+.vol
+.file
+.disk_label*
+lost+found
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+__MACOSX/
+
+# --- VS Code ---
+.vscode/
+.history/
+*.vsix
+.ionide/
+*.code-workspace
+
+# --- Vim / Neovim ---
+[._]*.s[a-v][a-z]
+!*.svg
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+[._]*.un~
+tags
+.exrc
+.nvimrc
+.nvim.lua
+.nvim/
+.neoconf.json
+.luarc.json
+.lazy.lua
+
+# --- Nix / NixOS / direnv / devenv ---
+result
+result-*
+repl-result*
+.direnv/
+**/.nixos-test-history
+.devenv/
+.devenv.flake.nix
+devenv.local.nix
+
+# --- Other editors / local tooling ---
+*~
+*.swp
+*.swo
+*.orig
+.idea/
+*.iml
+.mise.local.toml
+
+# --- Swift Package Manager ---
+# Package.swift and Package.resolved are source — keep them.
+.build/
+.swiftpm/
+/Packages
+Package.pins
+.netrc
+
+# --- Xcode ---
+# Lumina.xcodeproj / .xcworkspace are source; userdata is not.
+xcuserdata/
+DerivedData/
+.index-build/
+SourcePackages/
+ModuleCache.noindex/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.xcresult
+*.xcarchive
+timeline.xctimeline
+playground.xcworkspace
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+# --- Tests / coverage ---
+*.profraw
+*.profdata
+coverage/
+*.lcov
+lcov.info
+TestResults/
+fastlane/test_output
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+
+# --- Built app / ship artifacts ---
+*.app
+*.appex
+*.dmg
+*.pkg
+/*.zip
+/dist/
+/artifacts/
+/release-build/
+/build/
+/Build/
+.xcode-build/
+*.bottle.tar.gz
+*.bottle.json
+*.doccarchive
+
+# --- Signing / notarization / secrets ---
+# Entitlements and Info.plist are source — do not ignore those.
+*.p12
+*.p8
+*.cer
+*.certSigningRequest
+*.mobileprovision
+*.provisionprofile
+*.key
+*.pem
+*.keychain
+*.keychain-db
+AuthKey_*.p8
+.env
+.env.*
+!.env.example
+Secrets/
+secrets/
+private/
+*.notary.log
+notary-log.json
+
+# --- Runtime leftovers dropped in the tree ---
+# Live paths are ~/.config/lumina, Application Support/Lumina, $TMPDIR/lumina-$UID
+/lumina.toml
+/session.json
+/instances.json
+*.sock
+*.log
+*.crash
+*.ips
+core
+core.*
+*.core
+
+# --- Local overrides ---
+*.local.toml
+*.local.json
+*.local.sh
+*.local.swift
