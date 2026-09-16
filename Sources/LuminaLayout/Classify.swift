@@ -1,0 +1,188 @@
+import Foundation
+
+public struct WindowRule: Equatable, Sendable, Codable {
+    public var appId: String
+    public var titleRegex: String?
+    public var action: WindowRuleAction
+    public var titleRegexError: String?
+
+    public init(appId: String, titleRegex: String? = nil, action: WindowRuleAction, titleRegexError: String? = nil) {
+        self.appId = appId
+        self.titleRegex = titleRegex
+        self.action = action
+        self.titleRegexError = titleRegexError
+    }
+
+    public func matches(bundleId: String?, title: String?) -> Bool {
+        guard let bundleId, bundleId == appId else { return false }
+        guard let pattern = titleRegex, !pattern.isEmpty else { return true }
+        guard let title else { return false }
+        return title.range(of: pattern, options: .regularExpression) != nil
+    }
+}
+
+public enum WindowRuleAction: String, Equatable, Sendable, Codable {
+    case tile
+    case float
+    case ignore
+}
+
+public struct ClassifyInput: Equatable, Sendable {
+    public var bundleId: String?
+    public var title: String?
+    public var role: String?
+    public var subrole: String?
+    public var hasZoomButton: Bool
+    public var width: Double
+    public var height: Double
+    public var isOnScreen: Bool
+    public var pidAlreadyHasOnScreenWindow: Bool
+    public var layerOrIsHUD: Bool
+    public var isPiP: Bool
+    public var isVisualIntelligenceOrSiriHUD: Bool
+    public var centerOnBoundDisplay: Bool
+
+    public init(
+        bundleId: String? = nil,
+        title: String? = nil,
+        role: String? = nil,
+        subrole: String? = nil,
+        hasZoomButton: Bool = true,
+        width: Double = 800,
+        height: Double = 600,
+        isOnScreen: Bool = true,
+        pidAlreadyHasOnScreenWindow: Bool = false,
+        layerOrIsHUD: Bool = false,
+        isPiP: Bool = false,
+        isVisualIntelligenceOrSiriHUD: Bool = false,
+        centerOnBoundDisplay: Bool = true
+    ) {
+        self.bundleId = bundleId
+        self.title = title
+        self.role = role
+        self.subrole = subrole
+        self.hasZoomButton = hasZoomButton
+        self.width = width
+        self.height = height
+        self.isOnScreen = isOnScreen
+        self.pidAlreadyHasOnScreenWindow = pidAlreadyHasOnScreenWindow
+        self.layerOrIsHUD = layerOrIsHUD
+        self.isPiP = isPiP
+        self.isVisualIntelligenceOrSiriHUD = isVisualIntelligenceOrSiriHUD
+        self.centerOnBoundDisplay = centerOnBoundDisplay
+    }
+}
+
+public enum ClassifyResult: Equatable, Sendable {
+    case unmanaged
+    case ignored
+    case floating
+    case tiled
+}
+
+public enum AXRoleName {
+    public static let sheet = "AXSheet"
+    public static let drawer = "AXDrawer"
+    public static let popover = "AXPopover"
+    public static let helpTag = "AXHelpTag"
+    public static let dialog = "AXDialog"
+    public static let systemDialog = "AXSystemDialog"
+    public static let standardWindow = "AXStandardWindow"
+    public static let floatingWindow = "AXFloatingWindow"
+    public static let systemFloatingWindow = "AXSystemFloatingWindow"
+}
+
+public enum Classify {
+    public static let hardFloatBundleIds: Set<String> = [
+        "com.apple.Spotlight",
+        "com.apple.notificationcenterui",
+        "com.apple.controlcenter",
+        "com.apple.loginwindow",
+        "com.apple.ScreenSharing",
+        "com.apple.screencaptureui",
+        "com.apple.UserNotificationCenter",
+    ]
+
+    public static let terminalBundleIds: Set<String> = [
+        "com.apple.Terminal",
+        "com.googlecode.iterm2",
+        "org.alacritty",
+        "com.mitchellh.ghostty",
+        "net.kovidgoyal.kitty",
+        "com.github.wez.wezterm",
+    ]
+
+    public static let hardRoles: Set<String> = [
+        AXRoleName.sheet,
+        AXRoleName.drawer,
+        AXRoleName.popover,
+        AXRoleName.helpTag,
+    ]
+
+    public static let hardSubroles: Set<String> = [
+        AXRoleName.floatingWindow,
+        AXRoleName.systemFloatingWindow,
+    ]
+
+    public static let dialogRoles: Set<String> = [
+        AXRoleName.dialog,
+        AXRoleName.systemDialog,
+    ]
+}
+
+public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyResult {
+    if !input.centerOnBoundDisplay {
+        return .unmanaged
+    }
+    if !input.isOnScreen && input.pidAlreadyHasOnScreenWindow {
+        return .ignored
+    }
+
+    var allowTiled = false
+    for rule in rules {
+        guard rule.matches(bundleId: input.bundleId, title: input.title) else { continue }
+        switch rule.action {
+        case .ignore:
+            return .ignored
+        case .float:
+            return .floating
+        case .tile:
+            allowTiled = true
+        }
+        break
+    }
+
+    if isHardFloat(input) {
+        return .floating
+    }
+
+    if input.role.map(Classify.dialogRoles.contains) == true {
+        if !allowTiled { return .floating }
+        // tile rule may force-tile a dialog-looking standard window
+    }
+
+    if !allowTiled && !isTerminal(input.bundleId) {
+        if !input.hasZoomButton { return .floating }
+        if input.width < 400 || input.height < 300 { return .floating }
+    }
+
+    return .tiled
+}
+
+private func isHardFloat(_ input: ClassifyInput) -> Bool {
+    if let role = input.role, Classify.hardRoles.contains(role) { return true }
+    if let sub = input.subrole, Classify.hardSubroles.contains(sub) { return true }
+    if let bid = input.bundleId, Classify.hardFloatBundleIds.contains(bid) { return true }
+    if input.isPiP || input.layerOrIsHUD || input.isVisualIntelligenceOrSiriHUD { return true }
+    return false
+}
+
+private func isTerminal(_ bundleId: String?) -> Bool {
+    guard let bundleId else { return false }
+    return Classify.terminalBundleIds.contains(bundleId)
+}
+
+/// Center of `rect` inside the bound display's full AX frame (not usable).
+public func centerOnDisplay(rect: Rect, displayFrame: Rect) -> Bool {
+    displayFrame.contains(point: rect.center)
+}
