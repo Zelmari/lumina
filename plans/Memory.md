@@ -4,7 +4,7 @@ Setbacks noticed while implementing v1 on a Linux cloud agent. Keep this short s
 
 ## Toolchain
 
-- The environment had no Swift. `swiftly install 6.3.3` is the floor (`Package.swift` tools version 6.3). Swiftly’s `init` also pulled 6.4 first; pin `--use` on 6.3.3 for CI.
+- Swiftly’s `init --skip-install` plus `install` can still exit 1 on GitHub-hosted Ubuntu because of a post-install `apt-get install libcurl4-openssl-dev` hint. Install the toolchain deps first, pass `--post-install-file`, and run that script with sudo.
 - `Lumina` / `LuminaAgent` / `LuminaCLI` are `#if os(macOS)` targets. Do not expect `swift build --target LuminaAgent` to work on Linux.
 
 ## Swift 6
