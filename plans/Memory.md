@@ -12,6 +12,7 @@ Setbacks noticed while implementing v1 on a Linux cloud agent. Keep this short s
 - `stderr` / `stdout` FILE* are not concurrency-safe. Use `FileHandle.standardError` / `standardOutput` for CLI and log errors.
 - `#expect(c.drain())` cannot call a `mutating` method; drain into a `let` first.
 - `swap(&a, &b)` inside `Session.swap` resolves to the instance method. Use `Swift.swap`.
+- `AXObserverCreate` takes a C callback and cannot capture the watched pid. Read pid with `AXUIElementGetPid`; do not pass `pid_t(0)`.
 
 ## TOML
 

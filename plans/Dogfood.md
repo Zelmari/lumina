@@ -44,7 +44,8 @@ Do not include Intel.
 - Visual Intelligence overlay floats; ⌘⇧Space / ⌘⇧6 not stolen.
 - Swipe away from an empty Lumina space drops hotkeys.
 - Swipe-back onto empty space without SkyLight: extra shows Start; attach if any sliver of that agent is on-screen.
-- First-run sheet lists the three Desktop & Dock tiling toggles verbatim; Accessibility pane opens; extra does **not** prompt AX as itself.
+- First-run sheet lists the three Desktop & Dock tiling toggles verbatim; Accessibility pane opens; extra does **not** prompt AX as itself. Launch-at-login is the extra menu checkbox (default off), not a Yes/No in the sheet.
+- Status-item digits: switch Lumina spaces from the extra **menu** (`Space N`). Clicking a digit in the title string is not hit-tested; Option-number keys still switch.
 - `scripts/bundle.sh` produces a runnable `Lumina.app`; Accessibility list shows **Lumina Agent**; `Contents/MacOS/lumina version` works; `file` is arm64.
 - Two Terminal windows tile 50/50 with outer/inner gaps 8; close one → the other fills usable.
 - `⌥ L` focuses spatially among two tiled windows.
