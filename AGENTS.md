@@ -28,7 +28,7 @@ These rules apply to every `git` and `gh` command. Read this section before the 
 - Subject: imperative, lowercase after the type, no trailing period, ≤72 characters. Match the existing history (`chore: cleanup`, `chore: initial file structure`).
 - Body (when needed): explain **why**, not a file list. Wrap at 72 characters.
 - One logical change per commit. Do not mix unrelated breakpoints in one commit unless the user asked for a single catch-up commit.
-- Never commit secrets, signing identities, `.env`, or `plans/` product drafts (that directory is gitignored on purpose).
+- Never commit secrets, signing identities, or `.env`.
 - Only commit when the user asked, or when the current plan step explicitly requires a commit.
 
 ### Pull requests

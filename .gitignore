@@ -1,5 +1,5 @@
 # Lumina — SwiftPM packages, Xcode .app, signing, Homebrew ship.
-# Public product docs live in docs/. Spec/design drafts stay local.
+# Public product docs live in docs/. Product plans live in plans/.
 
 # --- Local product-contract drafts ---
 /SPEC_LUMINA.md
@@ -10,7 +10,6 @@
 /drafts/
 /scratch/
 .scratch/
-plans/PROMPTS.md
 
 # --- macOS ---
 .DS_Store
@@ -195,4 +194,3 @@ core.*
 skills/
 AGENTS.md
 CLAUDE.md
-plans/
