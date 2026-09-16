@@ -4,32 +4,59 @@ Apple silicon, macOS 15.2 or later. Do not run another tiling WM. Turn Stage Man
 
 ## Homebrew
 
-Not yet. Shipping path is a personal tap after Developer ID + notarization. Official `homebrew/cask` comes later.
+Not yet. Shipping path is a personal tap after Developer ID + notarization. Official `homebrew/cask` comes later (Gatekeeper requires a signed + notarized binary; a quarantine-strip `postflight` will not be accepted).
 
 ## From source
 
-Layout tests (no AppKit):
+Layout and IPC tests (no AppKit; Linux OK):
 
 ```sh
 swift test --filter LuminaLayoutTests
+swift test --filter LuminaIPCTests
 ```
 
-The menu extra and agent are not a SwiftPM `.app`. That bundle will be built with Xcode or a documented bundle script, signed as:
+On an Apple silicon Mac, assemble a debug `.app`:
 
-| Binary | Bundle id |
-|---|---|
-| Menu extra | `com.zelmari.lumina` |
-| Agent | `com.zelmari.lumina.agent` |
-| CLI | `lumina` (socket client only) |
+```sh
+./scripts/bundle.sh
+```
 
-Grant Accessibility to **Lumina Agent**, not the menu extra and not a Homebrew symlink of `lumina`.
+That produces `dist/Lumina.app`:
 
-Launch at login is opt-in (default off) via the menu extra.
+| Binary | Path | Bundle id |
+|---|---|---|
+| Menu extra | `Contents/MacOS/Lumina` | `com.zelmari.lumina` |
+| Agent | `Contents/Helpers/lumina-agent.app` | `com.zelmari.lumina.agent` |
+| CLI | `Contents/MacOS/lumina` | socket client only |
+
+`file` on all three Mach-Os should be arm64, not universal. `Contents/MacOS/lumina version` prints the CLI version.
+
+Grant Accessibility to **Lumina Agent**, not the menu extra and not a Homebrew symlink of `lumina`. Ad-hoc signatures re-prompt Accessibility on every new signature.
+
+Launch at login is opt-in (default off) via the menu extra (`SMAppService.mainApp`). It starts the extra, which does a **fresh** start (one agent, space 1). Do not ship `Contents/Library/LaunchAgents/`.
+
+## Developer ID (not from this script)
+
+Identity placeholders only — do not commit secrets.
+
+```sh
+# Sign nested agent first, then the outer app, then notarize the outer, staple the dmg.
+codesign --force --options runtime --sign "Developer ID Application: <NAME> (<TEAMID>)" \
+  --entitlements Sources/LuminaAgent/LuminaAgent.entitlements \
+  dist/Lumina.app/Contents/Helpers/lumina-agent.app
+codesign --force --options runtime --sign "Developer ID Application: <NAME> (<TEAMID>)" \
+  --entitlements Sources/Lumina/Lumina.entitlements \
+  dist/Lumina.app
+xcrun notarytool submit dist/Lumina.dmg --keychain-profile "<PROFILE>" --wait
+xcrun stapler staple dist/Lumina.dmg
+```
+
+Do not set `com.apple.security.cs.disable-library-validation`. Sandbox stays off.
 
 ## Config
 
-`~/.config/lumina/lumina.toml`. Missing file: Lumina writes defaults on first launch.
+`~/.config/lumina/lumina.toml`. Missing file: Lumina writes a copy of the bundled default on first launch.
 
 ## Uninstall
 
-Quit all. Unregister launch-at-login from the menu extra. Delete `~/.config/lumina/` (optional), `~/Library/Application Support/Lumina/`, `~/Library/Logs/Lumina.log`. Drag `Lumina.app` to Trash. The Accessibility grant for `com.zelmari.lumina.agent` stays in System Settings until you remove it.
+Quit all. Unregister launch-at-login from the menu extra. Delete (optional) `~/.config/lumina/`, then `~/Library/Application Support/Lumina/`, `~/Library/Logs/Lumina.log`, and `$TMPDIR/lumina-$UID`. Drag `Lumina.app` to Trash. The Accessibility grant for `com.zelmari.lumina.agent` stays in System Settings until you remove it.

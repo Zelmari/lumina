@@ -2,22 +2,29 @@
 
 Window / tiling manager for macOS. Spiral tiling (Hyprland dwindle with permanent splits) and emulated spaces, without disabling SIP.
 
-Lumina is a guest on macOS. Quitting it leaves apps open and frames where they are.
+Lumina is a guest on macOS. Quitting it leaves apps open and frames where they are (they may overlap).
 
 ## Requirements
 
 - Apple silicon only (arm64). Intel is not supported.
 - macOS 15.2 or later (including macOS 26 Tahoe and macOS 27 Golden Gate).
-- Accessibility for **Lumina Agent** (`com.zelmari.lumina.agent`), not the menu extra and not a Homebrew symlink.
+- Accessibility for **Lumina Agent** (`com.zelmari.lumina.agent`), not the menu extra and not a Homebrew symlink of `lumina`.
 - Do not run another tiling WM beside it.
-- Stage Manager: unsupported. Turn it off.
+- Stage Manager: unsupported. Turn it off. Layouts may fight; Lumina must not crash.
 - System Settings → Desktop & Dock → Windows: turn **off** “Drag windows to screen edges to tile”, “Drag windows to menu bar to fill screen”, and “Hold Option key while dragging windows to tile”. Lumina does not write those settings.
 
-v1 manages **one display**. Config lives at `~/.config/lumina/lumina.toml`.
+v1 manages **one display**. Config lives at `~/.config/lumina/lumina.toml`. `launch-apps` defaults to empty.
+
+## Known behavior
+
+- Mission Control looks wrong: hidden-space windows are parked as a **1px vertical sliver** in a bottom corner (macOS will not accept a fully off-screen frame). A few pixels remain visible. Dock on the bottom + autohide makes the remnant less obvious.
+- Secure Input (password fields, 1Password, some terminals) makes Option hotkeys go dead. The menu extra shows “hotkeys blocked: Secure Input”; that is not a crash.
+- Reboot is a **fresh start**: one new agent on the current native Space, no restored layout. A second instance on another native Space is session-scoped; Start again after reboot if you want it.
+- Without SkyLight, swipe-back onto an **empty** Lumina space is not auto-detected. Use **Start on this Space** to attach (slivers count). Swipe-away still drops hotkeys.
 
 ## Status
 
-Not packaged yet. Layout engine (`LuminaLayout`) builds with SwiftPM and is unit-tested without AppKit (Linux toolchain is fine). The `.app` (menu extra + nested agent) will be an Xcode / bundle-script product; SwiftPM does not emit a signed two-process app.
+Layout and IPC are unit-tested with SwiftPM (Linux toolchain is fine). The signed two-process `.app` is assembled with `scripts/bundle.sh` on Apple silicon. SwiftPM does not emit that bundle layout by itself.
 
 See [docs/install.md](docs/install.md) and [docs/compat.md](docs/compat.md).
 
