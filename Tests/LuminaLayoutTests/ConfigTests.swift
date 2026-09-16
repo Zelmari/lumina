@@ -17,6 +17,19 @@ struct ConfigTests {
         #expect(config.bindings.contains(where: { $0.chord.keyName == "0" && $0.command == .workspace(10) }))
     }
 
+    @Test func bundledDefaultMatchesResourceFile() throws {
+        let testsDir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let resource = testsDir
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/Lumina/Resources/lumina.toml")
+        let disk = try String(contentsOf: resource, encoding: .utf8)
+        #expect(
+            disk.trimmingCharacters(in: .whitespacesAndNewlines)
+                == Config.bundledDefaultTOML.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
     @Test func rejectsOutOfRange() {
         let zero = parseConfig(text: """
         space-count = 0

@@ -16,7 +16,9 @@ public final class AXObserverHub {
             guard let refcon else { return }
             let hub = Unmanaged<AXObserverHub>.fromOpaque(refcon).takeUnretainedValue()
             let name = notification as String
-            hub.onNotification?(pid_t(0), name, element)
+            var owner: pid_t = 0
+            AXUIElementGetPid(element, &owner)
+            hub.onNotification?(owner, name, element)
         }, &observer)
         guard err == .success, let observer else { return }
         let notifications = [

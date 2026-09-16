@@ -113,14 +113,38 @@ final class ExtraController: NSObject {
     func startOnThisSpace(runLaunchApps: Bool = false) {
         let current = registry.load()
         let live = current.agents.filter { kill($0.pid, 0) == 0 }
-        if let attach = live.first {
-            var next = current
-            next.lastCurrentInstanceId = attach.instanceId
-            registry.save(next)
-            sendTo(instance: attach.instanceId, socket: attach.socket, .status)
-            pollStatus()
-            return
+        let presence: [AgentPresence] = live.map { rec in
+            let status = fetchAgentStatus(socket: rec.socket)
+            return AgentPresence(
+                instanceId: rec.instanceId,
+                isCurrent: status?.isCurrent ?? false,
+                hasOnScreenIncludingSlivers: status?.hasOnScreenIncludingSlivers ?? false
+            )
         }
+        switch startAttachDecision(agents: presence, lastCurrent: current.lastCurrentInstanceId) {
+        case .alreadyCurrent(let id):
+            var next = current
+            next.lastCurrentInstanceId = id
+            registry.save(next)
+            if let rec = live.first(where: { $0.instanceId == id }) {
+                sendTo(instance: rec.instanceId, socket: rec.socket, .markCurrent)
+            }
+            pollStatus()
+        case .attach(let id):
+            var next = current
+            next.lastCurrentInstanceId = id
+            registry.save(next)
+            if let rec = live.first(where: { $0.instanceId == id }) {
+                sendTo(instance: rec.instanceId, socket: rec.socket, .markCurrent)
+            }
+            pollStatus()
+        case .spawn:
+            spawnAgent(runLaunchApps: runLaunchApps || current.agents.isEmpty)
+        }
+    }
+
+    func spawnAgent(runLaunchApps: Bool) {
+        let current = registry.load()
         let id = UUID()
         let socket = LuminaPaths.agentSocketPath(
             uid: uid,
@@ -128,24 +152,54 @@ final class ExtraController: NSObject {
             instanceId: id.uuidString,
             supportFallback: supportRoot
         ).primary
+        let display = currentDisplayUUID()
         guard let pid = spawner.spawn(
             instanceId: id,
             socket: socket,
-            displayUUID: nil,
+            displayUUID: display,
             crashRecover: false,
-            runLaunchApps: runLaunchApps || current.agents.isEmpty
+            runLaunchApps: runLaunchApps
         ) else {
             log.error("spawn failed")
             return
         }
         var next = current
-        next.agents.append(InstanceRecord(instanceId: id, pid: pid, displayUUID: "", socket: socket))
+        next.agents.append(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
         next.lastCurrentInstanceId = id
         registry.save(next)
         spawner.watch(pid: pid) { [weak self] in
-            self?.agentDied(InstanceRecord(instanceId: id, pid: pid, displayUUID: "", socket: socket))
+            self?.agentDied(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
         }
         pollStatus()
+    }
+
+    func currentDisplayUUID() -> String? {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return nil }
+        guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+            return nil
+        }
+        let uuid = CGDisplayCreateUUIDFromDisplayID(number).takeRetainedValue()
+        return CFUUIDCreateString(nil, uuid) as String
+    }
+
+    func fetchAgentStatus(socket: String) -> AgentStatus? {
+        guard let resp = Client.request(socketPath: socket, cmd: "status", args: [:], role: .agent),
+              let obj = resp.data?.object
+        else { return nil }
+        return AgentStatus(
+            secureInput: obj["secureInput"]?.bool ?? false,
+            axTrusted: obj["axTrusted"]?.bool ?? false,
+            configError: obj["configError"]?.string,
+            paused: obj["paused"]?.bool ?? false,
+            instanceId: obj["instanceId"]?.string,
+            space: obj["space"]?.int,
+            displayGone: obj["displayGone"]?.bool ?? false,
+            hotkeyError: obj["hotkeyError"]?.string,
+            spaceCount: obj["spaceCount"]?.int,
+            isCurrent: obj["isCurrent"]?.bool ?? false,
+            hasOnScreenIncludingSlivers: obj["hasOnScreenIncludingSlivers"]?.bool ?? false,
+            skylightSpaceId: obj["skylightSpaceId"]?.int.map { UInt64($0) }
+        )
     }
 
     func agentDied(_ record: InstanceRecord) {
@@ -217,23 +271,36 @@ final class ExtraController: NSObject {
     }
 
     func pollStatus() {
-        if let rec = currentRecord(), let resp = Client.request(socketPath: rec.socket, cmd: "status", args: [:], role: .agent) {
-            let paused = resp.data?.object?["paused"]?.bool ?? false
-            let space = resp.data?.object?["space"]?.int ?? 1
-            let count = 5
-            let ax = resp.data?.object?["axTrusted"]?.bool ?? false
-            let secure = resp.data?.object?["secureInput"]?.bool ?? false
-            let err = resp.data?.object?["configError"]?.string
-            let displayGone = false
+        let reg = registry.load()
+        let live = reg.agents.filter { kill($0.pid, 0) == 0 }
+        var claimants: [(InstanceRecord, AgentStatus)] = []
+        for rec in live {
+            if let status = fetchAgentStatus(socket: rec.socket), status.isCurrent {
+                claimants.append((rec, status))
+            }
+        }
+        let winnerId = pickCurrentAgent(claimants: claimants.map(\.0.instanceId), lastCurrent: reg.lastCurrentInstanceId)
+        if let winnerId, let pair = claimants.first(where: { $0.0.instanceId == winnerId }) {
+            let rec = pair.0
+            let st = pair.1
+            if reg.lastCurrentInstanceId != rec.instanceId {
+                var next = reg
+                next.lastCurrentInstanceId = rec.instanceId
+                if let sky = st.skylightSpaceId, let idx = next.agents.firstIndex(where: { $0.instanceId == rec.instanceId }) {
+                    next.agents[idx].skylightSpaceId = sky
+                }
+                registry.save(next)
+            }
             status.updateCurrent(
-                spaceCount: count,
-                focused: space,
-                paused: paused,
-                warning: extraWarning(status: AgentStatus(secureInput: secure, axTrusted: ax, configError: err, paused: paused, displayGone: displayGone))
+                spaceCount: st.spaceCount ?? 5,
+                focused: st.space ?? 1,
+                paused: st.paused,
+                loginEnabled: LoginService.enabled,
+                warning: extraWarning(status: st)
             )
-            if !ax { firstRun?.sheetIfNeeded() }
+            if !st.axTrusted { firstRun?.sheetIfNeeded() }
         } else {
-            status.updateEmpty()
+            status.updateEmpty(loginEnabled: LoginService.enabled)
         }
     }
 
@@ -244,7 +311,11 @@ final class ExtraController: NSObject {
     }
 
     func togglePause() {
-        sendToCurrent(.pause)
+        if status.pausedNow {
+            sendToCurrent(.resume)
+        } else {
+            sendToCurrent(.pause)
+        }
     }
 
     func quitCurrent() {
@@ -297,8 +368,8 @@ final class ExtraController: NSObject {
     func toggleLogin() {
         #if os(macOS)
         if #available(macOS 13.0, *) {
-            // SMAppService.mainApp.register/unregister in LoginService.swift
             LoginService.toggle()
+            pollStatus()
         }
         #endif
     }
@@ -344,6 +415,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .listWindows: return "list-windows"
     case .listWorkspaces: return "list-workspaces"
     case .status: return "status"
+    case .markCurrent: return "mark-current"
     }
 }
 

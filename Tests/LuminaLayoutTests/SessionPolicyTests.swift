@@ -229,6 +229,41 @@ struct CurrentSpaceTests {
         #expect(!shouldAttach(hasAnyOnScreenIncludingSlivers: false))
         #expect(!isLargeOnScreen(width: 1, height: 600))
         #expect(isLargeOnScreen(width: 8, height: 8))
+        let a = UUID(uuidString: "00000000-0000-0000-0000-00000000000a")!
+        let b = UUID(uuidString: "00000000-0000-0000-0000-00000000000b")!
+        #expect(startAttachDecision(agents: [], lastCurrent: nil) == .spawn)
+        #expect(
+            startAttachDecision(
+                agents: [AgentPresence(instanceId: a, isCurrent: true, hasOnScreenIncludingSlivers: false)],
+                lastCurrent: a
+            ) == .alreadyCurrent(a)
+        )
+        #expect(
+            startAttachDecision(
+                agents: [AgentPresence(instanceId: a, isCurrent: false, hasOnScreenIncludingSlivers: true)],
+                lastCurrent: nil
+            ) == .attach(a)
+        )
+        #expect(
+            startAttachDecision(
+                agents: [
+                    AgentPresence(instanceId: a, isCurrent: false, hasOnScreenIncludingSlivers: true),
+                    AgentPresence(instanceId: b, isCurrent: false, hasOnScreenIncludingSlivers: true),
+                ],
+                lastCurrent: b
+            ) == .attach(b)
+        )
+        #expect(
+            startAttachDecision(
+                agents: [
+                    AgentPresence(instanceId: a, isCurrent: false, hasOnScreenIncludingSlivers: false),
+                    AgentPresence(instanceId: b, isCurrent: false, hasOnScreenIncludingSlivers: false),
+                ],
+                lastCurrent: a
+            ) == .spawn
+        )
+        #expect(pickCurrentAgent(claimants: [a, b], lastCurrent: b) == b)
+        #expect(pickCurrentAgent(claimants: [a], lastCurrent: b) == a)
     }
 
     @Test func lastCurrentWinsTwoClaimants() {
@@ -360,5 +395,6 @@ struct RegistryTests {
         #expect(extraWarning(status: AgentStatus(axTrusted: false)) == .axDenied)
         #expect(extraWarning(status: AgentStatus(axTrusted: true, displayGone: true)) == .displayGone)
         #expect(extraWarning(status: AgentStatus(axTrusted: true, configError: "bad")) == .configInvalid)
+        #expect(extraWarning(status: AgentStatus(axTrusted: true, hotkeyError: "alt-h")) == .hotkeyFailed)
     }
 }

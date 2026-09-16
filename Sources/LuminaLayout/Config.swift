@@ -518,6 +518,11 @@ extension Config {
     [[window-rule]]
     app-id = "com.apple.Preferences"
     action = "float"
+
+    # [[window-rule]]
+    # app-id = "com.example.app"
+    # title-regex = ".*Preferences"
+    # action = "float"
     """
 
     public static var bundledDefault: Config {

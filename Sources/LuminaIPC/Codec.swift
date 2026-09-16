@@ -118,6 +118,7 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
     case "list-windows": return .ok(.listWindows)
     case "list-workspaces": return .ok(.listWorkspaces)
     case "status": return .ok(.status)
+    case "mark-current": return .ok(.markCurrent)
     default: return .unknown
     }
 }

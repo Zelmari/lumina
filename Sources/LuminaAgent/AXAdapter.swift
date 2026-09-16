@@ -177,6 +177,17 @@ public final class AXAdapter {
         AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
+    public func minSize(of element: AXUIElement) -> Size {
+        var ref: CFTypeRef?
+        let attr = "AXMinSize" as CFString
+        guard AXUIElementCopyAttributeValue(element, attr, &ref) == .success,
+              let val = ref, CFGetTypeID(val) == AXValueGetTypeID()
+        else { return .unknown }
+        var size = CGSize.zero
+        AXValueGetValue(val as! AXValue, .cgSize, &size)
+        return Size(w: Double(size.width), h: Double(size.height))
+    }
+
     public func windows(pid: pid_t) -> [AXUIElement] {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.05)
@@ -214,9 +225,14 @@ public struct BoundDisplay {
         usableRect(axVisibleFrame: axVisibleFrame, outerGap: gaps.outer)
     }
 
-    public static func resolve(menuBarMaxY: Double, focusedCenter: Point?) -> BoundDisplay? {
+    public static func resolve(menuBarMaxY: Double, focusedCenter: Point?, preferredUUID: String? = nil) -> BoundDisplay? {
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return nil }
+        if let preferredUUID,
+           let match = screens.compactMap({ from(screen: $0, menuBarMaxY: menuBarMaxY) }).first(where: { $0.uuid == preferredUUID })
+        {
+            return match
+        }
         let picked: NSScreen
         if let focusedCenter {
             picked = screens.first(where: { screen in

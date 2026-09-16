@@ -27,6 +27,8 @@ public final class AgentRuntime: NSObject {
     public var moveStart: (UInt32, Point, Int)?
     public var createDebounce: DispatchWorkItem?
     public var resizeDebounce: DispatchWorkItem?
+    public var configDebounce: DispatchWorkItem?
+    let preferredDisplayUUID: String?
 
     let log: LuminaLog
     let adapter: AXAdapter
@@ -53,14 +55,18 @@ public final class AgentRuntime: NSObject {
         let text = try? String(contentsOfFile: LuminaPaths.configPath(home: home), encoding: .utf8)
         self.config = loadOrDefault(text: text)
         self.session = Session.empty(spaceCount: config.spaceCount, instanceId: instanceId)
+        self.preferredDisplayUUID = displayUUID
         super.init()
-        _ = displayUUID
     }
 
     public func start() {
         adapter.setSystemTimeout()
         adapter.menuBarScreenMaxY = menuBarMaxY()
-        bound = BoundDisplay.resolve(menuBarMaxY: adapter.menuBarScreenMaxY, focusedCenter: nil)
+        bound = BoundDisplay.resolve(
+            menuBarMaxY: adapter.menuBarScreenMaxY,
+            focusedCenter: nil,
+            preferredUUID: preferredDisplayUUID
+        )
         if !axTrusted {
             log.info("AX not trusted; idling")
         }
@@ -101,6 +107,7 @@ public final class AgentRuntime: NSObject {
         ffmTimer?.cancel()
         secureTimer?.cancel()
         configWatcher?.cancel()
+        configDebounce?.cancel()
     }
 
     func bootLayout() {
@@ -256,7 +263,14 @@ public final class AgentRuntime: NSObject {
             debounceCreate { self.onCreate(element) }
         case kAXUIElementDestroyedNotification:
             if let id = adapter.windowId(for: element) {
-                session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
+                let wasFS = session.current.luminaFullscreen != nil
+                    && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
+                if wasFS {
+                    session = session.closeFocused(space: session.focusedSpace)
+                    unstashSpace(session.focusedSpace)
+                } else {
+                    session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
+                }
                 elements[id] = nil
                 applyFrames()
             }
@@ -506,11 +520,15 @@ public final class AgentRuntime: NSObject {
             return .success(id: id, data: listWorkspacesJSON())
         case .status:
             return .success(id: id, data: statusJSON())
+        case .markCurrent:
+            recomputeCurrentToken(reason: .start)
+            return .success(id: id)
         }
     }
 
     func applyFrames() {
         if userPaused || displayGone || !isCurrent { return }
+        refreshBound()
         guard let bound else { return }
         let started = Date()
         let usable = bound.usableRect(gaps: config.gaps)
@@ -712,7 +730,27 @@ public final class AgentRuntime: NSObject {
         applyFrames()
     }
 
-    func minSizes() -> [UInt32: Size] { [:] }
+    func refreshBound() {
+        adapter.menuBarScreenMaxY = menuBarMaxY()
+        if let uuid = bound?.uuid ?? preferredDisplayUUID {
+            bound = BoundDisplay.resolve(
+                menuBarMaxY: adapter.menuBarScreenMaxY,
+                focusedCenter: nil,
+                preferredUUID: uuid
+            ) ?? bound
+        } else {
+            bound = BoundDisplay.resolve(menuBarMaxY: adapter.menuBarScreenMaxY, focusedCenter: nil)
+        }
+    }
+
+    func minSizes() -> [UInt32: Size] {
+        var out: [UInt32: Size] = [:]
+        for (id, el) in elements {
+            let size = adapter.minSize(of: el)
+            if size != .unknown { out[id] = size }
+        }
+        return out
+    }
 
     func focusedId() -> UInt32? { session.current.focusedWindow }
 
@@ -840,7 +878,7 @@ public final class AgentRuntime: NSObject {
         }
         if displayGone, shouldAutoResume(userPaused: userPaused, boundUUID: bound.uuid, availableUUIDs: available) {
             displayGone = false
-            self.bound = BoundDisplay.resolve(menuBarMaxY: adapter.menuBarScreenMaxY, focusedCenter: nil)
+            refreshBound()
             if isCurrent, !userPaused { hotkeys.register(bindings: config.bindings) }
             applyFrames()
             restashOffspace()
@@ -895,7 +933,10 @@ public final class AgentRuntime: NSObject {
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: MutationQueue.shared.queue)
         src.setEventHandler { [weak self] in
-            self?.reloadConfig()
+            self?.configDebounce?.cancel()
+            let item = DispatchWorkItem { self?.reloadConfig() }
+            self?.configDebounce = item
+            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.05, execute: item)
         }
         src.setCancelHandler { close(fd) }
         src.resume()
@@ -988,14 +1029,33 @@ public final class AgentRuntime: NSObject {
         ])
     }
 
+    func hasOnScreenIncludingSlivers() -> Bool {
+        guard let bound else { return false }
+        let ids = Set(session.spaces.values.flatMap { space -> [UInt32] in
+            space.tiledLeaves().compactMap { $0.leaf?.cgWindowId } + space.floating.map(\.cgWindowId)
+        })
+        guard !ids.isEmpty else { return false }
+        let cg = onScreenCGWindows(intersecting: bound.axFrame)
+        return cg.contains { row in
+            guard let id = row[kCGWindowNumber as String] as? UInt32 else { return false }
+            return ids.contains(id)
+        }
+    }
+
     func statusJSON() -> JSONValue {
         .object([
             "secureInput": .bool(secureInput),
             "axTrusted": .bool(axTrusted),
             "configError": configError.map { .string($0) } ?? .null,
-            "paused": .bool(userPaused || displayGone),
+            "paused": .bool(userPaused),
+            "displayGone": .bool(displayGone),
             "instanceId": .string(instanceId.uuidString),
             "space": .int(session.focusedSpace.raw),
+            "spaceCount": .int(session.spaceCount),
+            "isCurrent": .bool(isCurrent),
+            "hasOnScreenIncludingSlivers": .bool(hasOnScreenIncludingSlivers()),
+            "hotkeyError": hotkeys.hotkeyError.map { .string($0) } ?? .null,
+            "skylightSpaceId": lastSkyLightId.map { .int(Int($0)) } ?? .null,
         ])
     }
 }

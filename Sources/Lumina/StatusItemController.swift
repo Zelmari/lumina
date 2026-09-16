@@ -16,6 +16,8 @@ final class StatusItemController {
     private var paused = false
     private var spaceCount = 5
     private var focused = 1
+    private var loginEnabled = false
+    var pausedNow: Bool { paused }
 
     func install() {
         guard item == nil else { return }
@@ -26,17 +28,19 @@ final class StatusItemController {
         rebuildMenu()
     }
 
-    func updateEmpty() {
+    func updateEmpty(loginEnabled: Bool = false) {
         current = false
+        self.loginEnabled = loginEnabled
         item?.button?.title = "Start on this Space"
         rebuildMenu()
     }
 
-    func updateCurrent(spaceCount: Int, focused: Int, paused: Bool, warning: ExtraWarning) {
+    func updateCurrent(spaceCount: Int, focused: Int, paused: Bool, loginEnabled: Bool = false, warning: ExtraWarning) {
         current = true
         self.spaceCount = spaceCount
         self.focused = focused
         self.paused = paused
+        self.loginEnabled = loginEnabled
         var parts: [String] = []
         for i in 1...spaceCount {
             parts.append(i == focused ? "(\(i))" : "\(i)")
@@ -76,7 +80,9 @@ final class StatusItemController {
         let start = action("Start on this Space", #selector(start))
         start.isHidden = current
         menu.addItem(start)
-        menu.addItem(action("Launch at Login", #selector(login)))
+        let login = action("Launch at Login", #selector(login))
+        login.state = loginEnabled ? .on : .off
+        menu.addItem(login)
         if current {
             menu.addItem(action("Quit this Space", #selector(quitThis)))
         }

@@ -68,6 +68,21 @@ enum LuminaCLI {
         if let resp = unixRequest(path: menu, request: req) {
             return resp.data?.object?["instanceId"]?.string
         }
+        return instancesFileToken()
+    }
+
+    static func instancesFileToken() -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = LuminaPaths.instancesPath(supportRoot: home + "/Library/Application Support/Lumina")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        if let id = obj["lastCurrentInstanceId"] as? String { return id }
+        if let agents = obj["agents"] as? [[String: Any]],
+           let first = agents.first?["instanceId"] as? String
+        {
+            return first
+        }
         return nil
     }
 

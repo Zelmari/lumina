@@ -85,6 +85,10 @@ public struct AgentStatus: Equatable, Sendable, Codable {
     public var space: Int?
     public var displayGone: Bool
     public var hotkeyError: String?
+    public var spaceCount: Int?
+    public var isCurrent: Bool
+    public var hasOnScreenIncludingSlivers: Bool
+    public var skylightSpaceId: UInt64?
 
     public init(
         secureInput: Bool = false,
@@ -94,7 +98,11 @@ public struct AgentStatus: Equatable, Sendable, Codable {
         instanceId: String? = nil,
         space: Int? = nil,
         displayGone: Bool = false,
-        hotkeyError: String? = nil
+        hotkeyError: String? = nil,
+        spaceCount: Int? = nil,
+        isCurrent: Bool = false,
+        hasOnScreenIncludingSlivers: Bool = false,
+        skylightSpaceId: UInt64? = nil
     ) {
         self.secureInput = secureInput
         self.axTrusted = axTrusted
@@ -104,6 +112,10 @@ public struct AgentStatus: Equatable, Sendable, Codable {
         self.space = space
         self.displayGone = displayGone
         self.hotkeyError = hotkeyError
+        self.spaceCount = spaceCount
+        self.isCurrent = isCurrent
+        self.hasOnScreenIncludingSlivers = hasOnScreenIncludingSlivers
+        self.skylightSpaceId = skylightSpaceId
     }
 }
 

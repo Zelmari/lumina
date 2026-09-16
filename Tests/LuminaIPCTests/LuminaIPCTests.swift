@@ -125,5 +125,12 @@ struct ArgvTests {
         #expect(fs?.args["mode"]?.string == "lumina")
         #expect(CLIArgs.parse(["lumina", "list-windows"])?.cmd == "list-windows")
         #expect(CLIArgs.parse(["lumina", "list-workspaces"])?.cmd == "list-workspaces")
+        let mark = #"{"v":1,"id":"m","cmd":"mark-current","args":{}}"#
+        let parsed = parseLine(mark)
+        guard case .request(.markCurrent, let id) = parsed else {
+            Issue.record("expected mark-current, got \(parsed)")
+            return
+        }
+        #expect(id == "m")
     }
 }
