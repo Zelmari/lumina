@@ -21,22 +21,34 @@ public final class AXObserverHub {
             hub.onNotification?(owner, name, element)
         }, &observer)
         guard err == .success, let observer else { return }
-        let notifications = [
+        let app = AXUIElementCreateApplication(pid)
+        let appNotes = [
             kAXWindowCreatedNotification,
-            kAXUIElementDestroyedNotification,
             kAXFocusedWindowChangedNotification,
+            kAXApplicationHiddenNotification,
+        ]
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        for n in appNotes {
+            AXObserverAddNotification(observer, app, n as CFString, refcon)
+        }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        observers[pid] = observer
+    }
+
+    public func watchWindow(_ element: AXUIElement, pid: pid_t) {
+        watch(pid: pid)
+        guard let observer = observers[pid] else { return }
+        let refcon = Unmanaged.passUnretained(self).toOpaque()
+        let windowNotes = [
+            kAXUIElementDestroyedNotification,
             kAXWindowMovedNotification,
             kAXWindowResizedNotification,
             kAXTitleChangedNotification,
             kAXWindowMiniaturizedNotification,
-            kAXApplicationHiddenNotification,
         ]
-        let app = AXUIElementCreateApplication(pid)
-        for n in notifications {
-            AXObserverAddNotification(observer, app, n as CFString, Unmanaged.passUnretained(self).toOpaque())
+        for n in windowNotes {
+            AXObserverAddNotification(observer, element, n as CFString, refcon)
         }
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
-        observers[pid] = observer
     }
 
     public func unwatch(pid: pid_t) {

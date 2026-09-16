@@ -11,17 +11,25 @@ struct AgentApp {
     static func main() {
         signal(SIGPIPE, SIG_IGN)
         let env = ProcessInfo.processInfo.environment
-        let instance = UUID(uuidString: env["LUMINA_INSTANCE_ID"] ?? "") ?? UUID()
-        let socket = env["LUMINA_SOCKET"] ?? CommandLine.arguments.dropFirst().first
-            ?? LuminaPaths.agentSocketPath(
+        var argv = Array(CommandLine.arguments.dropFirst())
+        func takeFlag(_ flag: String) -> String? {
+            guard let i = argv.firstIndex(of: flag), i + 1 < argv.count else { return nil }
+            let value = argv[i + 1]
+            argv.removeSubrange(i...i + 1)
+            return value
+        }
+        let instance = UUID(uuidString: env["LUMINA_INSTANCE_ID"] ?? takeFlag("--instance-id") ?? "") ?? UUID()
+        let socket = env["LUMINA_SOCKET"] ?? takeFlag("--socket") ?? argv.first
+            ?? LuminaPaths.resolvedAgentSocketPath(
                 uid: getuid(),
                 tmpdir: FileManager.default.temporaryDirectory.path,
                 instanceId: instance.uuidString,
-                supportFallback: nil
-            ).primary
-        let crash = env["LUMINA_CRASH_RECOVER"] == "1" || CommandLine.arguments.contains("--crash-recover")
-        let launchApps = env["LUMINA_LAUNCH_APPS"] == "1"
-        let display = env["LUMINA_DISPLAY_UUID"]
+                supportFallback: FileManager.default.homeDirectoryForCurrentUser.path
+                    + "/Library/Application Support/Lumina"
+            )
+        let crash = env["LUMINA_CRASH_RECOVER"] == "1" || argv.contains("--crash-recover")
+        let launchApps = env["LUMINA_LAUNCH_APPS"] == "1" || argv.contains("--launch-apps")
+        let display = env["LUMINA_DISPLAY_UUID"] ?? takeFlag("--display")
         let log = LuminaLog(category: .agent, fileURL: LuminaLog.defaultFileURL())
         log.info("lumina-agent boot instance=\(instance)")
         let app = NSApplication.shared

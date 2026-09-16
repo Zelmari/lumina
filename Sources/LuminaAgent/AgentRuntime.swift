@@ -2,11 +2,15 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import CoreFoundation
+import Darwin
 import Foundation
 import LuminaLayout
 import LuminaIPC
 
-public final class AgentRuntime: NSObject {
+typealias WindowRef = LuminaLayout.Window
+
+public final class AgentRuntime: NSObject, @unchecked Sendable {
     public let instanceId: UUID
     public let socketPath: String
     public let crashRecover: Bool
@@ -23,6 +27,7 @@ public final class AgentRuntime: NSObject {
     public var secureInput = false
     public var configError: String?
     public var lastSpaceChange = Date.distantPast
+    public var lastLuminaSpaceChange = Date.distantPast
     public var pasteboardCount: Int = 0
     public var moveStart: (UInt32, Point, Int)?
     public var createDebounce: DispatchWorkItem?
@@ -38,7 +43,9 @@ public final class AgentRuntime: NSObject {
     var elements: [UInt32: AXUIElement] = [:]
     var ffmTimer: DispatchSourceTimer?
     var secureTimer: DispatchSourceTimer?
+    var axPollTimer: DispatchSourceTimer?
     var configWatcher: DispatchSourceFileSystemObject?
+    var didBootLayout = false
     let supportRoot: String
     let sessionPath: String
 
@@ -67,9 +74,6 @@ public final class AgentRuntime: NSObject {
             focusedCenter: nil,
             preferredUUID: preferredDisplayUUID
         )
-        if !axTrusted {
-            log.info("AX not trusted; idling")
-        }
         hotkeys.isPaused = { [weak self] in
             guard let self else { return true }
             return self.userPaused || self.displayGone || !self.isCurrent
@@ -79,6 +83,8 @@ public final class AgentRuntime: NSObject {
         }
         if shouldRegisterHotkeys(isCurrent: isCurrent, paused: userPaused || displayGone) {
             hotkeys.register(bindings: config.bindings)
+            if let err = hotkeys.hotkeyError { log.error("hotkeys \(err)") }
+            else { log.info("hotkeys registered \(config.bindings.count)") }
         }
         do {
             let server = AgentSocketServer(path: socketPath, log: log)
@@ -88,24 +94,31 @@ public final class AgentRuntime: NSObject {
             try server.start()
             self.server = server
         } catch {
-            log.error("socket failed")
+            log.error("socket failed path=\(socketPath) \(error)")
         }
         installWorkspaceObservers()
         watchConfig()
         pollSecureInput()
+        log.info(
+            "agent start instance=\(instanceId) crashRecover=\(crashRecover) axTrusted=\(axTrusted) bundle=\(Bundle.main.bundleIdentifier ?? "?")"
+        )
         if axTrusted {
-            bootLayout()
+            bootLayoutIfNeeded()
+        } else {
+            log.info("AX not trusted; waiting (will prompt as Lumina Agent if still denied)")
+            pollUntilAXTrusted()
         }
-        log.info("agent start instance=\(instanceId) crashRecover=\(crashRecover)")
     }
 
     public func stop() {
         unstashAll()
+        rescueOffscreenWindows()
         writeSession(stash: [])
         hotkeys.unregister()
         server?.stop()
         ffmTimer?.cancel()
         secureTimer?.cancel()
+        axPollTimer?.cancel()
         configWatcher?.cancel()
         configDebounce?.cancel()
     }
@@ -127,14 +140,15 @@ public final class AgentRuntime: NSObject {
             launchConfiguredApps()
         }
         let windows = collectManagedWindows()
+        log.info("collectManagedWindows \(windows.count) ids=\(windows.map(\.cgWindowId))")
         let tileable: [WindowRef]
         let floaters: [WindowRef]
         if config.launchTiling.isAliasFloatExisting {
             tileable = []
             floaters = windows
         } else {
-            tileable = windows.filter { classifyWindow($0) == .tiled }.map(\.0)
-            floaters = windows.filter { classifyWindow($0) == .floating }.map(\.0)
+            tileable = windows.filter { classifyWindow($0) == .tiled }
+            floaters = windows.filter { classifyWindow($0) == .floating }
         }
         let usable = bound.map { $0.usableRect(gaps: config.gaps) } ?? Rect(x: 0, y: 0, w: 1, h: 1)
         session = session.applyLaunchTiling(
@@ -151,11 +165,55 @@ public final class AgentRuntime: NSObject {
         }
         applyFrames()
         watchRunningApps()
+        log.info("bootLayout tiled=\(tileable.count) floating=\(floaters.count) usable=\(usable.w)x\(usable.h)")
+    }
+
+    func bootLayoutIfNeeded() {
+        guard !didBootLayout else { return }
+        didBootLayout = true
+        bootLayout()
+    }
+
+    func requestAgentAXPrompt() {
+        // LSUIElement agents often never surface the system AX sheet; go regular for the prompt.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate(ignoringOtherApps: true)
+        let opts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, !self.axTrusted else { return }
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
+    func pollUntilAXTrusted() {
+        axPollTimer?.cancel()
+        var prompted = false
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
+        timer.schedule(deadline: .now(), repeating: 0.4)
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            if self.axTrusted {
+                self.axPollTimer?.cancel()
+                self.axPollTimer = nil
+                NSApp.setActivationPolicy(.accessory)
+                self.log.info("AX trusted; starting layout")
+                self.bootLayoutIfNeeded()
+                return
+            }
+            if !prompted {
+                prompted = true
+                self.log.info("AX still untrusted; prompting as Lumina Agent")
+                self.requestAgentAXPrompt()
+            }
+        }
+        timer.resume()
+        axPollTimer = timer
     }
 
     func classifyWindow(_ window: WindowRef) -> ClassifyResult {
         guard let el = elements[window.cgWindowId], let bound else { return .tiled }
-        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap { $0[kCGWindowNumber as String] as? UInt32 })
+        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         guard let (input, _, _) = classifyInput(from: el, adapter: adapter, bound: bound, onScreenIds: onScreen) else {
             return .tiled
         }
@@ -166,15 +224,27 @@ public final class AgentRuntime: NSObject {
         guard let bound else { return [] }
         var out: [WindowRef] = []
         let cg = onScreenCGWindows(intersecting: bound.axFrame)
-        let onScreenIds = Set(cg.compactMap { $0[kCGWindowNumber as String] as? UInt32 })
+        let onScreenIds = Set(cg.compactMap(cgWindowID))
         let apps = NSWorkspace.shared.runningApplications
         for app in apps {
             let pid = app.processIdentifier
             observers.watch(pid: pid)
             for el in adapter.windows(pid: pid) {
-                guard let (input, id, _) = classifyInput(from: el, adapter: adapter, bound: bound, onScreenIds: onScreenIds) else { continue }
+                let used = Set(out.map(\.cgWindowId))
+                guard let (input, id, _) = classifyInput(
+                    from: el,
+                    adapter: adapter,
+                    bound: bound,
+                    onScreenIds: onScreenIds,
+                    excludingWindowIds: used
+                ) else { continue }
                 let result = classify(input, rules: config.windowRules)
+                log.info(
+                    "classify \(app.bundleIdentifier ?? "?") '\(input.title ?? "")' role=\(input.role ?? "?") sub=\(input.subrole ?? "?") zoom=\(input.hasZoomButton) \(Int(input.width))x\(Int(input.height)) layerHUD=\(input.layerOrIsHUD) -> \(result) id=\(id)"
+                )
                 if result == .unmanaged || result == .ignored { continue }
+                observers.watchWindow(el, pid: pid)
+                adapter.rememberWindowId(id, for: el)
                 elements[id] = el
                 let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
                 var w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame)
@@ -183,7 +253,7 @@ public final class AgentRuntime: NSObject {
             }
         }
         // front-to-back: CG list is front-to-back already (index 0 frontmost)
-        let order = cg.compactMap { $0[kCGWindowNumber as String] as? UInt32 }
+        let order = cg.compactMap(cgWindowID)
         out.sort { a, b in
             let ia = order.firstIndex(of: a.cgWindowId) ?? .max
             let ib = order.firstIndex(of: b.cgWindowId) ?? .max
@@ -213,7 +283,14 @@ public final class AgentRuntime: NSObject {
 
     @objc func appLaunched(_ n: Notification) {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-            MutationQueue.shared.hop { self.observers.watch(pid: app.processIdentifier) }
+            let pid = app.processIdentifier
+            DispatchQueue.main.async { self.observers.watch(pid: pid) }
+            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.adoptWindows(pid: pid)
+            }
+            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.55) { [weak self] in
+                self?.adoptWindows(pid: pid)
+            }
         }
     }
 
@@ -235,7 +312,12 @@ public final class AgentRuntime: NSObject {
     @objc func appActivated(_ n: Notification) {
         guard !userPaused, isCurrent else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-            MutationQueue.shared.hop { self.switchToWindowOf(pid: app.processIdentifier) }
+            MutationQueue.shared.hop {
+                self.adoptWindows(pid: app.processIdentifier)
+                if Date().timeIntervalSince(self.lastLuminaSpaceChange) > 0.8 {
+                    self.switchToWindowOf(pid: app.processIdentifier)
+                }
+            }
         }
     }
 
@@ -260,28 +342,23 @@ public final class AgentRuntime: NSObject {
         if userPaused || displayGone || !isCurrent { return }
         switch name {
         case kAXWindowCreatedNotification:
-            debounceCreate { self.onCreate(element) }
+            debounceCreate(pid: pid)
+            onCreate(element)
         case kAXUIElementDestroyedNotification:
-            if let id = adapter.windowId(for: element) {
-                let wasFS = session.current.luminaFullscreen != nil
-                    && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
-                if wasFS {
-                    session = session.closeFocused(space: session.focusedSpace)
-                    unstashSpace(session.focusedSpace)
-                } else {
-                    session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
-                }
-                elements[id] = nil
-                applyFrames()
-            }
+            handleDestroy(element)
         case kAXFocusedWindowChangedNotification:
-            if let id = adapter.windowId(for: element), owned(id) {
-                var space = session.current
-                space.focusedWindow = id
-                if let leaf = space.leaf(containing: id) {
-                    space.lastTiledLeaf = leaf.id
+            let win = adapter.focusedWindow(of: element)
+                ?? adapter.focusedWindow(of: AXUIElementCreateApplication(pid))
+            guard let win, let id = adapter.windowId(for: win) else { return }
+            if ownedAnywhere(id) {
+                observers.watchWindow(win, pid: pid)
+                if owned(id) {
+                    rememberFocus(id)
+                } else if let sid = session.spaceContaining(cgWindowId: id), sid != session.focusedSpace {
+                    stash(ids: [id], space: sid)
                 }
-                session.spaces[session.focusedSpace] = space
+            } else {
+                onCreate(win)
             }
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
             onMovedOrResized(element, resized: name == kAXWindowResizedNotification)
@@ -293,48 +370,203 @@ public final class AgentRuntime: NSObject {
                adapter.shouldIgnoreAXGeometry(window: w)
             { return }
             adapter.deminiaturize(element)
+            let retryId = adapter.windowId(for: element)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.adapter.deminiaturize(element)
+                guard let self, let retryId, let el = self.elements[retryId] else { return }
+                self.adapter.deminiaturize(el)
             }
         default:
             break
         }
     }
 
-    func debounceCreate(_ work: @escaping () -> Void) {
+    func debounceCreate(pid: pid_t) {
         createDebounce?.cancel()
-        let item = DispatchWorkItem { work() }
+        let item = DispatchWorkItem { [weak self] in
+            self?.adoptWindows(pid: pid)
+        }
         createDebounce = item
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.04, execute: item)
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.08, execute: item)
+    }
+
+    func adoptWindows(pid: pid_t, apply: Bool = true) {
+        observers.watch(pid: pid)
+        var claimed = session.allWindowIds.union(elements.keys)
+        for el in adapter.windows(pid: pid) {
+            onCreate(el, claimed: &claimed, apply: false)
+        }
+        if apply { applyFrames() }
     }
 
     func onCreate(_ element: AXUIElement) {
+        var claimed = session.allWindowIds.union(elements.keys)
+        onCreate(element, claimed: &claimed, apply: true)
+    }
+
+    func onCreate(_ element: AXUIElement, claimed: inout Set<UInt32>, apply: Bool = true) {
         guard let bound else { return }
-        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap { $0[kCGWindowNumber as String] as? UInt32 })
-        guard let (input, id, pid) = classifyInput(from: element, adapter: adapter, bound: bound, onScreenIds: onScreen) else { return }
+        if let existing = trackedId(matching: element), ownedAnywhere(existing) {
+            claimed.insert(existing)
+            if let pid = adapter.pid(of: element) {
+                observers.watchWindow(element, pid: pid)
+            }
+            adapter.rememberWindowId(existing, for: element)
+            elements[existing] = element
+            if let sid = session.spaceContaining(cgWindowId: existing), sid != session.focusedSpace {
+                stash(ids: [existing], space: sid)
+            }
+            return
+        }
+        if let frame = adapter.frame(of: element), isStashedAway(frame) {
+            log.info("onCreate skip stashed-away role=\(adapter.role(of: element) ?? "?")")
+            return
+        }
+        let peekId = adapter.windowId(for: element, excluding: claimed)
+        let peekPid = adapter.pid(of: element)
+        if let peekId, let peekPid, let sid = otherSpace(pid: peekPid, id: peekId, element: element) {
+            claimed.insert(peekId)
+            restashPid(peekPid, on: sid)
+            return
+        }
+        if let frame = adapter.frame(of: element), shouldPullOnScreen(frame),
+           peekPid.map({ ownedWindows(pid: $0).isEmpty }) ?? true
+        {
+            var dummy = WindowRef(cgWindowId: 0, pid: peekPid ?? 0, lastOnscreenFrame: frame)
+            _ = adapter.setFrame(usableRestoreRect(frame), of: element, tag: &dummy)
+        }
+        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
+        guard let (input, id, pid) = classifyInput(
+            from: element,
+            adapter: adapter,
+            bound: bound,
+            onScreenIds: onScreen,
+            excludingWindowIds: claimed
+        ) else {
+            log.info("onCreate skip (no window id) role=\(adapter.role(of: element) ?? "?")")
+            return
+        }
+        if let sid = otherSpace(pid: pid, id: id, element: element) {
+            claimed.insert(id)
+            observers.watchWindow(element, pid: pid)
+            adapter.rememberWindowId(id, for: element)
+            elements[id] = element
+            restashPid(pid, on: sid)
+            return
+        }
+        if ownedAnywhere(id) {
+            claimed.insert(id)
+            observers.watchWindow(element, pid: pid)
+            adapter.rememberWindowId(id, for: element)
+            elements[id] = element
+            return
+        }
+        if let stale = staleOwnedWindow(pid: pid, liveId: id, element: element) {
+            log.info("rebind onCreate \(stale) -> \(id) bundle=\(input.bundleId ?? "?")")
+            rebindOwned(from: stale, to: id, element: element, pid: pid)
+            claimed.insert(id)
+            if apply { applyFrames() }
+            return
+        }
         let result = classify(input, rules: config.windowRules)
+        log.info(
+            "onCreate \(input.bundleId ?? "?") '\(input.title ?? "")' role=\(input.role ?? "?") sub=\(input.subrole ?? "?") zoom=\(input.hasZoomButton) \(Int(input.width))x\(Int(input.height)) center=\(input.centerOnBoundDisplay) onScreen=\(input.isOnScreen) -> \(result) id=\(id)"
+        )
         if result == .unmanaged || result == .ignored { return }
+        claimed.insert(id)
+        observers.watchWindow(element, pid: pid)
+        adapter.rememberWindowId(id, for: element)
         elements[id] = element
         let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-        let window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame)
+        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame)
         let usable = bound.usableRect(gaps: config.gaps)
         if session.current.luminaFullscreen != nil {
             session = session.insertWhileLuminaFS(space: session.focusedSpace, window: window, result: result, usableIsWide: usableIsWide(usable))
             if result == .tiled { stash(ids: [id]) }
         } else if result == .floating {
+            window.role = .floating
             var space = session.current
-            var w = window
-            w.role = .floating
-            space.floating.append(w)
+            space.floating.append(window)
             session.spaces[session.focusedSpace] = space
         } else {
+            pruneGhostLeaves(space: session.focusedSpace)
             session = session.insertSpiral(space: session.focusedSpace, newLeaf: window, usableIsWide: usableIsWide(usable))
             let mins = minSizes()
             let (clamped, floated) = session.clampOverflow(space: session.focusedSpace, minSizes: mins, usable: usable, gaps: config.gaps, preferFloat: session.current.lastTiledLeaf)
             session = clamped
-            _ = floated
+            placeFloated(floated)
+        }
+        if apply { applyFrames() }
+    }
+
+    func trackedId(matching element: AXUIElement) -> UInt32? {
+        if let id = adapter.cachedWindowId(for: element), ownedAnywhere(id) || elements[id] != nil {
+            return id
+        }
+        return elements.first(where: { CFEqual($0.value, element) })?.key
+    }
+
+    func staleOwnedWindow(pid: pid_t, liveId: UInt32, element: AXUIElement) -> UInt32? {
+        let live = Set(
+            (CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
+                .compactMap(cgWindowID)
+        )
+        let ownedForPid = session.current.tiledLeaves().compactMap(\.leaf).filter { $0.pid == pid }
+            + session.current.floating.filter { $0.pid == pid }
+        let stale = ownedForPid.filter { !live.contains($0.cgWindowId) && $0.cgWindowId != liveId }
+        guard stale.count == 1, !owned(liveId) else { return nil }
+        let old = stale[0].cgWindowId
+        guard let el = elements[old], CFEqual(el, element) else { return nil }
+        return old
+    }
+
+    func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
+        session = session.rebindWindowId(space: session.focusedSpace, from: from, to: to)
+        elements[from] = nil
+        adapter.forgetWindowId(from)
+        adapter.rememberWindowId(to, for: element)
+        elements[to] = element
+        observers.watchWindow(element, pid: pid)
+        if session.current.focusedWindow == from {
+            rememberFocus(to)
+        }
+    }
+
+    func handleDestroy(_ element: AXUIElement) {
+        let cached = adapter.cachedWindowId(for: element)
+        let live = Set(
+            (CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
+                .compactMap(cgWindowID)
+        )
+        let before = session.allWindowIds
+        if let id = cached {
+            if live.contains(id) {
+                log.info("destroy skipped; cg window still live id=\(id)")
+            } else {
+                log.info("destroy remove id=\(id)")
+                let wasFS = session.current.luminaFullscreen != nil
+                    && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
+                if wasFS {
+                    session = session.closeFocused(space: session.focusedSpace)
+                    unstashSpace(session.focusedSpace)
+                } else {
+                    session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
+                }
+                elements[id] = nil
+                adapter.forgetWindowId(id)
+            }
+        } else {
+            log.info("destroy without cached id role=\(adapter.role(of: element) ?? "?")")
+        }
+        pruneMissingWindows()
+        if session.allWindowIds != before {
+            recoverManagedWindows()
         }
         applyFrames()
+    }
+
+    func isOffEveryDisplay(_ rect: Rect) -> Bool {
+        let frames = NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: menuBarMaxY())?.axFrame }
+        return !frames.contains { $0.contains(point: rect.center) }
     }
 
     func onMovedOrResized(_ element: AXUIElement, resized: Bool) {
@@ -356,7 +588,7 @@ public final class AgentRuntime: NSObject {
         guard let bound, let frame = adapter.frame(of: element) else { return }
         let usable = bound.usableRect(gaps: config.gaps)
         let pidAlive = adapter.pid(of: element).map { kill($0, 0) == 0 } ?? false
-        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap { $0[kCGWindowNumber as String] as? UInt32 })
+        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         let signals = NativeFSSignals(
             missingFromOnScreen: !onScreen.contains(id),
             pidAlive: pidAlive,
@@ -413,7 +645,7 @@ public final class AgentRuntime: NSObject {
 
     func onTitleChanged(_ element: AXUIElement) {
         guard let bound, let id = adapter.windowId(for: element) else { return }
-        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap { $0[kCGWindowNumber as String] as? UInt32 })
+        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         guard let (input, _, _) = classifyInput(from: element, adapter: adapter, bound: bound, onScreenIds: onScreen) else { return }
         let result = classify(input, rules: config.windowRules)
         if result == .tiled, session.current.floating.contains(where: { $0.cgWindowId == id }) {
@@ -424,6 +656,7 @@ public final class AgentRuntime: NSObject {
 
     func handleBound(_ command: BoundCommand) {
         if userPaused || displayGone || !isCurrent { return }
+        log.info("command \(command.commandString)")
         switch command {
         case .focus(let dir):
             focusDir(dir)
@@ -444,8 +677,15 @@ public final class AgentRuntime: NSObject {
             switchSpaceBy { $0.workspaceNext() }
         case .moveNodeToWorkspace(let n):
             if let id = resolveWorkspace(id: n, count: session.spaceCount) {
+                guard let focused = focusedId() else {
+                    log.info("move-node-to-workspace \(n) skipped: no focused window")
+                    return
+                }
+                rememberFocus(focused)
                 let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)
+                let from = session.focusedSpace.raw
                 session = session.moveNodeToWorkspace(id, usableIsWide: usableIsWide(usable))
+                log.info("move-node-to-workspace window=\(focused) \(from)->\(id.raw) focusedSpace=\(session.focusedSpace.raw)")
                 restashOffspace()
                 applyFrames()
                 writeSession()
@@ -526,7 +766,7 @@ public final class AgentRuntime: NSObject {
         }
     }
 
-    func applyFrames() {
+    func applyFrames(retryingAfterGhosts: Bool = false) {
         if userPaused || displayGone || !isCurrent { return }
         refreshBound()
         guard let bound else { return }
@@ -535,13 +775,22 @@ public final class AgentRuntime: NSObject {
         let space = session.current
         let rects = frames(space: space, usable: usable, gaps: config.gaps)
         let fs = space.luminaFullscreen
+        var ghosts: [UInt32] = []
         for (nodeId, rect) in rects {
             if MutationQueue.shared.shouldSkip(started: started) {
                 log.info("layout pass exceeded 200ms; skipping remaining windows")
                 break
             }
             if let fs, fs != nodeId { continue }
-            guard var node = space.nodes[nodeId], var window = node.leaf, let el = elements[window.cgWindowId] else { continue }
+            guard var node = space.nodes[nodeId], var window = node.leaf,
+                  let el = resolvedElement(for: window)
+            else {
+                if let node = space.nodes[nodeId], let window = node.leaf {
+                    log.info("applyFrames skip missing AX window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
+                    ghosts.append(window.cgWindowId)
+                }
+                continue
+            }
             window.lastOnscreenFrame = rect
             let result = adapter.setFrame(rect, of: el, tag: &window)
             node.leaf = window
@@ -549,44 +798,70 @@ public final class AgentRuntime: NSObject {
             s.setNode(node)
             session.spaces[session.focusedSpace] = s
             if result == .failed {
-                session = session.floatLeaf(space: session.focusedSpace, nodeId: nodeId).0
+                log.info("setFrame failed window=\(window.cgWindowId); leaving tiled")
             }
         }
-        if let fs, let node = space.nodes[fs], var window = node.leaf, let el = elements[window.cgWindowId] {
+        if let fs, let node = space.nodes[fs], var window = node.leaf, let el = resolvedElement(for: window) {
             _ = adapter.setFrame(usable, of: el, tag: &window)
         }
         for floater in space.floating where floater.role == .floating {
-            if let el = elements[floater.cgWindowId], floater.lastOnscreenFrame.w > 2 {
-                var w = floater
+            var w = floater
+            w.lastOnscreenFrame = usableRestoreRect(w.lastOnscreenFrame)
+            if let el = resolvedElement(for: w) {
                 _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &w)
             }
+            if var s = session.spaces[session.focusedSpace],
+               let idx = s.floating.firstIndex(where: { $0.cgWindowId == w.cgWindowId })
+            {
+                s.floating[idx].lastOnscreenFrame = w.lastOnscreenFrame
+                session.spaces[session.focusedSpace] = s
+            }
+        }
+        if !ghosts.isEmpty, !retryingAfterGhosts {
+            for id in ghosts {
+                log.info("prune ghost window=\(id)")
+                session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
+                elements[id] = nil
+                adapter.forgetWindowId(id)
+            }
+            applyFrames(retryingAfterGhosts: true)
         }
     }
 
     func switchSpace(_ id: SpaceId) {
         guard id != session.focusedSpace else { return }
+        lastLuminaSpaceChange = Date()
         stash(ids: Set(session.visibleIds(on: session.focusedSpace)))
         session = session.switchTo(id)
         unstashSpace(id)
         applyFrames()
+        restashOffspace()
         writeSession()
     }
 
     func switchSpaceBy(_ transform: (Session) -> Session) {
+        lastLuminaSpaceChange = Date()
         stash(ids: Set(session.visibleIds(on: session.focusedSpace)))
         session = transform(session)
         unstashSpace(session.focusedSpace)
         applyFrames()
+        restashOffspace()
         writeSession()
     }
 
-    func stash(ids: Set<UInt32>) {
+    func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) {
         guard let bound else { return }
+        let spaceId = spaceId ?? session.focusedSpace
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
         for id in ids {
-            guard let el = elements[id] else { continue }
-            let current = adapter.frame(of: el)
-            if let current, !isSliver(current), var space = session.spaces[session.focusedSpace] {
+            guard var window = lookup(id) ?? session.spaces[spaceId]?.leaf(containing: id)?.leaf,
+                  let el = resolvedElement(for: window)
+            else {
+                log.info("stash skip missing AX window=\(id)")
+                continue
+            }
+            let current = adapter.frame(of: el) ?? cgWindowRect(id: id)
+            if let current, !isSliver(current), var space = session.spaces[spaceId] {
                 if var node = space.leaf(containing: id) {
                     node.leaf?.lastOnscreenFrame = current
                     space.setNode(node)
@@ -594,12 +869,23 @@ public final class AgentRuntime: NSObject {
                 if let idx = space.floating.firstIndex(where: { $0.cgWindowId == id }) {
                     space.floating[idx].lastOnscreenFrame = current
                 }
-                session.spaces[session.focusedSpace] = space
+                session.spaces[spaceId] = space
             }
-            let height = current?.h ?? 8
-            let sliver = stashFrame(for: height, display: DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame), dockRight: dockRight)
-            if var dummy = lookup(id) {
-                _ = adapter.setFrame(sliver, of: el, tag: &dummy)
+            let height = current?.h ?? window.lastOnscreenFrame.h
+            let width = current?.w ?? window.lastOnscreenFrame.w
+            let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+            var parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width)
+            _ = adapter.setFrame(parked, of: el, tag: &window)
+            if let after = adapter.frame(of: el) ?? cgWindowRect(id: id), after.intersects(bound.axVisibleFrame) {
+                let w = max(after.w, 400)
+                parked = Rect(
+                    x: dockRight ? bound.axFrame.minX - w - stashOffscreenGap * 2 : bound.axFrame.maxX + stashOffscreenGap * 2,
+                    y: bound.axFrame.minY,
+                    w: w,
+                    h: max(after.h, 300)
+                )
+                _ = adapter.setFrame(parked, of: el, tag: &window)
+                log.info("stash retry further offscreen window=\(id) bundle=\(window.bundleId ?? "?")")
             }
         }
     }
@@ -613,21 +899,259 @@ public final class AgentRuntime: NSObject {
     func unstashSpace(_ id: SpaceId) {
         guard let space = session.spaces[id] else { return }
         for node in space.tiledLeaves() {
-            if let w = node.leaf, let el = elements[w.cgWindowId] {
-                var ww = w
-                _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &ww)
-            }
+            if let w = node.leaf { restoreWindow(w) }
         }
-        for w in space.floating {
-            if let el = elements[w.cgWindowId] {
-                var ww = w
-                _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &ww)
-            }
-        }
+        for w in space.floating { restoreWindow(w) }
+        pruneGhostLeaves(space: id)
     }
 
     func unstashAll() {
         for spaceId in session.spaces.keys { unstashSpace(spaceId) }
+        unstashOrphanSlivers()
+        rescueOffscreenWindows()
+    }
+
+    func pruneMissingWindows() {
+        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        let live = Set(info.compactMap(cgWindowID))
+        for spaceId in Array(session.spaces.keys) {
+            for id in session.visibleIds(on: spaceId) where !live.contains(id) {
+                log.info("prune missing window=\(id)")
+                session = session.removeWindow(space: spaceId, cgWindowId: id)
+                elements[id] = nil
+                adapter.forgetWindowId(id)
+            }
+        }
+    }
+
+    func pruneGhostLeaves(space spaceId: SpaceId) {
+        guard let space = session.spaces[spaceId] else { return }
+        let windows = space.tiledLeaves().compactMap(\.leaf) + space.floating
+        for w in windows where !hasAXElement(w) {
+            log.info("prune ghost window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") space=\(spaceId)")
+            session = session.removeWindow(space: spaceId, cgWindowId: w.cgWindowId)
+            elements[w.cgWindowId] = nil
+            adapter.forgetWindowId(w.cgWindowId)
+        }
+    }
+
+    func hasAXElement(_ window: WindowRef) -> Bool {
+        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid {
+            return true
+        }
+        return adapter.axWindow(pid: window.pid, cgWindowId: window.cgWindowId) != nil
+    }
+
+    func recoverManagedWindows() {
+        rebindStaleWindowIds()
+        pruneGhostLeaves(space: session.focusedSpace)
+        for app in NSWorkspace.shared.runningApplications {
+            adoptWindows(pid: app.processIdentifier, apply: false)
+        }
+    }
+
+    func rebindStaleWindowIds() {
+        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        let live = Set(info.compactMap(cgWindowID))
+        for spaceId in Array(session.spaces.keys) {
+            guard let space = session.spaces[spaceId] else { continue }
+            let ownedWindows = space.tiledLeaves().compactMap(\.leaf) + space.floating
+            for w in ownedWindows where !live.contains(w.cgWindowId) {
+                let excluding = Set(session.visibleIds(on: spaceId).filter { $0 != w.cgWindowId })
+                guard let el = elements[w.cgWindowId] else { continue }
+                guard let newId = adapter.windowId(for: el, excluding: excluding), newId != w.cgWindowId else { continue }
+                log.info("rebind stale \(w.cgWindowId) -> \(newId) bundle=\(w.bundleId ?? "?")")
+                session = session.rebindWindowId(space: spaceId, from: w.cgWindowId, to: newId)
+                elements[w.cgWindowId] = nil
+                adapter.forgetWindowId(w.cgWindowId)
+                adapter.rememberWindowId(newId, for: el)
+                elements[newId] = el
+            }
+        }
+    }
+
+    func restoreWindow(_ window: WindowRef) {
+        var w = window
+        let target = usableRestoreRect(w.lastOnscreenFrame)
+        guard let el = resolvedElement(for: w) else {
+            log.info("unstash missing AX window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?")")
+            return
+        }
+        // Electron often ignores a jump from a 1px sliver; bump size first.
+        if let cur = cgWindowRect(id: w.cgWindowId), isSliver(cur) {
+            let bump = Rect(x: target.x, y: target.y, w: max(400, min(target.w, 800)), h: max(300, min(target.h, 600)))
+            _ = adapter.setFrame(bump, of: el, tag: &w)
+        }
+        _ = adapter.setFrame(target, of: el, tag: &w)
+        if let cur = cgWindowRect(id: w.cgWindowId), isSliver(cur), let el2 = resolvedElement(for: w) {
+            log.info("unstash still sliver window=\(w.cgWindowId); retry usable")
+            _ = adapter.setFrame(usableRestoreRect(Rect(x: 0, y: 0, w: 1, h: 1)), of: el2, tag: &w)
+        }
+    }
+
+    func usableRestoreRect(_ preferred: Rect) -> Rect {
+        let fallback = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 40, y: 48, w: 1200, h: 800)
+        guard let bound else { return fallback }
+        let usable = bound.usableRect(gaps: config.gaps)
+        var r = preferred
+        if isSliver(r) || r.w < 200 || r.h < 150 {
+            return usable
+        }
+        r.w = min(r.w, usable.w)
+        r.h = min(r.h, usable.h)
+        r.x = min(max(r.x, usable.x), usable.maxX - r.w)
+        r.y = min(max(r.y, usable.y), usable.maxY - r.h)
+        return r
+    }
+
+    func screenFrames() -> [Rect] {
+        NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: menuBarMaxY())?.axFrame }
+    }
+
+    func shouldPullOnScreen(_ frame: Rect) -> Bool {
+        guard let bound else { return false }
+        if isStashedAway(frame) { return false }
+        if bound.axFrame.contains(point: frame.center) { return false }
+        if centerOnOtherDisplay(rect: frame, bound: bound.axFrame, screens: screenFrames()) { return false }
+        return true
+    }
+
+    func isStrayOffscreen(_ frame: Rect) -> Bool {
+        shouldPullOnScreen(frame) || isOurStashSliver(frame)
+    }
+
+    func placeFloated(_ windows: [WindowRef]) {
+        for orig in windows {
+            var w = orig
+            w.lastOnscreenFrame = usableRestoreRect(w.lastOnscreenFrame)
+            if let el = resolvedElement(for: w) {
+                _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &w)
+            }
+            if var space = session.spaces[session.focusedSpace],
+               let idx = space.floating.firstIndex(where: { $0.cgWindowId == w.cgWindowId })
+            {
+                space.floating[idx] = w
+                session.spaces[session.focusedSpace] = space
+            }
+            log.info("floated overflow window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?")")
+        }
+    }
+
+    func isOurProcess(_ pid: pid_t) -> Bool {
+        pid == getpid() || adapter.bundleId(pid: pid)?.hasPrefix("com.zelmari.lumina") == true
+    }
+
+    func rescueOffscreenWindows() {
+        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        for row in info {
+            guard let id = cgWindowID(row), let pid = cgOwnerPID(row), let rect = cgWindowRect(row) else { continue }
+            if isOurProcess(pid) { continue }
+            if cgWindowLayer(row) > 0 { continue }
+            guard isStrayOffscreen(rect) else { continue }
+            let w = lookup(id)
+                ?? session.spaces.values.compactMap { $0.leaf(containing: id)?.leaf }.first
+                ?? WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: usableRestoreRect(rect))
+            log.info("rescue offscreen window=\(id) pid=\(pid) \(Int(rect.w))x\(Int(rect.h))")
+            restoreWindow(w)
+        }
+    }
+
+    func resolvedElement(for window: WindowRef) -> AXUIElement? {
+        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid {
+            return el
+        }
+        adapter.forgetWindowId(window.cgWindowId)
+        if let el = adapter.axWindow(pid: window.pid, cgWindowId: window.cgWindowId) {
+            elements[window.cgWindowId] = el
+            return el
+        }
+        log.info("no AX element for window=\(window.cgWindowId) pid=\(window.pid) bundle=\(window.bundleId ?? "?")")
+        return nil
+    }
+
+    func isOurStashSliver(_ rect: Rect) -> Bool {
+        guard isSliver(rect), rect.h >= 8, rect.w <= 2, let bound else { return false }
+        let onRight = abs(rect.minX - (bound.axFrame.maxX - 1)) < 4
+        let onLeft = abs(rect.minX - bound.axFrame.minX) < 4
+        return onRight || onLeft
+    }
+
+    func isStashedAway(_ rect: Rect) -> Bool {
+        if isOurStashSliver(rect) || isSliver(rect) { return true }
+        guard let bound else { return false }
+        return isStashedOffDisplay(rect, display: DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame))
+    }
+
+    func ownedWindows(pid: pid_t) -> [(SpaceId, WindowRef)] {
+        var out: [(SpaceId, WindowRef)] = []
+        for (sid, space) in session.spaces {
+            for w in space.tiledLeaves().compactMap(\.leaf) + space.floating where w.pid == pid {
+                out.append((sid, w))
+            }
+        }
+        return out
+    }
+
+    func isTileCandidate(_ element: AXUIElement) -> Bool {
+        let role = adapter.role(of: element)
+        if let role, Classify.nonWindowRoles.contains(role) { return false }
+        let sub = adapter.subrole(of: element)
+        if let sub, Classify.hardSubroles.contains(sub) { return false }
+        if let frame = adapter.frame(of: element), isStashedAway(frame) { return false }
+        if let frame = adapter.frame(of: element), frame.w >= 400, frame.h >= 300 { return true }
+        return adapter.hasZoomButton(element)
+    }
+
+    func otherSpace(pid: pid_t, id: UInt32, element: AXUIElement) -> SpaceId? {
+        if let sid = session.spaceContaining(cgWindowId: id), sid != session.focusedSpace {
+            return sid
+        }
+        if let tracked = trackedId(matching: element),
+           let sid = session.spaceContaining(cgWindowId: tracked),
+           sid != session.focusedSpace
+        {
+            return sid
+        }
+        let owned = ownedWindows(pid: pid)
+        let elsewhere = owned.filter { $0.0 != session.focusedSpace }
+        guard !elsewhere.isEmpty else { return nil }
+        if let found = elements.first(where: { CFEqual($0.value, element) }),
+           let sid = session.spaceContaining(cgWindowId: found.key),
+           sid != session.focusedSpace
+        {
+            return sid
+        }
+        let real = adapter.windows(pid: pid).filter(isTileCandidate)
+        if real.count <= owned.count {
+            return elsewhere[0].0
+        }
+        return nil
+    }
+
+    func restashPid(_ pid: pid_t, on spaceId: SpaceId) {
+        let ids = Set(ownedWindows(pid: pid).filter { $0.0 == spaceId }.map(\.1.cgWindowId))
+        guard !ids.isEmpty else { return }
+        log.info("restash pid=\(pid) space=\(spaceId) ids=\(ids)")
+        stash(ids: ids, space: spaceId)
+    }
+
+    func unstashOrphanSlivers() {
+        let ownedPids = Set(session.spaces.values.flatMap { space in
+            space.tiledLeaves().compactMap { $0.leaf?.pid } + space.floating.map(\.pid)
+        })
+        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        for row in info {
+            guard let id = cgWindowID(row), let pid = cgOwnerPID(row), let rect = cgWindowRect(row) else { continue }
+            guard ownedPids.contains(pid), isOurStashSliver(rect) else { continue }
+            let w = lookup(id)
+                ?? session.spaces.values.compactMap { $0.leaf(containing: id)?.leaf }.first
+                ?? WindowRef(cgWindowId: id, pid: pid, bundleId: nil, lastOnscreenFrame: usableRestoreRect(rect))
+            restoreWindow(w)
+        }
     }
 
     func unstashLeftovers() -> [StashEntry] {
@@ -635,34 +1159,32 @@ public final class AgentRuntime: NSObject {
         if let data = try? Data(contentsOf: URL(fileURLWithPath: sessionPath)),
            let file = try? SessionFile.decode(data)
         {
-            entries.append(contentsOf: file.stash)
+            entries.append(contentsOf: file.stash.filter { !isSliver($0.lastOnscreenFrame) || $0.lastOnscreenFrame.h >= 8 })
         }
-        if let bound {
-            let cg = onScreenCGWindows(intersecting: bound.axFrame)
-            for row in cg {
-                guard let id = row[kCGWindowNumber as String] as? UInt32,
-                      let pid = row[kCGWindowOwnerPID as String] as? pid_t,
-                      let bounds = row[kCGWindowBounds as String] as? [String: CGFloat]
-                else { continue }
-                let rect = Rect(x: Double(bounds["X"] ?? 0), y: Double(bounds["Y"] ?? 0), w: Double(bounds["Width"] ?? 0), h: Double(bounds["Height"] ?? 0))
-                if isSliver(rect) {
-                    entries.append(StashEntry(cgWindowId: id, pid: pid, bundleId: nil, lastOnscreenFrame: rect))
-                }
-            }
+        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        for row in info {
+            guard let id = cgWindowID(row),
+                  let pid = cgOwnerPID(row),
+                  let rect = cgWindowRect(row),
+                  isOurStashSliver(rect)
+            else { continue }
+            let known = entries.first { $0.cgWindowId == id }
+            let restore = known.flatMap { isSliver($0.lastOnscreenFrame) ? nil : $0.lastOnscreenFrame }
+                ?? usableRestoreRect(rect)
+            entries.append(StashEntry(cgWindowId: id, pid: pid, bundleId: known?.bundleId, lastOnscreenFrame: restore))
         }
         for e in entries {
-            if let el = adapter.axWindow(pid: e.pid, cgWindowId: e.cgWindowId) {
-                elements[e.cgWindowId] = el
-                var w = WindowRef(cgWindowId: e.cgWindowId, pid: e.pid, bundleId: e.bundleId, lastOnscreenFrame: e.lastOnscreenFrame)
-                _ = adapter.setFrame(e.lastOnscreenFrame, of: el, tag: &w)
-            }
+            let w = WindowRef(cgWindowId: e.cgWindowId, pid: e.pid, bundleId: e.bundleId, lastOnscreenFrame: usableRestoreRect(e.lastOnscreenFrame))
+            restoreWindow(w)
         }
+        rescueOffscreenWindows()
         return entries
     }
 
     func restashOffspace() {
         for (id, _) in session.spaces where id != session.focusedSpace {
-            stash(ids: Set(session.visibleIds(on: id)))
+            stash(ids: Set(session.visibleIds(on: id)), space: id)
         }
         if session.current.luminaFullscreen != nil { stashSiblings() }
     }
@@ -718,7 +1240,7 @@ public final class AgentRuntime: NSObject {
     func resize(_ delta: ResizeDelta) {
         guard let bound, let focused = focusedId(), let leaf = session.current.leaf(containing: focused) else { return }
         let usable = bound.usableRect(gaps: config.gaps)
-        let (after, _) = session.resize(
+        let (after, floated) = session.resize(
             space: session.focusedSpace,
             focusedLeaf: leaf.id,
             delta: delta,
@@ -727,6 +1249,7 @@ public final class AgentRuntime: NSObject {
             gaps: config.gaps
         )
         session = after
+        if let floated { placeFloated([floated]) }
         applyFrames()
     }
 
@@ -752,10 +1275,40 @@ public final class AgentRuntime: NSObject {
         return out
     }
 
-    func focusedId() -> UInt32? { session.current.focusedWindow }
+    func focusedId() -> UInt32? {
+        if let id = session.current.focusedWindow, owned(id) { return id }
+        if let id = frontmostOwnedWindow() {
+            rememberFocus(id)
+            return id
+        }
+        return nil
+    }
+
+    func rememberFocus(_ id: UInt32) {
+        var space = session.current
+        space.focusedWindow = id
+        if let leaf = space.leaf(containing: id) {
+            space.lastTiledLeaf = leaf.id
+        }
+        session.spaces[session.focusedSpace] = space
+    }
+
+    func frontmostOwnedWindow() -> UInt32? {
+        guard let bound else { return nil }
+        for row in onScreenCGWindows(intersecting: bound.axFrame) {
+            guard let id = cgWindowID(row), owned(id) else { continue }
+            return id
+        }
+        return session.current.tiledLeaves().first?.leaf?.cgWindowId
+            ?? session.current.floating.first?.cgWindowId
+    }
 
     func owned(_ id: UInt32) -> Bool {
         session.current.leaf(containing: id) != nil || session.current.floating.contains(where: { $0.cgWindowId == id })
+    }
+
+    func ownedAnywhere(_ id: UInt32) -> Bool {
+        session.spaceContaining(cgWindowId: id) != nil
     }
 
     func lookup(_ id: UInt32) -> WindowRef? {
@@ -788,6 +1341,7 @@ public final class AgentRuntime: NSObject {
             session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
             session.nativeFSWindows.removeAll { $0.cgWindowId == id }
             elements[id] = nil
+            adapter.forgetWindowId(id)
         }
         applyFrames()
     }
@@ -810,9 +1364,9 @@ public final class AgentRuntime: NSObject {
         guard let bound else { return }
         let cg = onScreenCGWindows(intersecting: bound.axFrame)
         let large = cg.contains { row in
-            guard let b = row[kCGWindowBounds as String] as? [String: CGFloat] else { return false }
-            return isLargeOnScreen(width: Double(b["Width"] ?? 0), height: Double(b["Height"] ?? 0))
-                && ownedPid(row[kCGWindowOwnerPID as String] as? pid_t)
+            guard let b = cgWindowRect(row) else { return false }
+            return isLargeOnScreen(width: b.w, height: b.h)
+                && ownedPid(cgOwnerPID(row))
         }
         let cur = skyLight.currentSpaceId(displayUUID: bound.uuid)
         let became = recomputeCurrent(
@@ -1037,7 +1591,7 @@ public final class AgentRuntime: NSObject {
         guard !ids.isEmpty else { return false }
         let cg = onScreenCGWindows(intersecting: bound.axFrame)
         return cg.contains { row in
-            guard let id = row[kCGWindowNumber as String] as? UInt32 else { return false }
+            guard let id = cgWindowID(row) else { return false }
             return ids.contains(id)
         }
     }

@@ -43,19 +43,20 @@ public final class Hotkeys {
             }
             if let ref { refs.append(ref) }
         }
-        Hotkeys.table = bindings
+        registered = bindings
     }
 
     public func unregister() {
         for ref in refs { UnregisterEventHotKey(ref) }
         refs.removeAll()
+        registered = []
         if let handler {
             RemoveEventHandler(handler)
             self.handler = nil
         }
     }
 
-    private static var table: [Binding] = []
+    private var registered: [Binding] = []
 
     private func handle(_ event: EventRef?) -> OSStatus {
         guard let event else { return noErr }
@@ -71,8 +72,8 @@ public final class Hotkeys {
             &id
         )
         let index = Int(id.id) - 1
-        guard Hotkeys.table.indices.contains(index) else { return noErr }
-        let command = Hotkeys.table[index].command
+        guard registered.indices.contains(index) else { return noErr }
+        let command = registered[index].command
         MutationQueue.shared.hop { [weak self] in
             self?.onCommand?(command)
         }

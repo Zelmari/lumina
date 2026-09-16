@@ -25,11 +25,11 @@ public final class AgentSocketServer {
         guard listenFD >= 0 else { throw POSIXError(.EADDRINUSE) }
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
-        let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
+        let maxLen = unixSocketPathMaxBytes
         let pathBytes = Array(path.utf8)
-        guard pathBytes.count < maxLen else { throw POSIXError(.ENAMETOOLONG) }
+        guard pathBytes.count <= maxLen else { throw POSIXError(.ENAMETOOLONG) }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: UInt8.self, capacity: maxLen) { buf in
+            ptr.withMemoryRebound(to: UInt8.self, capacity: maxLen + 1) { buf in
                 for (i, b) in pathBytes.enumerated() { buf[i] = b }
                 buf[pathBytes.count] = 0
             }
@@ -40,7 +40,10 @@ public final class AgentSocketServer {
                 bind(listenFD, $0, len) == 0
             }
         }
-        guard bindOK else { throw POSIXError(.EADDRINUSE) }
+        guard bindOK else {
+            let code = POSIXError.Code(rawValue: errno) ?? .EADDRINUSE
+            throw POSIXError(code)
+        }
         chmod(path, 0o600)
         listen(listenFD, 8)
         let src = DispatchSource.makeReadSource(fileDescriptor: listenFD, queue: queue)

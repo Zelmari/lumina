@@ -1,20 +1,24 @@
 #if os(macOS)
 import AppKit
 import ApplicationServices
+import CoreFoundation
+import Darwin
 import Foundation
 import LuminaLayout
 import LuminaIPC
-
-@_silgen_name("_AXUIElementGetWindow")
-func AXUIElementGetWindow_private(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<UInt32>) -> Int32
 
 public enum SetFrameResult: Equatable, Sendable {
     case ok
     case failed
 }
 
+@_silgen_name("_AXUIElementGetWindow")
+private func AXUIElementGetWindow(_ element: CFTypeRef, _ identifier: UnsafeMutablePointer<UInt32>) -> Int32
+
 public final class AXAdapter {
     private var inFlight: [UInt32: UInt64] = [:]
+    private var idCache: [UInt: UInt32] = [:]
+    private var tracked: [UInt32: AXUIElement] = [:]
     private var loggedMissingPrivateAPI = false
     private let log: LuminaLog
     public var menuBarScreenMaxY: Double = 0
@@ -28,36 +32,72 @@ public final class AXAdapter {
         AXUIElementSetMessagingTimeout(system, 0.05)
     }
 
-    public func windowId(for element: AXUIElement) -> UInt32? {
+    public func windowId(for element: AXUIElement, excluding: Set<UInt32> = []) -> UInt32? {
+        if let cached = cachedWindowId(for: element), !excluding.contains(cached) {
+            return cached
+        }
         var id: UInt32 = 0
-        let err = AXUIElementGetWindow_private(element, &id)
-        if err == 0, id != 0 {
+        let err = AXUIElementGetWindow(element, &id)
+        if err == 0, id != 0, !excluding.contains(id) {
             return id
         }
         if err != 0 && !loggedMissingPrivateAPI {
             loggedMissingPrivateAPI = true
-            log.info("private _AXUIElementGetWindow missing or failed; using fallback matcher")
+            log.info("private _AXUIElementGetWindow failed err=\(err); using fallback matcher")
         }
-        return fallbackWindowId(for: element)
+        return fallbackWindowId(for: element, excluding: excluding)
     }
 
-    private func fallbackWindowId(for element: AXUIElement) -> UInt32? {
-        guard let frame = frame(of: element), let pid = pid(of: element) else { return nil }
-        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
-        let matches = info.filter { row in
-            let owner = row[kCGWindowOwnerPID as String] as? pid_t
-            guard owner == pid else { return false }
-            guard let bounds = row[kCGWindowBounds as String] as? [String: CGFloat] else { return false }
-            let x = Double(bounds["X"] ?? 0)
-            let y = Double(bounds["Y"] ?? 0)
-            let w = Double(bounds["Width"] ?? 0)
-            let h = Double(bounds["Height"] ?? 0)
-            return abs(x - frame.x) < 2 && abs(y - frame.y) < 2 && abs(w - frame.w) < 2 && abs(h - frame.h) < 2
-        }
-        if matches.count == 1 {
-            return matches[0][kCGWindowNumber as String] as? UInt32
+    public func cachedWindowId(for element: AXUIElement) -> UInt32? {
+        let key = elementKey(element)
+        if let cached = idCache[key] { return cached }
+        for (id, el) in tracked where CFEqual(el, element) {
+            idCache[key] = id
+            return id
         }
         return nil
+    }
+
+    public func rememberWindowId(_ id: UInt32, for element: AXUIElement) {
+        if let old = tracked.first(where: { CFEqual($0.value, element) && $0.key != id })?.key {
+            tracked[old] = nil
+            idCache = idCache.filter { $0.value != old }
+        }
+        idCache[elementKey(element)] = id
+        tracked[id] = element
+    }
+
+    public func forgetWindowId(_ id: UInt32) {
+        idCache = idCache.filter { $0.value != id }
+        tracked[id] = nil
+        inFlight[id] = nil
+    }
+
+    public func focusedWindow(of appOrWindow: AXUIElement) -> AXUIElement? {
+        if role(of: appOrWindow) == "AXWindow" { return appOrWindow }
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appOrWindow, kAXFocusedWindowAttribute as CFString, &ref) == .success,
+              let val = ref, CFGetTypeID(val) == AXUIElementGetTypeID()
+        else { return nil }
+        return (val as! AXUIElement)
+    }
+
+    private func elementKey(_ element: AXUIElement) -> UInt {
+        UInt(bitPattern: Unmanaged.passUnretained(element as AnyObject).toOpaque())
+    }
+
+    private func fallbackWindowId(for element: AXUIElement, excluding: Set<UInt32>) -> UInt32? {
+        guard let frame = frame(of: element), let pid = pid(of: element) else { return nil }
+        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] ?? []
+        var owned: [(id: UInt32, frame: Rect)] = []
+        for row in info {
+            guard cgOwnerPID(row) == pid, let id = cgWindowID(row) else { continue }
+            guard let rect = cgWindowRect(row) else { continue }
+            if cgWindowLayer(row) > 0 { continue }
+            owned.append((id, rect))
+        }
+        return pickCGWindowId(axFrame: frame, candidates: owned, excluding: excluding)
     }
 
     public func pid(of element: AXUIElement) -> pid_t? {
@@ -81,21 +121,28 @@ public final class AXAdapter {
         return Rect(x: Double(point.x), y: Double(point.y), w: Double(size.width), h: Double(size.height))
     }
 
-    public func setFrame(_ rect: Rect, of element: AXUIElement, tag window: inout WindowRef) -> SetFrameResult {
+    public func setFrame(_ rect: Rect, of element: AXUIElement, tag window: inout LuminaLayout.Window) -> SetFrameResult {
         window.generation += 1
-        inFlight[window.cgWindowId] = window.generation
+        let id = window.cgWindowId
+        let gen = window.generation
+        inFlight[id] = gen
         let ok = applyFrame(rect, of: element)
         if !ok {
             let retry = applyFrame(rect, of: element)
-            inFlight[window.cgWindowId] = nil
-            return retry ? .ok : .failed
+            if !retry {
+                inFlight[id] = nil
+                return .failed
+            }
         }
-        inFlight[window.cgWindowId] = nil
+        // AXMoved/AXResized arrive after we return; keep the tag until they can be ignored.
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            if self?.inFlight[id] == gen { self?.inFlight[id] = nil }
+        }
         return .ok
     }
 
-    public func shouldIgnoreAXGeometry(window: WindowRef) -> Bool {
-        shouldIgnoreAXGeometry(windowGeneration: window.generation, inFlight: inFlight[window.cgWindowId])
+    public func shouldIgnoreAXGeometry(window: LuminaLayout.Window) -> Bool {
+        inFlight[window.cgWindowId] == window.generation || inFlight[window.cgWindowId] != nil
     }
 
     public func generationInFlight(for id: UInt32) -> Bool {
@@ -109,12 +156,13 @@ public final class AXAdapter {
         guard let sizeVal = AXValueCreate(.cgSize, &size),
               let posVal = AXValueCreate(.cgPoint, &point)
         else { return false }
-        _ = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        _ = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
-        _ = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        guard let read = frame(of: element) else { return false }
-        return abs(read.x - rect.x) < 4 && abs(read.y - rect.y) < 4
-            && abs(read.w - rect.w) < 8 && abs(read.h - rect.h) < 8
+        let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+        let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+        let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+        let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
+        if fatal.contains(s1) || fatal.contains(pos) || fatal.contains(s2) { return false }
+        // Safari/WebKit often return cannotComplete/failure even when the window moves.
+        return true
     }
 
     public func pressClose(of element: AXUIElement) {
@@ -222,7 +270,7 @@ public struct BoundDisplay {
     public var axVisibleFrame: Rect
 
     public func usableRect(gaps: Gaps) -> Rect {
-        usableRect(axVisibleFrame: axVisibleFrame, outerGap: gaps.outer)
+        axVisibleFrame.inset(by: Double(gaps.outer))
     }
 
     public static func resolve(menuBarMaxY: Double, focusedCenter: Point?, preferredUUID: String? = nil) -> BoundDisplay? {
@@ -267,16 +315,47 @@ func menuBarMaxY() -> Double {
     Double(NSScreen.screens.first?.frame.maxY ?? 0)
 }
 
+func cgWindowID(_ row: [String: Any]) -> UInt32? {
+    cgNSNumber(row[kCGWindowNumber as String])?.uint32Value
+}
+
+func cgOwnerPID(_ row: [String: Any]) -> pid_t? {
+    cgNSNumber(row[kCGWindowOwnerPID as String])?.int32Value
+}
+
+func cgWindowLayer(_ row: [String: Any]) -> Int {
+    cgNSNumber(row[kCGWindowLayer as String])?.intValue ?? 0
+}
+
+func cgWindowRect(_ row: [String: Any]) -> Rect? {
+    guard let bounds = row[kCGWindowBounds as String] as? [String: Any] else { return nil }
+    return Rect(
+        x: cgNSNumber(bounds["X"])?.doubleValue ?? 0,
+        y: cgNSNumber(bounds["Y"])?.doubleValue ?? 0,
+        w: cgNSNumber(bounds["Width"])?.doubleValue ?? 0,
+        h: cgNSNumber(bounds["Height"])?.doubleValue ?? 0
+    )
+}
+
+private func cgNSNumber(_ value: Any?) -> NSNumber? {
+    if let n = value as? NSNumber { return n }
+    if let i = value as? Int { return NSNumber(value: i) }
+    if let d = value as? Double { return NSNumber(value: d) }
+    if let f = value as? CGFloat { return NSNumber(value: Double(f)) }
+    return nil
+}
+
+func cgWindowRect(id: UInt32) -> Rect? {
+    let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
+    return info.first { cgWindowID($0) == id }.flatMap(cgWindowRect)
+}
+
 func onScreenCGWindows(intersecting axFrame: Rect) -> [[String: Any]] {
-    let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
+    let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        as? [[String: Any]] ?? []
     return info.filter { row in
-        guard let bounds = row[kCGWindowBounds as String] as? [String: CGFloat] else { return false }
-        let rect = Rect(
-            x: Double(bounds["X"] ?? 0),
-            y: Double(bounds["Y"] ?? 0),
-            w: Double(bounds["Width"] ?? 0),
-            h: Double(bounds["Height"] ?? 0)
-        )
+        guard let rect = cgWindowRect(row) else { return false }
         return rect.intersects(axFrame)
     }
 }
@@ -285,18 +364,21 @@ public func classifyInput(
     from element: AXUIElement,
     adapter: AXAdapter,
     bound: BoundDisplay,
-    onScreenIds: Set<UInt32>
+    onScreenIds: Set<UInt32>,
+    excludingWindowIds: Set<UInt32> = []
 ) -> (ClassifyInput, UInt32, pid_t)? {
-    guard let id = adapter.windowId(for: element), id != 0 else { return nil }
     guard let pid = adapter.pid(of: element) else { return nil }
     let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-    let pidHasOnScreen = onScreenIds.contains { other in
-        other != id && onScreenCGWindows(intersecting: bound.axFrame).contains { row in
-            (row[kCGWindowNumber as String] as? UInt32) == other
-                && (row[kCGWindowOwnerPID as String] as? pid_t) == pid
-        }
+    guard let id = adapter.windowId(for: element, excluding: excludingWindowIds), id != 0 else { return nil }
+    let onScreenRows = onScreenCGWindows(intersecting: bound.axFrame)
+    let pidOnScreenFrames: [Rect] = onScreenRows.compactMap { row in
+        guard cgOwnerPID(row) == pid, let rect = cgWindowRect(row), rect.w >= 8, rect.h >= 8 else { return nil }
+        return rect
     }
-    let layer = (onScreenCGWindows(intersecting: bound.axFrame).first { ($0[kCGWindowNumber as String] as? UInt32) == id }?[kCGWindowLayer as String] as? Int) ?? 0
+    let axOnScreen = axFrameLooksOnScreen(frame: frame, onScreenFrames: pidOnScreenFrames)
+    let idOnScreen = onScreenIds.contains(id) && frame.w >= 8 && frame.h >= 8
+    let layer = cgWindowLayer(onScreenRows.first { cgWindowID($0) == id } ?? [:])
+    let screens = NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: adapter.menuBarScreenMaxY)?.axFrame }
     let input = ClassifyInput(
         bundleId: adapter.bundleId(pid: pid),
         title: adapter.title(of: element),
@@ -305,12 +387,12 @@ public func classifyInput(
         hasZoomButton: adapter.hasZoomButton(element),
         width: frame.w,
         height: frame.h,
-        isOnScreen: onScreenIds.contains(id) && frame.w >= 8 && frame.h >= 8,
-        pidAlreadyHasOnScreenWindow: pidHasOnScreen,
+        isOnScreen: axOnScreen || idOnScreen,
+        pidAlreadyHasOnScreenWindow: !pidOnScreenFrames.isEmpty,
         layerOrIsHUD: layer > 0,
         isPiP: adapter.subrole(of: element) == "AXPictureInPictureWindow",
         isVisualIntelligenceOrSiriHUD: false,
-        centerOnBoundDisplay: centerOnDisplay(rect: frame, displayFrame: bound.axFrame)
+        centerOnBoundDisplay: shouldManageOnBoundDisplay(rect: frame, bound: bound.axFrame, screens: screens)
     )
     return (input, id, pid)
 }
