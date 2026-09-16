@@ -193,3 +193,6 @@ core.*
 *.local.swift
 
 skills/
+AGENTS.md
+CLAUDE.md
+plans/
