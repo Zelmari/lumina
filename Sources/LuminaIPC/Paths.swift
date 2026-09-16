@@ -1,4 +1,7 @@
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 
 public enum LuminaPaths {
     public static func runtimeRoot(uid: uid_t, tmpdir: String) -> String {
@@ -35,4 +38,17 @@ public enum LuminaPaths {
 
 public func peerEuidAllowed(peer: uid_t, selfEuid: uid_t) -> Bool {
     peer == selfEuid
+}
+
+public func kernBootUUID() -> String? {
+    #if os(macOS)
+    var size = 0
+    sysctlbyname("kern.bootsessionuuid", nil, &size, nil, 0)
+    guard size > 0 else { return nil }
+    var buf = [CChar](repeating: 0, count: size)
+    guard sysctlbyname("kern.bootsessionuuid", &buf, &size, nil, 0) == 0 else { return nil }
+    return String(cString: buf)
+    #else
+    return nil
+    #endif
 }

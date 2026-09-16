@@ -67,7 +67,7 @@ extension Session {
         return self
     }
 
-    func visibleIds(on spaceId: SpaceId) -> [UInt32] {
+    public func visibleIds(on spaceId: SpaceId) -> [UInt32] {
         guard let space = spaces[spaceId] else { return [] }
         let tiled = space.tiledLeaves().compactMap { $0.leaf?.cgWindowId }
         let floating = space.floating.map(\.cgWindowId)

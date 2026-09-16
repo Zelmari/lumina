@@ -28,20 +28,22 @@ let layoutTargets: [Target] = [
 #if os(macOS)
 let appleProducts: [Product] = [
     .executable(name: "lumina", targets: ["LuminaCLI"]),
+    .executable(name: "lumina-agent", targets: ["LuminaAgent"]),
+    .executable(name: "Lumina", targets: ["Lumina"]),
 ]
 let appleTargets: [Target] = [
     .executableTarget(
         name: "LuminaCLI",
         dependencies: ["LuminaIPC"]
     ),
-    .target(
+    .executableTarget(
         name: "LuminaAgent",
         dependencies: ["LuminaLayout", "LuminaIPC"],
         exclude: ["Info.plist", "LuminaAgent.entitlements"]
     ),
-    .target(
+    .executableTarget(
         name: "Lumina",
-        dependencies: ["LuminaIPC"],
+        dependencies: ["LuminaIPC", "LuminaLayout"],
         exclude: ["Info.plist", "Lumina.entitlements"],
         resources: [.copy("Resources/lumina.toml")]
     ),
