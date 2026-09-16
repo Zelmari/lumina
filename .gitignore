@@ -2,8 +2,6 @@
 # Public product docs live in docs/. Spec/design drafts stay local.
 
 # --- Local product-contract drafts ---
-/plans
-plans/
 /SPEC_LUMINA.md
 /DESIGN_DOC_LUMINA.md
 /SPEC*.md
@@ -12,6 +10,7 @@ plans/
 /drafts/
 /scratch/
 .scratch/
+plans/PROMPTS.md
 
 # --- macOS ---
 .DS_Store
@@ -192,3 +191,5 @@ core.*
 *.local.json
 *.local.sh
 *.local.swift
+
+skills/
