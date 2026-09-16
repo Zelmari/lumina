@@ -54,6 +54,11 @@ struct ClassifyTests {
         #expect(classify(input, rules: []) == .unmanaged)
         #expect(!centerOnDisplay(rect: Rect(x: 2000, y: 0, w: 100, h: 100), displayFrame: Rect(x: 0, y: 0, w: 1000, h: 800)))
         #expect(centerOnDisplay(rect: Rect(x: 0, y: 0, w: 100, h: 100), displayFrame: Rect(x: 0, y: 0, w: 1000, h: 800)))
+        let bound = Rect(x: 0, y: 0, w: 1000, h: 800)
+        let screens = [bound, Rect(x: 2000, y: 0, w: 1000, h: 800)]
+        #expect(centerOnOtherDisplay(rect: Rect(x: 2100, y: 10, w: 100, h: 100), bound: bound, screens: screens))
+        #expect(shouldManageOnBoundDisplay(rect: Rect(x: 900, y: 0, w: 400, h: 600), bound: bound, screens: screens))
+        #expect(!shouldManageOnBoundDisplay(rect: Rect(x: 2100, y: 10, w: 100, h: 100), bound: bound, screens: screens))
     }
 
     @Test func hiddenTabHeuristicIgnored() {
@@ -72,6 +77,11 @@ struct ClassifyTests {
         #expect(classify(ClassifyInput(isPiP: true), rules: []) == .floating)
         #expect(classify(ClassifyInput(layerOrIsHUD: true), rules: []) == .floating)
         #expect(classify(ClassifyInput(isVisualIntelligenceOrSiriHUD: true), rules: []) == .floating)
+    }
+
+    @Test func scrollAreaNotAWindow() {
+        let input = ClassifyInput(bundleId: "com.apple.finder", role: "AXScrollArea", width: 1470, height: 956)
+        #expect(classify(input, rules: []) == .unmanaged)
     }
 
     @Test func ignoreAlwaysWins() {

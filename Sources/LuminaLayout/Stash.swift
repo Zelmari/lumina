@@ -10,26 +10,32 @@ public struct DisplayFrame: Equatable, Sendable {
     }
 }
 
-/// 1px vertical sliver in a bottom corner of the bound display, still inside `axFrame`.
-public func stashFrame(for lastHeight: Double, display: DisplayFrame, dockRight: Bool) -> Rect {
+/// Gap past the bound display so a min-width window is fully off-screen (no 1px remnant).
+public let stashOffscreenGap: Double = 80
+
+/// Park the window fully off the bound display. Dock-right: left of `minX`; else right of `maxX`.
+/// Uses `lastWidth` so apps that ignore 1px still sit entirely past the edge.
+public func stashFrame(
+    for lastHeight: Double,
+    display: DisplayFrame,
+    dockRight: Bool,
+    lastWidth: Double = 400
+) -> Rect {
     let height = max(lastHeight, 8)
-    let y = display.axFrame.maxY - height
-    let x: Double
+    let width = max(lastWidth, 400)
+    let y = min(max(display.axFrame.minY, display.axFrame.maxY - height), display.axFrame.maxY - 8)
     if dockRight {
-        x = display.axFrame.minX
-    } else {
-        x = display.axFrame.maxX - 1
+        return Rect(x: display.axFrame.minX - width - stashOffscreenGap, y: y, w: width, h: height)
     }
-    let rect = Rect(x: x, y: y, w: 1, h: height)
-    let minX = max(rect.minX, display.axFrame.minX)
-    let maxX = min(rect.maxX, display.axFrame.maxX)
-    let minY = max(rect.minY, display.axFrame.minY)
-    let maxY = min(rect.maxY, display.axFrame.maxY)
-    return Rect(x: minX, y: minY, w: max(1, maxX - minX), h: max(8, maxY - minY))
+    return Rect(x: display.axFrame.maxX + stashOffscreenGap, y: y, w: width, h: height)
 }
 
 public func isSliver(_ rect: Rect) -> Bool {
     rect.w <= 2 || rect.h <= 2
+}
+
+public func isStashedOffDisplay(_ rect: Rect, display: DisplayFrame) -> Bool {
+    rect.maxX <= display.axFrame.minX + 1 || rect.minX >= display.axFrame.maxX - 1
 }
 
 public struct StashEntry: Equatable, Sendable, Codable {

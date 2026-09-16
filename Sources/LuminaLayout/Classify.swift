@@ -128,10 +128,27 @@ public enum Classify {
         AXRoleName.dialog,
         AXRoleName.systemDialog,
     ]
+
+    /// AXWindowsAttribute sometimes includes chrome (Finder desktop scroll area, web views).
+    public static let nonWindowRoles: Set<String> = [
+        "AXScrollArea",
+        "AXWebArea",
+        "AXGroup",
+        "AXToolbar",
+        "AXMenuBar",
+        "AXSplitGroup",
+        "AXList",
+        "AXOutline",
+        "AXImage",
+        "AXStaticText",
+    ]
 }
 
 public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyResult {
     if !input.centerOnBoundDisplay {
+        return .unmanaged
+    }
+    if let role = input.role, Classify.nonWindowRoles.contains(role) {
         return .unmanaged
     }
     if !input.isOnScreen && input.pidAlreadyHasOnScreenWindow {
@@ -185,4 +202,16 @@ private func isTerminal(_ bundleId: String?) -> Bool {
 /// Center of `rect` inside the bound display's full AX frame (not usable).
 public func centerOnDisplay(rect: Rect, displayFrame: Rect) -> Bool {
     displayFrame.contains(point: rect.center)
+}
+
+/// True when the window's center is on some other screen, not the bound display.
+public func centerOnOtherDisplay(rect: Rect, bound: Rect, screens: [Rect]) -> Bool {
+    if bound.contains(point: rect.center) { return false }
+    return screens.contains { $0.contains(point: rect.center) }
+}
+
+/// Manage unless the window is clearly on a different display. Off-display leftovers stay eligible.
+public func shouldManageOnBoundDisplay(rect: Rect, bound: Rect, screens: [Rect]) -> Bool {
+    if bound.contains(point: rect.center) { return true }
+    return !centerOnOtherDisplay(rect: rect, bound: bound, screens: screens)
 }

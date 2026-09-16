@@ -116,4 +116,36 @@ struct SpiralTests {
         let split = session[space1]!.nodes[root.children[1]]!
         #expect(split.axis == .vertical)
     }
+
+    @Test func rebindWindowIdKeepsLeafAndUpdatesFocus() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(10), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(20), usableIsWide: true)
+        session = session.rebindWindowId(space: space1, from: 20, to: 99)
+        let space = session[space1]!
+        #expect(space.leaf(containing: 20) == nil)
+        #expect(space.leaf(containing: 99)?.leaf?.cgWindowId == 99)
+        #expect(space.leaf(containing: 10)?.leaf?.cgWindowId == 10)
+        #expect(space.focusedWindow == 99)
+    }
+
+    @Test func rebindWindowIdNoopsOnCollision() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(10), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(20), usableIsWide: true)
+        let before = session
+        session = session.rebindWindowId(space: space1, from: 20, to: 10)
+        #expect(session == before)
+    }
+
+    @Test func spaceContainingFindsOtherWorkspace() {
+        let space2 = SpaceId.require(2)
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(space: space1, newLeaf: win(10), usableIsWide: true)
+        session = session.insertSpiral(space: space2, newLeaf: win(20), usableIsWide: true)
+        #expect(session.spaceContaining(cgWindowId: 10) == space1)
+        #expect(session.spaceContaining(cgWindowId: 20) == space2)
+        #expect(session.spaceContaining(cgWindowId: 99) == nil)
+        #expect(session.allWindowIds == Set([10, 20]))
+    }
 }

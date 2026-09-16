@@ -73,6 +73,18 @@ extension Session {
         let floating = space.floating.map(\.cgWindowId)
         return tiled + floating
     }
+
+    public func spaceContaining(cgWindowId: UInt32) -> SpaceId? {
+        for (id, space) in spaces {
+            if space.leaf(containing: cgWindowId) != nil { return id }
+            if space.floating.contains(where: { $0.cgWindowId == cgWindowId }) { return id }
+        }
+        return nil
+    }
+
+    public var allWindowIds: Set<UInt32> {
+        Set(spaces.keys.flatMap { visibleIds(on: $0) })
+    }
 }
 
 public func wrapWorkspace(current: Int, count: Int, delta: Int) -> Int {

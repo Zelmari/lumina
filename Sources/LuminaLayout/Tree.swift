@@ -185,6 +185,33 @@ extension Session {
         session.spaces[spaceId] = s
         return session
     }
+
+    /// Keep the leaf/floater; replace a stale `CGWindowID` (Electron often mints a new one).
+    public func rebindWindowId(space spaceId: SpaceId, from: UInt32, to: UInt32) -> Session {
+        guard from != to, var space = spaces[spaceId] else { return self }
+        if space.leaf(containing: to) != nil || space.floating.contains(where: { $0.cgWindowId == to }) {
+            return self
+        }
+        var session = self
+        if var node = space.leaf(containing: from), var leaf = node.leaf {
+            leaf.cgWindowId = to
+            node.leaf = leaf
+            space.setNode(node)
+            if space.focusedWindow == from { space.focusedWindow = to }
+        }
+        if let idx = space.floating.firstIndex(where: { $0.cgWindowId == from }) {
+            space.floating[idx].cgWindowId = to
+            if space.focusedWindow == from { space.focusedWindow = to }
+        }
+        session.spaces[spaceId] = space
+        session.nativeFSWindows = session.nativeFSWindows.map { window in
+            guard window.cgWindowId == from else { return window }
+            var next = window
+            next.cgWindowId = to
+            return next
+        }
+        return session
+    }
 }
 
 extension Space {

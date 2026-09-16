@@ -8,15 +8,17 @@ struct StashTests {
             axFrame: Rect(x: 0, y: 0, w: 1440, h: 900),
             axVisibleFrame: Rect(x: 0, y: 0, w: 1440, h: 850)
         )
-        let right = stashFrame(for: 600, display: display, dockRight: false)
-        #expect(right.w == 1)
+        let right = stashFrame(for: 600, display: display, dockRight: false, lastWidth: 800)
+        #expect(right.w == 800)
         #expect(right.h == 600)
-        #expect(right.x == 1439)
-        #expect(right.y == 300)
-        let left = stashFrame(for: 600, display: display, dockRight: true)
-        #expect(left.x == 0)
-        #expect(left.w == 1)
-        #expect(isSliver(right))
+        #expect(right.x == 1440 + stashOffscreenGap)
+        #expect(isStashedOffDisplay(right, display: display))
+        #expect(!display.axFrame.intersects(right))
+        let left = stashFrame(for: 600, display: display, dockRight: true, lastWidth: 500)
+        #expect(left.x == 0 - 500 - stashOffscreenGap)
+        #expect(left.w == 500)
+        #expect(isStashedOffDisplay(left, display: display))
+        #expect(!display.axFrame.intersects(left))
     }
 
     @Test func sessionJSONRoundTripOmitsTree() throws {
