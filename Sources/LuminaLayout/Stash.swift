@@ -10,24 +10,21 @@ public struct DisplayFrame: Equatable, Sendable {
     }
 }
 
-/// Gap past the bound display so a min-width window is fully off-screen (no 1px remnant).
-public let stashOffscreenGap: Double = 80
-
-/// Park the window fully off the bound display. Dock-right: left of `minX`; else right of `maxX`.
-/// Uses `lastWidth` so apps that ignore 1px still sit entirely past the edge.
+/// 1×8 in the menu-bar / display-chrome strip, inside `axFrame` but outside `axVisibleFrame`
+/// so macOS will not clamp the window back onto the desktop.
 public func stashFrame(
     for lastHeight: Double,
     display: DisplayFrame,
     dockRight: Bool,
-    lastWidth: Double = 400
+    lastWidth: Double = 1
 ) -> Rect {
-    let height = max(lastHeight, 8)
-    let width = max(lastWidth, 400)
-    let y = min(max(display.axFrame.minY, display.axFrame.maxY - height), display.axFrame.maxY - 8)
-    if dockRight {
-        return Rect(x: display.axFrame.minX - width - stashOffscreenGap, y: y, w: width, h: height)
-    }
-    return Rect(x: display.axFrame.maxX + stashOffscreenGap, y: y, w: width, h: height)
+    _ = lastHeight
+    _ = lastWidth
+    let w: Double = 1
+    let h: Double = 8
+    let y = display.axFrame.minY
+    let x = dockRight ? display.axFrame.minX : display.axFrame.maxX - 1
+    return Rect(x: x, y: y, w: w, h: h)
 }
 
 public func isSliver(_ rect: Rect) -> Bool {
@@ -36,6 +33,13 @@ public func isSliver(_ rect: Rect) -> Bool {
 
 public func isStashedOffDisplay(_ rect: Rect, display: DisplayFrame) -> Bool {
     rect.maxX <= display.axFrame.minX + 1 || rect.minX >= display.axFrame.maxX - 1
+}
+
+/// Hidden workspace stash: sliver, past the display, or only in the menu-bar/dock chrome.
+public func isStashedAway(_ rect: Rect, display: DisplayFrame) -> Bool {
+    if isSliver(rect) { return true }
+    if isStashedOffDisplay(rect, display: display) { return true }
+    return display.axFrame.intersects(rect) && !display.axVisibleFrame.intersects(rect)
 }
 
 public struct StashEntry: Equatable, Sendable, Codable {

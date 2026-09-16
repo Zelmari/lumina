@@ -149,6 +149,40 @@ public final class AXAdapter {
         inFlight[id] != nil
     }
 
+    public func setStashFrame(_ rect: Rect, of element: AXUIElement, tag window: inout LuminaLayout.Window) -> SetFrameResult {
+        window.generation += 1
+        let id = window.cgWindowId
+        let gen = window.generation
+        inFlight[id] = gen
+        let ok = applyStashFrame(rect, of: element)
+        if !ok {
+            inFlight[id] = nil
+            return .failed
+        }
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            if self?.inFlight[id] == gen { self?.inFlight[id] = nil }
+        }
+        return .ok
+    }
+
+    /// Position first, then shrink. Size-first would collapse the tile in-place;
+    /// origin-past-the-display is clamped back onto the desktop.
+    private func applyStashFrame(_ rect: Rect, of element: AXUIElement) -> Bool {
+        AXUIElementSetMessagingTimeout(element, 0.05)
+        var size = CGSize(width: rect.w, height: rect.h)
+        var point = CGPoint(x: rect.x, y: rect.y)
+        guard let sizeVal = AXValueCreate(.cgSize, &size),
+              let posVal = AXValueCreate(.cgPoint, &point)
+        else { return false }
+        let pos1 = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+        let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+        let pos2 = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+        let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+        let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
+        if fatal.contains(pos1) || fatal.contains(s1) || fatal.contains(pos2) || fatal.contains(s2) { return false }
+        return true
+    }
+
     private func applyFrame(_ rect: Rect, of element: AXUIElement) -> Bool {
         AXUIElementSetMessagingTimeout(element, 0.05)
         var size = CGSize(width: rect.w, height: rect.h)

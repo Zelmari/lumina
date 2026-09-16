@@ -6,19 +6,22 @@ struct StashTests {
     @Test func stashFrameBottomRightVsLeft() {
         let display = DisplayFrame(
             axFrame: Rect(x: 0, y: 0, w: 1440, h: 900),
-            axVisibleFrame: Rect(x: 0, y: 0, w: 1440, h: 850)
+            axVisibleFrame: Rect(x: 0, y: 25, w: 1440, h: 850)
         )
         let right = stashFrame(for: 600, display: display, dockRight: false, lastWidth: 800)
-        #expect(right.w == 800)
-        #expect(right.h == 600)
-        #expect(right.x == 1440 + stashOffscreenGap)
-        #expect(isStashedOffDisplay(right, display: display))
-        #expect(!display.axFrame.intersects(right))
-        let left = stashFrame(for: 600, display: display, dockRight: true, lastWidth: 500)
-        #expect(left.x == 0 - 500 - stashOffscreenGap)
-        #expect(left.w == 500)
-        #expect(isStashedOffDisplay(left, display: display))
-        #expect(!display.axFrame.intersects(left))
+        #expect(right.w == 1)
+        #expect(right.h == 8)
+        #expect(right.x == 1439)
+        #expect(right.y == 0)
+        #expect(!display.axVisibleFrame.intersects(right))
+        let left = stashFrame(for: 600, display: display, dockRight: true)
+        #expect(left.x == 0)
+        #expect(left.w == 1)
+        #expect(isStashedAway(right, display: display))
+        #expect(isStashedAway(left, display: display))
+        let hung = Rect(x: 1439, y: -592, w: 800, h: 600)
+        #expect(isStashedAway(hung, display: display))
+        #expect(!display.axVisibleFrame.intersects(hung))
     }
 
     @Test func sessionJSONRoundTripOmitsTree() throws {

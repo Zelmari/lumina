@@ -854,7 +854,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let spaceId = spaceId ?? session.focusedSpace
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
         for id in ids {
-            guard var window = lookup(id) ?? session.spaces[spaceId]?.leaf(containing: id)?.leaf,
+            guard var window = session.spaces[spaceId]?.leaf(containing: id)?.leaf
+                    ?? session.spaces[spaceId]?.floating.first(where: { $0.cgWindowId == id })
+                    ?? lookup(id),
                   let el = resolvedElement(for: window)
             else {
                 log.info("stash skip missing AX window=\(id)")
@@ -874,18 +876,34 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let height = current?.h ?? window.lastOnscreenFrame.h
             let width = current?.w ?? window.lastOnscreenFrame.w
             let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
-            var parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width)
-            _ = adapter.setFrame(parked, of: el, tag: &window)
+            let parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width)
+            _ = adapter.setStashFrame(parked, of: el, tag: &window)
             if let after = adapter.frame(of: el) ?? cgWindowRect(id: id), after.intersects(bound.axVisibleFrame) {
-                let w = max(after.w, 400)
-                parked = Rect(
-                    x: dockRight ? bound.axFrame.minX - w - stashOffscreenGap * 2 : bound.axFrame.maxX + stashOffscreenGap * 2,
-                    y: bound.axFrame.minY,
-                    w: w,
-                    h: max(after.h, 300)
+                // Min-size apps ignore 1×8. Keep 1px on-display and hang the rest above the menu bar.
+                let hang = Rect(
+                    x: parked.x,
+                    y: bound.axFrame.minY - after.h + parked.h,
+                    w: after.w,
+                    h: after.h
                 )
-                _ = adapter.setFrame(parked, of: el, tag: &window)
-                log.info("stash retry further offscreen window=\(id) bundle=\(window.bundleId ?? "?")")
+                _ = adapter.setStashFrame(hang, of: el, tag: &window)
+                if let still = adapter.frame(of: el) ?? cgWindowRect(id: id), still.intersects(bound.axVisibleFrame) {
+                    log.info(
+                        "stash still on desktop window=\(id) bundle=\(window.bundleId ?? "?") \(Int(still.w))x\(Int(still.h)) @\(Int(still.x)),\(Int(still.y))"
+                    )
+                }
+            }
+            if var space = session.spaces[spaceId] {
+                if var node = space.leaf(containing: id), let saved = node.leaf {
+                    window.lastOnscreenFrame = saved.lastOnscreenFrame
+                    node.leaf = window
+                    space.setNode(node)
+                }
+                if let idx = space.floating.firstIndex(where: { $0.cgWindowId == id }) {
+                    window.lastOnscreenFrame = space.floating[idx].lastOnscreenFrame
+                    space.floating[idx] = window
+                }
+                session.spaces[spaceId] = space
             }
         }
     }
@@ -1082,7 +1100,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func isStashedAway(_ rect: Rect) -> Bool {
         if isOurStashSliver(rect) || isSliver(rect) { return true }
         guard let bound else { return false }
-        return isStashedOffDisplay(rect, display: DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame))
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        if isStashedOffDisplay(rect, display: display) { return true }
+        return display.axFrame.intersects(rect) && !display.axVisibleFrame.intersects(rect)
     }
 
     func ownedWindows(pid: pid_t) -> [(SpaceId, WindowRef)] {
