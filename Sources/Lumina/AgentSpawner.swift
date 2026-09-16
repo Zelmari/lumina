@@ -3,49 +3,56 @@ import Darwin
 import Foundation
 import LuminaIPC
 
-final class AgentSpawner {
+@_silgen_name("responsibility_spawnattrs_setdisclaim")
+private func responsibility_spawnattrs_setdisclaim(
+    _ attr: UnsafeMutablePointer<posix_spawnattr_t?>,
+    _ disclaim: Int32
+) -> Int32
+
+final class AgentSpawner: @unchecked Sendable {
     var quitPids: Set<pid_t> = []
+    private let log = LuminaLog(category: .extra, fileURL: LuminaLog.defaultFileURL())
 
     func spawn(
         instanceId: UUID,
         socket: String,
         displayUUID: String?,
         crashRecover: Bool,
-        runLaunchApps: Bool
-    ) -> pid_t? {
-        let agent = Self.agentURL()
-        guard let agent else { return nil }
-        var pid: pid_t = 0
-        var attr = posix_spawnattr_t(nil as OpaquePointer?)
-        posix_spawnattr_init(&attr)
-        posix_spawnattr_setflags(&attr, Int16(0x0400)) // POSIX_SPAWN_SETSID
-        if let disclaim = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_spawnattrs_setdisclaim") {
-            typealias Fn = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
-            let fn = unsafeBitCast(disclaim, to: Fn.self)
-            _ = fn(&attr, 1)
+        runLaunchApps: Bool,
+        completion: @escaping @Sendable (pid_t?) -> Void
+    ) {
+        var env = ProcessInfo.processInfo.environment
+        env["LUMINA_INSTANCE_ID"] = instanceId.uuidString
+        env["LUMINA_SOCKET"] = socket
+        env["LUMINA_CRASH_RECOVER"] = crashRecover ? "1" : "0"
+        env["LUMINA_LAUNCH_APPS"] = runLaunchApps ? "1" : "0"
+        if let displayUUID { env["LUMINA_DISPLAY_UUID"] = displayUUID }
+
+        var arguments = [
+            "--instance-id", instanceId.uuidString,
+            "--socket", socket,
+        ]
+        if let displayUUID {
+            arguments += ["--display", displayUUID]
         }
-        var env: [String] = []
-        if let e = environ {
-            var i = 0
-            while let p = e[i] {
-                env.append(String(cString: p))
-                i += 1
-            }
+        if crashRecover { arguments.append("--crash-recover") }
+        if runLaunchApps { arguments.append("--launch-apps") }
+
+        guard let exe = Self.nestedAgentExecutable() else {
+            log.error("agent app missing")
+            completion(nil)
+            return
         }
-        env.append("LUMINA_INSTANCE_ID=\(instanceId.uuidString)")
-        env.append("LUMINA_SOCKET=\(socket)")
-        env.append("LUMINA_CRASH_RECOVER=\(crashRecover ? "1" : "0")")
-        env.append("LUMINA_LAUNCH_APPS=\(runLaunchApps ? "1" : "0")")
-        if let displayUUID { env.append("LUMINA_DISPLAY_UUID=\(displayUUID)") }
-        let argv = [agent.path, crashRecover ? "--crash-recover" : nil].compactMap { $0 }
-        let cArgv = argv.map { strdup($0) } + [nil]
-        let cEnv = env.map { strdup($0) } + [nil]
-        let err = posix_spawn(&pid, agent.path, nil, &attr, cArgv, cEnv)
-        for p in cArgv { if let p { free(p) } }
-        for p in cEnv { if let p { free(p) } }
-        posix_spawnattr_destroy(&attr)
-        guard err == 0 else { return nil }
-        return pid
+
+        log.info("launching agent \(exe.path)")
+        let pid = posixSpawn(exe: exe.path, arguments: arguments, env: env)
+        if let pid, pid > 0 {
+            log.info("spawned agent pid=\(pid)")
+            completion(pid)
+        } else {
+            log.error("posix_spawn failed exe=\(exe.path)")
+            completion(nil)
+        }
     }
 
     func watch(pid: pid_t, onExit: @escaping () -> Void) {
@@ -57,13 +64,53 @@ final class AgentSpawner {
         src.resume()
     }
 
-    static func agentURL() -> URL? {
-        let bundle = Bundle.main.bundleURL
-        let nested = bundle.appendingPathComponent("Contents/Helpers/lumina-agent.app/Contents/MacOS/lumina-agent")
-        if FileManager.default.isExecutableFile(atPath: nested.path) { return nested }
-        let sibling = bundle.deletingLastPathComponent().appendingPathComponent("lumina-agent")
-        if FileManager.default.isExecutableFile(atPath: sibling.path) { return sibling }
+    static func nestedAgentAppURL() -> URL? {
+        let names = ["Lumina Agent.app", "lumina-agent.app"]
+        for name in names {
+            let nested = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/\(name)")
+            let exe = nested.appendingPathComponent("Contents/MacOS/lumina-agent")
+            if FileManager.default.isExecutableFile(atPath: exe.path) { return nested }
+        }
         return nil
+    }
+
+    static func nestedAgentExecutable() -> URL? {
+        nestedAgentAppURL()?.appendingPathComponent("Contents/MacOS/lumina-agent")
+    }
+
+    private func posixSpawn(exe: String, arguments: [String], env: [String: String]) -> pid_t? {
+        let argvStrings = [exe] + arguments
+        let envStrings = env.map { "\($0.key)=\($0.value)" }
+        var cArgv = argvStrings.map { strdup($0) }
+        cArgv.append(nil)
+        var cEnv = envStrings.map { strdup($0) }
+        cEnv.append(nil)
+        defer {
+            cArgv.dropLast().forEach { free($0) }
+            cEnv.dropLast().forEach { free($0) }
+        }
+
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+
+        // Detach so extra quit does not kill the agent (DESIGN §3 / BP-31).
+        let setsid: Int16 = 0x0400
+        posix_spawnattr_setflags(&attr, setsid)
+        // Child must own TCC, otherwise AXIsProcessTrusted follows the extra.
+        _ = responsibility_spawnattrs_setdisclaim(&attr, 1)
+
+        var pid: pid_t = 0
+        let rc = cArgv.withUnsafeMutableBufferPointer { argvBuf in
+            cEnv.withUnsafeMutableBufferPointer { envBuf in
+                posix_spawn(&pid, exe, nil, &attr, argvBuf.baseAddress, envBuf.baseAddress)
+            }
+        }
+        if rc != 0 {
+            log.error("posix_spawn errno=\(rc) \(String(cString: strerror(rc)))")
+            return nil
+        }
+        return pid
     }
 }
 #endif

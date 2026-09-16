@@ -2,11 +2,10 @@
 import AppKit
 import ApplicationServices
 
-final class FirstRunController {
+final class FirstRunController: @unchecked Sendable {
     let flagPath: String
     weak var extra: ExtraController?
-    private var timer: Timer?
-    private var alert: NSAlert?
+    private var showing = false
 
     init(flagPath: String, extra: ExtraController) {
         self.flagPath = flagPath
@@ -14,13 +13,15 @@ final class FirstRunController {
     }
 
     func sheetIfNeeded() {
-        if FileManager.default.fileExists(atPath: flagPath), extra?.currentRecord() != nil {
-            return
-        }
-        DispatchQueue.main.async { self.show() }
+        if showing { return }
+        if FileManager.default.fileExists(atPath: flagPath) { return }
+        showing = true
+        show()
     }
 
     private func show() {
+        defer { showing = false }
+        if FileManager.default.fileExists(atPath: flagPath) { return }
         extra?.writeDefaultConfigIfNeeded()
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -39,12 +40,19 @@ final class FirstRunController {
         alert.addButton(withTitle: "Open Accessibility Settings")
         alert.addButton(withTitle: "Later")
         alert.window.level = .floating
-        self.alert = alert
         let response = alert.runModal()
+        markDone()
         if response == .alertFirstButtonReturn {
             openAccessibility()
         }
-        pollAX()
+    }
+
+    private func markDone() {
+        try? FileManager.default.createDirectory(
+            atPath: (flagPath as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+        FileManager.default.createFile(atPath: flagPath, contents: nil)
     }
 
     private func openAccessibility() {
@@ -54,28 +62,6 @@ final class FirstRunController {
         ]
         for s in urls {
             if let url = URL(string: s), NSWorkspace.shared.open(url) { return }
-        }
-    }
-
-    private func pollAX() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] t in
-            guard let self else { return }
-            if self.extra?.currentRecord() != nil {
-                self.extra?.pollStatus()
-            }
-            // Agent reports axTrusted via status; extra must not prompt as itself.
-            if let rec = self.extra?.currentRecord(),
-               let resp = Client.request(socketPath: rec.socket, cmd: "status", args: [:], role: .agent),
-               resp.data?.object?["axTrusted"]?.bool == true
-            {
-                t.invalidate()
-                try? FileManager.default.createDirectory(
-                    atPath: (self.flagPath as NSString).deletingLastPathComponent,
-                    withIntermediateDirectories: true
-                )
-                FileManager.default.createFile(atPath: self.flagPath, contents: nil)
-            }
         }
     }
 }

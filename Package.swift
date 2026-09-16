@@ -29,7 +29,8 @@ let layoutTargets: [Target] = [
 let appleProducts: [Product] = [
     .executable(name: "lumina", targets: ["LuminaCLI"]),
     .executable(name: "lumina-agent", targets: ["LuminaAgent"]),
-    .executable(name: "Lumina", targets: ["Lumina"]),
+    // Not "Lumina": default APFS is case-insensitive, so it would collide with "lumina".
+    .executable(name: "LuminaExtra", targets: ["Lumina"]),
 ]
 let appleTargets: [Target] = [
     .executableTarget(

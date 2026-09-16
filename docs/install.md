@@ -25,13 +25,13 @@ That produces `dist/Lumina.app`:
 
 | Binary | Path | Bundle id |
 |---|---|---|
-| Menu extra | `Contents/MacOS/Lumina` | `com.zelmari.lumina` |
-| Agent | `Contents/Helpers/lumina-agent.app` | `com.zelmari.lumina.agent` |
+| Menu extra | `Contents/MacOS/LuminaExtra` | `com.zelmari.lumina` |
+| Agent | `Contents/Helpers/Lumina Agent.app` | `com.zelmari.lumina.agent` |
 | CLI | `Contents/MacOS/lumina` | socket client only |
 
 `file` on all three Mach-Os should be arm64, not universal. `Contents/MacOS/lumina version` prints the CLI version.
 
-Grant Accessibility to **Lumina Agent**, not the menu extra and not a Homebrew symlink of `lumina`. Ad-hoc signatures re-prompt Accessibility on every new signature.
+Grant Accessibility to **Lumina Agent**, not the menu extra and not a Homebrew symlink of `lumina`. `bundle.sh` pins the ad-hoc designated requirement to the agent bundle id so local rebuilds should keep that grant. A Developer ID build still uses the cert’s requirement (see below).
 
 Launch at login is opt-in (default off) via the menu extra (`SMAppService.mainApp`). It starts the extra, which does a **fresh** start (one agent, space 1). Do not ship `Contents/Library/LaunchAgents/`.
 

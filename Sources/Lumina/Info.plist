@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>Lumina</string>
+	<string>LuminaExtra</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.zelmari.lumina</string>
 	<key>CFBundleInfoDictionaryVersion</key>

@@ -28,7 +28,7 @@ struct ExtraApp {
     }
 }
 
-final class ExtraController: NSObject {
+final class ExtraController: NSObject, @unchecked Sendable {
     let log = LuminaLog(category: .extra, fileURL: LuminaLog.defaultFileURL())
     let status = StatusItemController()
     let registry: RegistryStore
@@ -61,7 +61,7 @@ final class ExtraController: NSObject {
         status.onQuitThisSpace = { [weak self] in self?.quitCurrent() }
         status.onQuitAll = { [weak self] in self?.quitAll() }
         status.install()
-        let menuPath = LuminaPaths.menuSocketPath(uid: uid, tmpdir: tmpdir)
+        let menuPath = LuminaPaths.resolvedMenuSocketPath(uid: uid, tmpdir: tmpdir)
         let server = MenuSocketServer(path: menuPath, log: log)
         server.onCommand = { [weak self] cmd, id in self?.handleExtra(cmd, id: id) ?? .failure(id: id, error: "gone") }
         try? server.start()
@@ -144,33 +144,35 @@ final class ExtraController: NSObject {
     }
 
     func spawnAgent(runLaunchApps: Bool) {
-        let current = registry.load()
         let id = UUID()
-        let socket = LuminaPaths.agentSocketPath(
+        let socket = LuminaPaths.resolvedAgentSocketPath(
             uid: uid,
             tmpdir: tmpdir,
             instanceId: id.uuidString,
             supportFallback: supportRoot
-        ).primary
+        )
         let display = currentDisplayUUID()
-        guard let pid = spawner.spawn(
+        spawner.spawn(
             instanceId: id,
             socket: socket,
             displayUUID: display,
             crashRecover: false,
             runLaunchApps: runLaunchApps
-        ) else {
-            log.error("spawn failed")
-            return
+        ) { [weak self] pid in
+            guard let self else { return }
+            guard let pid else {
+                self.log.error("spawn failed")
+                return
+            }
+            var next = self.registry.load()
+            next.agents.append(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
+            next.lastCurrentInstanceId = id
+            self.registry.save(next)
+            self.spawner.watch(pid: pid) { [weak self] in
+                self?.agentDied(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
+            }
+            self.pollStatus()
         }
-        var next = current
-        next.agents.append(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
-        next.lastCurrentInstanceId = id
-        registry.save(next)
-        spawner.watch(pid: pid) { [weak self] in
-            self?.agentDied(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
-        }
-        pollStatus()
     }
 
     func currentDisplayUUID() -> String? {
@@ -211,22 +213,25 @@ final class ExtraController: NSObject {
             if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
             registry.save(reg)
         case .restartCrashRecover:
-            if let pid = spawner.spawn(
+            spawner.spawn(
                 instanceId: record.instanceId,
                 socket: record.socket,
-                displayUUID: record.displayUUID,
+                displayUUID: record.displayUUID.isEmpty ? nil : record.displayUUID,
                 crashRecover: true,
                 runLaunchApps: false
-            ) {
-                var reg = registry.load()
+            ) { [weak self] pid in
+                guard let self, let pid else { return }
+                var reg = self.registry.load()
                 if let idx = reg.agents.firstIndex(where: { $0.instanceId == record.instanceId }) {
                     reg.agents[idx].pid = pid
                 }
-                registry.save(reg)
-                spawner.watch(pid: pid) { [weak self] in
+                self.registry.save(reg)
+                self.spawner.watch(pid: pid) { [weak self] in
                     self?.agentDied(InstanceRecord(instanceId: record.instanceId, pid: pid, displayUUID: record.displayUUID, socket: record.socket))
                 }
+                self.pollStatus()
             }
+            return
         }
         pollStatus()
     }
@@ -298,7 +303,6 @@ final class ExtraController: NSObject {
                 loginEnabled: LoginService.enabled,
                 warning: extraWarning(status: st)
             )
-            if !st.axTrusted { firstRun?.sheetIfNeeded() }
         } else {
             status.updateEmpty(loginEnabled: LoginService.enabled)
         }

@@ -3,6 +3,13 @@ import Foundation
 import Darwin
 #endif
 
+/// Darwin `sockaddr_un.sun_path` is 104 bytes including the trailing NUL.
+public let unixSocketPathMaxBytes = 103
+
+public func unixSocketPathFits(_ path: String) -> Bool {
+    path.utf8.count <= unixSocketPathMaxBytes
+}
+
 public enum LuminaPaths {
     public static func runtimeRoot(uid: uid_t, tmpdir: String) -> String {
         "\(tmpdir)/lumina-\(uid)"
@@ -10,6 +17,13 @@ public enum LuminaPaths {
 
     public static func menuSocketPath(uid: uid_t, tmpdir: String) -> String {
         runtimeRoot(uid: uid, tmpdir: tmpdir) + "/menu.sock"
+    }
+
+    /// Path that actually fits in `sockaddr_un`. macOS `$TMPDIR` is often already ~48 bytes.
+    public static func resolvedMenuSocketPath(uid: uid_t, tmpdir: String) -> String {
+        let primary = menuSocketPath(uid: uid, tmpdir: tmpdir)
+        if unixSocketPathFits(primary) { return primary }
+        return "/tmp/lumina-\(uid)-menu.sock"
     }
 
     public static func agentSocketPath(
@@ -21,6 +35,29 @@ public enum LuminaPaths {
         let primary = runtimeRoot(uid: uid, tmpdir: tmpdir) + "/spaces/\(instanceId)/agent.sock"
         let fallback = supportFallback.map { $0 + "/spaces/\(instanceId)/agent.sock" }
         return (primary, fallback)
+    }
+
+    /// Same inputs always yield the same path; extra, agent, and CLI must share this.
+    public static func resolvedAgentSocketPath(
+        uid: uid_t,
+        tmpdir: String,
+        instanceId: String,
+        supportFallback: String?
+    ) -> String {
+        let pair = agentSocketPath(
+            uid: uid,
+            tmpdir: tmpdir,
+            instanceId: instanceId,
+            supportFallback: supportFallback
+        )
+        let candidates = [
+            pair.primary,
+            pair.fallback,
+            runtimeRoot(uid: uid, tmpdir: tmpdir) + "/\(instanceId).sock",
+            "/tmp/lumina-\(uid)/\(instanceId).sock",
+        ].compactMap { $0 }
+        return candidates.first(where: unixSocketPathFits)
+            ?? "/tmp/lumina-\(uid)/\(instanceId).sock"
     }
 
     public static func sessionPath(supportRoot: String, instanceId: String) -> String {

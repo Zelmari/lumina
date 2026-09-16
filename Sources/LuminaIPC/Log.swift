@@ -70,9 +70,13 @@ public final class LuminaLog: @unchecked Sendable {
 #if os(macOS)
 import Darwin
 
+// Darwin.flock is `struct flock` (fcntl); bind flock(2) by symbol name.
+@_silgen_name("flock")
+private func posixFlock(_ fd: Int32, _ operation: Int32) -> Int32
+
 private func flockFile(_ handle: FileHandle, lock: Bool) {
     let fd = handle.fileDescriptor
-    _ = Darwin.flock(fd, lock ? LOCK_EX : LOCK_UN)
+    _ = posixFlock(fd, lock ? LOCK_EX : LOCK_UN)
 }
 #else
 private func flockFile(_ handle: FileHandle, lock: Bool) {

@@ -21,7 +21,7 @@ enum LuminaCLI {
         }
         let uid = getuid()
         let tmp = FileManager.default.temporaryDirectory.path
-        let menu = LuminaPaths.menuSocketPath(uid: uid, tmpdir: tmp)
+        let menu = LuminaPaths.resolvedMenuSocketPath(uid: uid, tmpdir: tmp)
         if CLIArgs.isExtraCommand(request.cmd) || request.cmd == "start" {
             if let resp = unixRequest(path: menu, request: request) {
                 printResponse(resp, log: log)
@@ -48,13 +48,12 @@ enum LuminaCLI {
             log.error("agent not running on this Space")
             exit(2)
         }
-        let agent = LuminaPaths.agentSocketPath(
+        let path = LuminaPaths.resolvedAgentSocketPath(
             uid: uid,
             tmpdir: tmp,
             instanceId: token,
             supportFallback: FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Application Support/Lumina"
         )
-        let path = FileManager.default.fileExists(atPath: agent.primary) ? agent.primary : (agent.fallback ?? agent.primary)
         guard let resp = unixRequest(path: path, request: request) else {
             log.error("agent not running on this Space")
             exit(2)
