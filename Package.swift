@@ -8,7 +8,12 @@ let layoutProducts: [Product] = [
 ]
 
 let layoutTargets: [Target] = [
-    .target(name: "LuminaLayout"),
+    .target(
+        name: "LuminaLayout",
+        dependencies: [
+            .product(name: "TOMLDecoder", package: "TOMLDecoder"),
+        ]
+    ),
     .target(name: "LuminaIPC"),
     .testTarget(
         name: "LuminaLayoutTests",
@@ -52,6 +57,9 @@ let package = Package(
         .macOS("15.2"),
     ],
     products: layoutProducts + appleProducts,
+    dependencies: [
+        .package(url: "https://github.com/dduan/TOMLDecoder", from: "0.4.4"),
+    ],
     targets: layoutTargets + appleTargets,
     swiftLanguageModes: [.v6]
 )
