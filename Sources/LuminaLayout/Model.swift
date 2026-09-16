@@ -223,6 +223,8 @@ public struct Session: Equatable, Sendable, Codable {
     public var paused: Bool
     /// Next monotonic NodeId. Starts at 1.
     public var nextNodeId: UInt64
+    /// Native-FS bookmarks live in RAM only, not session.json.
+    public var nativeFSWindows: [WindowRef]
 
     public init(
         instanceId: UUID,
@@ -231,7 +233,8 @@ public struct Session: Equatable, Sendable, Codable {
         focusedSpace: SpaceId,
         spaces: [SpaceId: Space],
         paused: Bool = false,
-        nextNodeId: UInt64 = 1
+        nextNodeId: UInt64 = 1,
+        nativeFSWindows: [WindowRef] = []
     ) {
         self.instanceId = instanceId
         self.nativeSpaceToken = nativeSpaceToken ?? instanceId
@@ -240,6 +243,7 @@ public struct Session: Equatable, Sendable, Codable {
         self.spaces = spaces
         self.paused = paused
         self.nextNodeId = nextNodeId
+        self.nativeFSWindows = nativeFSWindows
     }
 
     /// Builds spaces `1...count`, `focusedSpace = 1`, all `root == nil`, `paused = false`.
