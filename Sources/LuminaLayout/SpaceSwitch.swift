@@ -54,7 +54,11 @@ extension Session {
     public func floatToggle(space spaceId: SpaceId, usableIsWide: Bool) -> Session {
         guard let space = spaces[spaceId], let focused = space.focusedWindow else { return self }
         if let leaf = space.leaf(containing: focused) {
-            return floatLeaf(space: spaceId, nodeId: leaf.id).0
+            var session = self
+            if space.luminaFullscreen == leaf.id {
+                session = session.exitLuminaFS(space: spaceId)
+            }
+            return session.floatLeaf(space: spaceId, nodeId: leaf.id).0
         }
         if let idx = space.floating.firstIndex(where: { $0.cgWindowId == focused }) {
             var session = self
