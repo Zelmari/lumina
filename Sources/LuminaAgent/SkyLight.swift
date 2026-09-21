@@ -29,7 +29,8 @@ public final class SkyLightClient {
 
     public func currentSpaceId(displayUUID: String) -> UInt64? {
         guard let connFn = slsMainConnectionID, let get = slsManagedDisplayGetCurrentSpace else { return nil }
-        return get(connFn(), displayUUID as CFString)
+        let id = get(connFn(), displayUUID as CFString)
+        return id == 0 ? nil : id
     }
 
     private func logOnce(_ message: String) {

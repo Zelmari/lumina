@@ -142,7 +142,11 @@ public final class AXAdapter {
     }
 
     public func shouldIgnoreAXGeometry(window: LuminaLayout.Window) -> Bool {
-        inFlight[window.cgWindowId] == window.generation || inFlight[window.cgWindowId] != nil
+        LuminaLayout.shouldIgnoreAXGeometry(windowGeneration: window.generation, inFlight: inFlight[window.cgWindowId])
+    }
+
+    public func clearInFlight(id: UInt32, generation: UInt64) {
+        if inFlight[id] == generation { inFlight[id] = nil }
     }
 
     public func generationInFlight(for id: UInt32) -> Bool {
@@ -185,18 +189,26 @@ public final class AXAdapter {
 
     private func applyFrame(_ rect: Rect, of element: AXUIElement) -> Bool {
         AXUIElementSetMessagingTimeout(element, 0.05)
-        var size = CGSize(width: rect.w, height: rect.h)
-        var point = CGPoint(x: rect.x, y: rect.y)
-        guard let sizeVal = AXValueCreate(.cgSize, &size),
-              let posVal = AXValueCreate(.cgPoint, &point)
-        else { return false }
-        let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
-        let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
-        if fatal.contains(s1) || fatal.contains(pos) || fatal.contains(s2) { return false }
-        // Safari/WebKit often return cannotComplete/failure even when the window moves.
-        return true
+        func write() -> Bool {
+            var size = CGSize(width: rect.w, height: rect.h)
+            var point = CGPoint(x: rect.x, y: rect.y)
+            guard let sizeVal = AXValueCreate(.cgSize, &size),
+                  let posVal = AXValueCreate(.cgPoint, &point)
+            else { return false }
+            let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+            let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+            let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+            let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
+            return !fatal.contains(s1) && !fatal.contains(pos) && !fatal.contains(s2)
+        }
+        guard write(), let got = frame(of: element) else { return false }
+        if framesClose(got, rect) { return true }
+        guard write(), let again = frame(of: element) else { return false }
+        return framesClose(again, rect)
+    }
+
+    private func framesClose(_ a: Rect, _ b: Rect) -> Bool {
+        abs(a.x - b.x) <= 2 && abs(a.y - b.y) <= 2 && abs(a.w - b.w) <= 2 && abs(a.h - b.h) <= 2
     }
 
     public func pressClose(of element: AXUIElement) {
@@ -255,7 +267,10 @@ public final class AXAdapter {
         AXUIElementSetAttributeValue(element, attr, value ? kCFBooleanTrue : kCFBooleanFalse)
     }
 
-    public func setFocused(_ element: AXUIElement) {
+    public func setFocused(_ element: AXUIElement, raise: Bool = false) {
+        if raise {
+            AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+        }
         AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
@@ -409,23 +424,23 @@ public func classifyInput(
         guard cgOwnerPID(row) == pid, let rect = cgWindowRect(row), rect.w >= 8, rect.h >= 8 else { return nil }
         return rect
     }
-    let axOnScreen = axFrameLooksOnScreen(frame: frame, onScreenFrames: pidOnScreenFrames)
-    let idOnScreen = onScreenIds.contains(id) && frame.w >= 8 && frame.h >= 8
+    let idOnScreen = onScreenIds.contains(id)
     let layer = cgWindowLayer(onScreenRows.first { cgWindowID($0) == id } ?? [:])
     let screens = NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: adapter.menuBarScreenMaxY)?.axFrame }
+    let bundle = adapter.bundleId(pid: pid)
     let input = ClassifyInput(
-        bundleId: adapter.bundleId(pid: pid),
+        bundleId: bundle,
         title: adapter.title(of: element),
         role: adapter.role(of: element),
         subrole: adapter.subrole(of: element),
         hasZoomButton: adapter.hasZoomButton(element),
         width: frame.w,
         height: frame.h,
-        isOnScreen: axOnScreen || idOnScreen,
+        isOnScreen: idOnScreen,
         pidAlreadyHasOnScreenWindow: !pidOnScreenFrames.isEmpty,
-        layerOrIsHUD: layer > 0,
+        layerOrIsHUD: layer >= 3,
         isPiP: adapter.subrole(of: element) == "AXPictureInPictureWindow",
-        isVisualIntelligenceOrSiriHUD: false,
+        isVisualIntelligenceOrSiriHUD: Classify.visualIntelligenceBundleIds.contains(bundle ?? ""),
         centerOnBoundDisplay: shouldManageOnBoundDisplay(rect: frame, bound: bound.axFrame, screens: screens)
     )
     return (input, id, pid)

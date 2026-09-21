@@ -21,7 +21,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var userPaused = false
     public var displayGone = false
     public var bound: BoundDisplay?
-    public var lastSkyLightId: UInt64?
+    /// SkyLight id captured once, when this agent bound its display.
+    public var boundSkyLightId: UInt64?
+    /// Latest SkyLight id, used only to notice a native Space change.
+    public var observedSkyLightId: UInt64?
+    var lastFocusedByPid: [pid_t: UInt32] = [:]
     public var axTrusted: Bool { AXIsProcessTrusted() }
     public var hotkeys = Hotkeys()
     public var secureInput = false
@@ -76,6 +80,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             focusedCenter: nil,
             preferredUUID: preferredDisplayUUID
         )
+        if let uuid = bound?.uuid, boundSkyLightId == nil {
+            boundSkyLightId = skyLight.currentSpaceId(displayUUID: uuid)
+            observedSkyLightId = boundSkyLightId
+        }
         hotkeys.isPaused = { [weak self] in
             guard let self else { return true }
             return self.userPaused || self.displayGone || !self.isCurrent
@@ -84,9 +92,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             self?.handleBound(cmd)
         }
         if shouldRegisterHotkeys(isCurrent: isCurrent, paused: userPaused || displayGone) {
-            hotkeys.register(bindings: config.bindings)
-            if let err = hotkeys.hotkeyError { log.error("hotkeys \(err)") }
-            else { log.info("hotkeys registered \(config.bindings.count)") }
+            registerHotkeys()
         }
         do {
             let server = AgentSocketServer(path: socketPath, log: log)
@@ -105,7 +111,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "agent start instance=\(instanceId) crashRecover=\(crashRecover) axTrusted=\(axTrusted) bundle=\(Bundle.main.bundleIdentifier ?? "?")"
         )
         if axTrusted {
-            bootLayoutIfNeeded()
+            MutationQueue.shared.hop { [weak self] in self?.bootLayoutIfNeeded() }
         } else {
             log.info("AX not trusted; waiting (will prompt as Lumina Agent if still denied)")
             pollUntilAXTrusted()
@@ -116,13 +122,29 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         unstashAll()
         rescueOffscreenWindows()
         writeSession(stash: [])
-        hotkeys.unregister()
+        unregisterHotkeys()
         server?.stop()
         ffmTimer?.cancel()
         secureTimer?.cancel()
         axPollTimer?.cancel()
         configWatcher?.cancel()
         configDebounce?.cancel()
+    }
+
+    /// Carbon hotkeys are main-thread only. Never sync to main from the mutation queue.
+    func registerHotkeys(_ bindings: [Binding]? = nil) {
+        let bindings = bindings ?? config.bindings
+        let work = { [weak self] in
+            guard let self else { return }
+            self.hotkeys.register(bindings: bindings)
+            if let err = self.hotkeys.hotkeyError { self.log.error("hotkeys \(err)") }
+        }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
+    }
+
+    func unregisterHotkeys() {
+        let work = { [weak self] in self?.hotkeys.unregister() }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     func bootLayout() {
@@ -137,7 +159,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let rebuild = rebuildSpaceId(crashRecover: crashRecover, sessionFocused: focusedFromFile, spaceCount: config.spaceCount)
         session.focusedSpace = rebuild
         session.paused = false
-        session.nativeFSWindows = []
         if runLaunchApps {
             launchConfiguredApps()
         }
@@ -167,6 +188,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         applyFrames()
         watchRunningApps()
+        startOrStopFFM()
         log.info("bootLayout tiled=\(tileable.count) floating=\(floaters.count) usable=\(usable.w)x\(usable.h)")
     }
 
@@ -200,7 +222,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 self.axPollTimer = nil
                 NSApp.setActivationPolicy(.accessory)
                 self.log.info("AX trusted; starting layout")
-                self.bootLayoutIfNeeded()
+                MutationQueue.shared.hop { [weak self] in self?.bootLayoutIfNeeded() }
                 return
             }
             if !prompted {
@@ -242,7 +264,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 ) else { continue }
                 let result = classify(input, rules: config.windowRules)
                 log.info(
-                    "classify \(app.bundleIdentifier ?? "?") '\(input.title ?? "")' role=\(input.role ?? "?") sub=\(input.subrole ?? "?") zoom=\(input.hasZoomButton) \(Int(input.width))x\(Int(input.height)) layerHUD=\(input.layerOrIsHUD) -> \(result) id=\(id)"
+                    "classify \(app.bundleIdentifier ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
                 )
                 if result == .unmanaged || result == .ignored { continue }
                 observers.watchWindow(el, pid: pid)
@@ -284,14 +306,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     @objc func appLaunched(_ n: Notification) {
+        guard isCurrent, !userPaused else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             let pid = app.processIdentifier
             DispatchQueue.main.async { self.observers.watch(pid: pid) }
             MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.adoptWindows(pid: pid)
+                guard let self, self.isCurrent else { return }
+                self.adoptWindows(pid: pid)
             }
             MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-                self?.adoptWindows(pid: pid)
+                guard let self, self.isCurrent else { return }
+                self.adoptWindows(pid: pid)
             }
         }
     }
@@ -307,7 +332,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     @objc func appHidden(_ n: Notification) {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-            MutationQueue.shared.hop { self.adapter.unhide(pid: app.processIdentifier) }
+            MutationQueue.shared.hop {
+                guard self.isCurrent, !self.userPaused, !self.ownedWindows(pid: app.processIdentifier).isEmpty else { return }
+                self.adapter.unhide(pid: app.processIdentifier)
+            }
         }
     }
 
@@ -331,6 +359,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     @objc func didWake(_ n: Notification) {
         MutationQueue.shared.hop {
             self.recomputeCurrentToken(reason: .wake)
+            guard self.isCurrent else { return }
             self.applyFrames()
             self.restashOffspace()
         }
@@ -371,10 +400,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                let w = session.current.leaf(containing: id)?.leaf,
                adapter.shouldIgnoreAXGeometry(window: w)
             { return }
-            adapter.deminiaturize(element)
             let retryId = adapter.windowId(for: element)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                guard let self, let retryId, let el = self.elements[retryId] else { return }
+            adapter.deminiaturize(element)
+            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                guard let self, let retryId, let el = self.elements[retryId], self.adapter.isMinimized(el) else { return }
                 self.adapter.deminiaturize(el)
             }
         default:
@@ -430,12 +459,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             restashPid(peekPid, on: sid)
             return
         }
-        if let frame = adapter.frame(of: element), shouldPullOnScreen(frame),
-           peekPid.map({ ownedWindows(pid: $0).isEmpty }) ?? true
-        {
-            var dummy = WindowRef(cgWindowId: 0, pid: peekPid ?? 0, lastOnscreenFrame: frame)
-            _ = adapter.setFrame(usableRestoreRect(frame), of: element, tag: &dummy)
-        }
         let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         guard let (input, id, pid) = classifyInput(
             from: element,
@@ -471,7 +494,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         let result = classify(input, rules: config.windowRules)
         log.info(
-            "onCreate \(input.bundleId ?? "?") '\(input.title ?? "")' role=\(input.role ?? "?") sub=\(input.subrole ?? "?") zoom=\(input.hasZoomButton) \(Int(input.width))x\(Int(input.height)) center=\(input.centerOnBoundDisplay) onScreen=\(input.isOnScreen) -> \(result) id=\(id)"
+            "onCreate \(input.bundleId ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
         )
         if result == .unmanaged || result == .ignored { return }
         claimed.insert(id)
@@ -515,10 +538,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let ownedForPid = session.current.tiledLeaves().compactMap(\.leaf).filter { $0.pid == pid }
             + session.current.floating.filter { $0.pid == pid }
         let stale = ownedForPid.filter { !live.contains($0.cgWindowId) && $0.cgWindowId != liveId }
-        guard stale.count == 1, !owned(liveId) else { return nil }
-        let old = stale[0].cgWindowId
-        guard let el = elements[old], CFEqual(el, element) else { return nil }
-        return old
+        let unmatched = ownedForPid.filter { !live.contains($0.cgWindowId) }
+        guard stale.count == 1, unmatched.count == 1, !owned(liveId) else { return nil }
+        return stale[0].cgWindowId
     }
 
     func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
@@ -547,12 +569,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 log.info("destroy remove id=\(id)")
                 let wasFS = session.current.luminaFullscreen != nil
                     && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
-                if wasFS {
-                    session = session.closeFocused(space: session.focusedSpace)
-                    unstashSpace(session.focusedSpace)
-                } else {
-                    session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
+                for spaceId in Array(session.spaces.keys) {
+                    if spaceId == session.focusedSpace {
+                        session = session.closeWindow(space: spaceId, cgWindowId: id)
+                    } else {
+                        session = session.removeWindow(space: spaceId, cgWindowId: id)
+                    }
                 }
+                if wasFS { unstashSpace(session.focusedSpace) }
                 elements[id] = nil
                 adapter.forgetWindowId(id)
             }
@@ -573,7 +597,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func onMovedOrResized(_ element: AXUIElement, resized: Bool) {
         guard let id = adapter.windowId(for: element) else { return }
-        if let w = lookup(id), adapter.shouldIgnoreAXGeometry(window: w) { return }
+        if let w = lookup(id), adapter.shouldIgnoreAXGeometry(window: w) {
+            adapter.clearInFlight(id: id, generation: w.generation)
+            return
+        }
         if !resized {
             handleTitleBarMove(id: id, element: element)
             return
@@ -603,6 +630,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             applyFrames()
             return
         }
+        if onScreen.contains(id), !adapter.isFullscreen(element),
+           session.nativeFSWindows.contains(where: { $0.cgWindowId == id })
+        {
+            if let parked = session.nativeFSWindows.first(where: { $0.cgWindowId == id }) {
+                session = session.reinsertNativeFS(parked, usableIsWide: usableIsWide(usable))
+                applyFrames()
+                return
+            }
+        }
         guard session.current.leaf(containing: id) != nil else { return }
         switch classifyInPlaceResize(frame: frame, usable: usable) {
         case .fill:
@@ -622,8 +658,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let axPoint = Point(x: Double(loc.x), y: menuBarMaxY() - Double(loc.y))
         let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
         let start = moveStart
+        if session.current.floating.contains(where: { $0.cgWindowId == id && $0.role == .floating }) {
+            if var space = session.spaces[session.focusedSpace],
+               let idx = space.floating.firstIndex(where: { $0.cgWindowId == id })
+            {
+                space.floating[idx].lastOnscreenFrame = frame
+                session.spaces[session.focusedSpace] = space
+            }
+            return
+        }
         if start == nil {
-            moveStart = (id, frame.center, nowCount)
+            let origin = lookup(id)?.lastOnscreenFrame.center ?? frame.center
+            moveStart = (id, origin, nowCount)
             return
         }
         guard let start, start.0 == id else { return }
@@ -639,8 +685,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if NSEvent.pressedMouseButtons == 0 {
             if shouldTitleBarSwap(probe), let other = over {
                 session = session.swap(space: session.focusedSpace, a: id, b: other)
-                applyFrames()
+            } else if let leaf = session.current.leaf(containing: id),
+                      let rect = frames(
+                        space: session.current,
+                        usable: bound?.usableRect(gaps: config.gaps) ?? frame,
+                        gaps: config.gaps
+                      )[leaf.id],
+                      var window = leaf.leaf
+            {
+                _ = adapter.setFrame(rect, of: element, tag: &window)
             }
+            applyFrames()
             moveStart = nil
         }
     }
@@ -650,7 +705,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         guard let (input, _, _) = classifyInput(from: element, adapter: adapter, bound: bound, onScreenIds: onScreen) else { return }
         let result = classify(input, rules: config.windowRules)
-        if result == .tiled, session.current.floating.contains(where: { $0.cgWindowId == id }) {
+        if result == .floating, let leaf = session.current.leaf(containing: id) {
+            let (after, _) = session.floatLeaf(space: session.focusedSpace, nodeId: leaf.id)
+            session = after
+            applyFrames()
+        } else if result == .tiled, session.current.floating.contains(where: { $0.cgWindowId == id }) {
             session = session.floatToggle(space: session.focusedSpace, usableIsWide: usableIsWide(bound.usableRect(gaps: config.gaps)))
             applyFrames()
         }
@@ -716,8 +775,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func handleAgent(_ cmd: AgentCmd, id: String) -> IPCResponse {
         switch cmd {
+        case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces:
+            break
+        default:
+            if userPaused || displayGone || !isCurrent { return .success(id: id) }
+        }
+        switch cmd {
         case .workspace(let n):
-            if let space = resolveWorkspace(id: n, count: session.spaceCount) { switchSpace(space) }
+            handleBound(.workspace(n))
             return .success(id: id)
         case .workspacePrev:
             handleBound(.workspacePrev); return .success(id: id)
@@ -741,12 +806,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             handleBound(.close); return .success(id: id)
         case .pause:
             userPaused = true
-            hotkeys.unregister()
+            unregisterHotkeys()
+            startOrStopFFM()
             return .success(id: id)
         case .resume:
             if !displayGone {
                 userPaused = false
-                if isCurrent { hotkeys.register(bindings: config.bindings) }
+                if isCurrent { registerHotkeys() }
+                startOrStopFFM()
             }
             return .success(id: id)
         case .reload:
@@ -767,7 +834,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return .success(id: id)
         case .yield:
             isCurrent = false
-            hotkeys.unregister()
+            unregisterHotkeys()
+            startOrStopFFM()
             return .success(id: id)
         }
     }
@@ -781,6 +849,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let space = session.current
         let rects = frames(space: space, usable: usable, gaps: config.gaps)
         let fs = space.luminaFullscreen
+        let liveIds = cgWindowIds()
         var ghosts: [UInt32] = []
         for (nodeId, rect) in rects {
             if MutationQueue.shared.shouldSkip(started: started) {
@@ -791,10 +860,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard var node = space.nodes[nodeId], var window = node.leaf,
                   let el = resolvedElement(for: window)
             else {
-                if let node = space.nodes[nodeId], let window = node.leaf {
-                    log.info("applyFrames skip missing AX window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
+                if let node = space.nodes[nodeId], let window = node.leaf, !liveIds.contains(window.cgWindowId) {
+                    log.info("applyFrames missing window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
                     ghosts.append(window.cgWindowId)
                 }
+                continue
+            }
+            if let live = adapter.frame(of: el), framesClose(live, rect, slop: 1) {
+                window.lastOnscreenFrame = rect
+                node.leaf = window
+                var s = session.spaces[session.focusedSpace]!
+                s.setNode(node)
+                session.spaces[session.focusedSpace] = s
                 continue
             }
             window.lastOnscreenFrame = rect
@@ -804,24 +881,23 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             s.setNode(node)
             session.spaces[session.focusedSpace] = s
             if result == .failed {
-                log.info("setFrame failed window=\(window.cgWindowId); leaving tiled")
+                log.info("setFrame failed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); floating")
+                let (after, _) = session.floatLeaf(space: session.focusedSpace, nodeId: nodeId)
+                session = after
             }
         }
         if let fs, let node = space.nodes[fs], var window = node.leaf, let el = resolvedElement(for: window) {
             _ = adapter.setFrame(usable, of: el, tag: &window)
         }
-        for floater in space.floating where floater.role == .floating {
-            var w = floater
-            w.lastOnscreenFrame = usableRestoreRect(w.lastOnscreenFrame)
-            if let el = resolvedElement(for: w) {
-                _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &w)
+        if var s = session.spaces[session.focusedSpace] {
+            for i in s.floating.indices where s.floating[i].role == .floating {
+                guard let el = resolvedElement(for: s.floating[i]),
+                      let live = adapter.frame(of: el),
+                      !framesClose(live, s.floating[i].lastOnscreenFrame, slop: 2)
+                else { continue }
+                s.floating[i].lastOnscreenFrame = live
             }
-            if var s = session.spaces[session.focusedSpace],
-               let idx = s.floating.firstIndex(where: { $0.cgWindowId == w.cgWindowId })
-            {
-                s.floating[idx].lastOnscreenFrame = w.lastOnscreenFrame
-                session.spaces[session.focusedSpace] = s
-            }
+            session.spaces[session.focusedSpace] = s
         }
         if !ghosts.isEmpty, !retryingAfterGhosts {
             for id in ghosts {
@@ -856,7 +932,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) {
-        guard let bound else { return }
+        guard isCurrent, let bound else { return }
         let spaceId = spaceId ?? session.focusedSpace
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
         for id in ids {
@@ -882,9 +958,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let height = current?.h ?? window.lastOnscreenFrame.h
             let width = current?.w ?? window.lastOnscreenFrame.w
             let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
-            let parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width)
+            let inset: Double = window.bundleId == "us.zoom.xos" ? 0 : 1
+            let parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width, inset: inset)
             _ = adapter.setStashFrame(parked, of: el, tag: &window)
-            if let after = adapter.frame(of: el) ?? cgWindowRect(id: id), after.intersects(bound.axVisibleFrame) {
+            if let after = adapter.frame(of: el) ?? cgWindowRect(id: id),
+               after.intersection(bound.axVisibleFrame).w > 8,
+               after.intersection(bound.axVisibleFrame).h > 8
+            {
                 // Min-size apps ignore 1×8. Keep 1px on-display and hang the rest above the menu bar.
                 let hang = Rect(
                     x: parked.x,
@@ -1067,16 +1147,26 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         pid == getpid() || adapter.bundleId(pid: pid)?.hasPrefix("com.zelmari.lumina") == true
     }
 
+    func cgWindowIds() -> Set<UInt32> {
+        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return Set(info.compactMap(cgWindowID))
+    }
+
+    func framesClose(_ a: Rect, _ b: Rect, slop: Double) -> Bool {
+        abs(a.x - b.x) <= slop && abs(a.y - b.y) <= slop && abs(a.w - b.w) <= slop && abs(a.h - b.h) <= slop
+    }
+
     func rescueOffscreenWindows() {
+        guard let bound else { return }
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
         let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
         for row in info {
             guard let id = cgWindowID(row), let pid = cgOwnerPID(row), let rect = cgWindowRect(row) else { continue }
             if isOurProcess(pid) { continue }
-            if cgWindowLayer(row) > 0 { continue }
-            guard isStrayOffscreen(rect) else { continue }
+            let ours = lookup(id) != nil || isOurStashSliver(rect) || isCornerParked(rect, display: display)
+            guard ours else { continue }
             let w = lookup(id)
-                ?? session.spaces.values.compactMap { $0.leaf(containing: id)?.leaf }.first
                 ?? WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: usableRestoreRect(rect))
             log.info("rescue offscreen window=\(id) pid=\(pid) \(Int(rect.w))x\(Int(rect.h))")
             restoreWindow(w)
@@ -1107,6 +1197,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if isOurStashSliver(rect) || isSliver(rect) { return true }
         guard let bound else { return false }
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        if isCornerParked(rect, display: display) { return true }
         if isStashedOffDisplay(rect, display: display) { return true }
         return display.axFrame.intersects(rect) && !display.axVisibleFrame.intersects(rect)
     }
@@ -1150,10 +1241,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         {
             return sid
         }
-        let real = adapter.windows(pid: pid).filter(isTileCandidate)
-        if real.count <= owned.count {
-            return elsewhere[0].0
-        }
         return nil
     }
 
@@ -1182,6 +1269,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func unstashLeftovers() -> [StashEntry] {
         var entries: [StashEntry] = []
+        if let dir = ProcessInfo.processInfo.environment["LUMINA_UNSTASH_FROM"] {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            for name in names where name.hasSuffix(".json") {
+                let path = dir + "/" + name
+                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                   let file = try? SessionFile.decode(data)
+                {
+                    entries.append(contentsOf: file.stash)
+                }
+                try? FileManager.default.removeItem(atPath: path)
+            }
+            try? FileManager.default.removeItem(atPath: dir)
+        }
         if let data = try? Data(contentsOf: URL(fileURLWithPath: sessionPath)),
            let file = try? SessionFile.decode(data)
         {
@@ -1236,7 +1336,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func focusDir(_ dir: Direction) {
         guard let target = spatialTarget(dir), let el = elements[target.cgWindowId] else { return }
-        adapter.setFocused(el)
+        adapter.setFocused(el, raise: true)
         var space = session.current
         space.focusedWindow = target.cgWindowId
         if target.role == .tiled, let leaf = space.leaf(containing: target.cgWindowId) {
@@ -1317,6 +1417,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             space.lastTiledLeaf = leaf.id
         }
         session.spaces[session.focusedSpace] = space
+        if let w = lookup(id) { lastFocusedByPid[w.pid] = id }
     }
 
     func frontmostOwnedWindow() -> UInt32? {
@@ -1364,7 +1465,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func dropPid(_ pid: pid_t) {
         let ids = elements.filter { adapter.pid(of: $0.value) == pid }.map(\.key)
         for id in ids {
-            session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
+            for spaceId in Array(session.spaces.keys) {
+                session = session.removeWindow(space: spaceId, cgWindowId: id)
+            }
             session.nativeFSWindows.removeAll { $0.cgWindowId == id }
             elements[id] = nil
             adapter.forgetWindowId(id)
@@ -1373,51 +1476,67 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func switchToWindowOf(pid: pid_t) {
-        for (spaceId, space) in session.spaces {
-            let hit = space.tiledLeaves().first { $0.leaf?.pid == pid }?.leaf?.cgWindowId
-                ?? space.floating.first { $0.pid == pid }?.cgWindowId
-            if let hit, spaceId != session.focusedSpace {
-                var s = session
-                s.spaces[spaceId]?.focusedWindow = hit
-                session = s
-                switchSpace(spaceId)
-                return
-            }
+        let app = AXUIElementCreateApplication(pid)
+        let focused = adapter.focusedWindow(of: app).flatMap { adapter.windowId(for: $0) } ?? lastFocusedByPid[pid]
+        if let focused, owned(focused) {
+            rememberFocus(focused)
+            if let el = elements[focused] { adapter.setFocused(el, raise: true) }
+            return
+        }
+        if let focused, let spaceId = session.spaceContaining(cgWindowId: focused), spaceId != session.focusedSpace {
+            var s = session
+            s.spaces[spaceId]?.focusedWindow = focused
+            session = s
+            switchSpace(spaceId)
+            if let el = elements[focused] { adapter.setFocused(el, raise: true) }
         }
     }
 
     func recomputeCurrentToken(reason: CurrentReason) {
         guard let bound else { return }
         let cg = onScreenCGWindows(intersecting: bound.axFrame)
+        let managed = managedWindowIds()
         let large = cg.contains { row in
-            guard let b = cgWindowRect(row) else { return false }
+            guard let id = cgWindowID(row), managed.contains(id), let b = cgWindowRect(row) else { return false }
             return isLargeOnScreen(width: b.w, height: b.h)
-                && ownedPid(cgOwnerPID(row))
         }
         let cur = skyLight.currentSpaceId(displayUUID: bound.uuid)
+        if let cur { observedSkyLightId = cur }
         let became = recomputeCurrent(
             reason: reason,
             skyLightCurrent: cur,
-            skyLightSelf: lastSkyLightId,
+            skyLightSelf: boundSkyLightId,
             skyLightOthers: [],
             hasLargeOnScreen: large,
             isLastCurrent: isCurrent,
             otherClaims: false
         )
-        if let cur { lastSkyLightId = lastSkyLightId ?? cur }
         if became && !isCurrent {
             isCurrent = true
             reconcile()
-            if !userPaused { hotkeys.register(bindings: config.bindings) }
+            if !userPaused { registerHotkeys() }
         } else if !became && isCurrent {
             isCurrent = false
-            hotkeys.unregister()
+            unregisterHotkeys()
         }
         if reason == .start {
             isCurrent = true
-            if !userPaused { hotkeys.register(bindings: config.bindings) }
+            if !userPaused { registerHotkeys() }
             reconcile()
         }
+        startOrStopFFM()
+    }
+
+    func managedWindowIds() -> Set<UInt32> {
+        var ids = Set<UInt32>()
+        for space in session.spaces.values {
+            for node in space.tiledLeaves() {
+                if let id = node.leaf?.cgWindowId { ids.insert(id) }
+            }
+            for w in space.floating { ids.insert(w.cgWindowId) }
+        }
+        for w in session.nativeFSWindows { ids.insert(w.cgWindowId) }
+        return ids
     }
 
     func ownedPid(_ pid: pid_t?) -> Bool {
@@ -1452,14 +1571,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard let bound else { return }
         if shouldStayPausedForDisplay(boundUUID: bound.uuid, availableUUIDs: available) {
             displayGone = true
-            hotkeys.unregister()
+            unregisterHotkeys()
             log.info("display gone uuid=\(bound.uuid)")
             return
         }
         if displayGone, shouldAutoResume(userPaused: userPaused, boundUUID: bound.uuid, availableUUIDs: available) {
             displayGone = false
             refreshBound()
-            if isCurrent, !userPaused { hotkeys.register(bindings: config.bindings) }
+            if isCurrent, !userPaused { registerHotkeys() }
             applyFrames()
             restashOffspace()
         }
@@ -1467,9 +1586,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func skyLightChanged() -> Bool {
         guard let bound, let cur = skyLight.currentSpaceId(displayUUID: bound.uuid) else { return false }
-        if lastSkyLightId == nil { lastSkyLightId = cur; return false }
-        if lastSkyLightId != cur {
-            lastSkyLightId = cur
+        if observedSkyLightId == nil { observedSkyLightId = cur; return false }
+        if observedSkyLightId != cur {
+            observedSkyLightId = cur
             return true
         }
         return false
@@ -1500,7 +1619,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if next.spaceCount != oldCount {
                 session = session.applySpaceCount(next.spaceCount, usableIsWide: usableIsWide(bound?.usableRect(gaps: next.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)))
             }
-            if isCurrent, !userPaused { hotkeys.register(bindings: next.bindings) }
+            if isCurrent, !userPaused { registerHotkeys(next.bindings) }
             startOrStopFFM()
             applyFrames()
         }
@@ -1537,12 +1656,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func ffmTick() {
-        if shouldIgnoreFFM(mouseButtonsDown: NSEvent.pressedMouseButtons != 0, generationInFlight: false) { return }
-        let loc = NSEvent.mouseLocation
-        let ax = Point(x: Double(loc.x), y: menuBarMaxY() - Double(loc.y))
-        if let hit = spatialWindows().first(where: { $0.frame.contains(point: ax) }), hit.cgWindowId != focusedId() {
-            if let el = elements[hit.cgWindowId] { adapter.setFocused(el) }
+        guard isCurrent, !userPaused, !displayGone else { return }
+        let inFlight = managedWindowIds().contains { adapter.generationInFlight(for: $0) }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let down = NSEvent.pressedMouseButtons != 0
+            let loc = NSEvent.mouseLocation
+            let ax = Point(x: Double(loc.x), y: self.menuBarY() - Double(loc.y))
+            MutationQueue.shared.hop {
+                if shouldIgnoreFFM(mouseButtonsDown: down, generationInFlight: inFlight) { return }
+                if let hit = self.spatialWindows().first(where: { $0.frame.contains(point: ax) }), hit.cgWindowId != self.focusedId() {
+                    if let el = self.elements[hit.cgWindowId] { self.adapter.setFocused(el) }
+                }
+            }
         }
+    }
+
+    func menuBarY() -> Double {
+        adapter.menuBarScreenMaxY
     }
 
     func pollSecureInput() {
@@ -1635,7 +1766,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "isCurrent": .bool(isCurrent),
             "hasOnScreenIncludingSlivers": .bool(hasOnScreenIncludingSlivers()),
             "hotkeyError": hotkeys.hotkeyError.map { .string($0) } ?? .null,
-            "skylightSpaceId": lastSkyLightId.map { .int(Int($0)) } ?? .null,
+            "skylightSpaceId": boundSkyLightId.map { .int(Int($0)) } ?? .null,
         ])
     }
 }

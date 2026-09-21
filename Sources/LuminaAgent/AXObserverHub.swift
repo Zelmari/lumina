@@ -10,6 +10,10 @@ public final class AXObserverHub {
     public var onNotification: ((pid_t, String, AXUIElement) -> Void)?
 
     public func watch(pid: pid_t) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.watch(pid: pid) }
+            return
+        }
         guard observers[pid] == nil else { return }
         var observer: AXObserver?
         let err = AXObserverCreate(pid, { _, element, notification, refcon in
@@ -36,6 +40,10 @@ public final class AXObserverHub {
     }
 
     public func watchWindow(_ element: AXUIElement, pid: pid_t) {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.watchWindow(element, pid: pid) }
+            return
+        }
         watch(pid: pid)
         guard let observer = observers[pid] else { return }
         let refcon = Unmanaged.passUnretained(self).toOpaque()
@@ -52,7 +60,12 @@ public final class AXObserverHub {
     }
 
     public func unwatch(pid: pid_t) {
-        observers[pid] = nil
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in self?.unwatch(pid: pid) }
+            return
+        }
+        guard let observer = observers.removeValue(forKey: pid) else { return }
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
     }
 }
 #endif
