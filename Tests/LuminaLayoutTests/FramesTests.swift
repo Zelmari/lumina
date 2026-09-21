@@ -88,6 +88,23 @@ struct FramesTests {
         #expect(abs(w2.h + w3.h + 8 - 600) < 0.0001)
     }
 
+    @Test func oddWidthGivesRemainderToLastSibling() {
+        let odd = Rect(x: 0, y: 0, w: 801, h: 100)
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(2), usableIsWide: true)
+        let space = session[space1]!
+        let f = frames(space: space, usable: odd, gaps: Gaps(inner: 0, outer: 0))
+        let root = space.nodes[space.root!]!
+        let left = f[root.children[0]]!
+        let right = f[root.children[1]]!
+        #expect(left.w + right.w == 801)
+        #expect(left.w == 401 || left.w == 400)
+        #expect(right.w == 801 - left.w)
+        #expect(left.w.rounded() == left.w)
+        #expect(right.w.rounded() == right.w)
+    }
+
     @Test func emptyRootReturnsEmpty() {
         let space = Space(id: space1)
         #expect(frames(space: space, usable: usable, gaps: gaps).isEmpty)

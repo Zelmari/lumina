@@ -44,23 +44,39 @@ private func framesRecurse(
         sum = Double(n)
     }
     let innerTotal = Double(gaps.inner) * Double(max(0, n - 1))
-    if node.axis == .horizontal {
+    let horizontal = node.axis == .horizontal
+    let available = max(0, (horizontal ? rect.width : rect.height) - innerTotal)
+    let spans = wholePointSpans(count: n, available: available, weights: weights, sum: sum)
+    if horizontal {
         var run = rect.minX
-        let available = max(0, rect.width - innerTotal)
         for i in 0..<n {
-            let span = available * (weights[i] / sum)
-            let childRect = Rect(x: run, y: rect.minY, w: span, h: rect.height)
+            let childRect = Rect(x: run, y: rect.minY, w: spans[i], h: rect.height)
             framesRecurse(id: node.children[i], nodes: nodes, rect: childRect, gaps: gaps, into: &out)
-            run += span + Double(gaps.inner)
+            run += spans[i] + Double(gaps.inner)
         }
     } else {
         var run = rect.minY
-        let available = max(0, rect.height - innerTotal)
         for i in 0..<n {
-            let span = available * (weights[i] / sum)
-            let childRect = Rect(x: rect.minX, y: run, w: rect.width, h: span)
+            let childRect = Rect(x: rect.minX, y: run, w: rect.width, h: spans[i])
             framesRecurse(id: node.children[i], nodes: nodes, rect: childRect, gaps: gaps, into: &out)
-            run += span + Double(gaps.inner)
+            run += spans[i] + Double(gaps.inner)
         }
     }
+}
+
+/// Round every span but the last to the nearest point. The last span absorbs the
+/// remainder so the children still fill `available` exactly.
+func wholePointSpans(count n: Int, available: Double, weights: [Double], sum: Double) -> [Double] {
+    guard n > 0 else { return [] }
+    if n == 1 { return [available] }
+    var spans = Array(repeating: 0.0, count: n)
+    var used = 0.0
+    for i in 0..<(n - 1) {
+        let raw = available * (weights[i] / sum)
+        let span = raw.rounded(.toNearestOrAwayFromZero)
+        spans[i] = span
+        used += span
+    }
+    spans[n - 1] = available - used
+    return spans
 }
