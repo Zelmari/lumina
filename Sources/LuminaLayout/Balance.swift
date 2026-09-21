@@ -136,22 +136,27 @@ extension Session {
             let containers = space.nodes.values.filter { !$0.isLeaf && $0.children.count == 2 }
             for container in containers {
                 let b = container.children[1]
+                guard let current = session.spaces[spaceId] else { break }
                 if let adjusted = clampSibling(
                     parent: container,
-                    space: space,
+                    space: current,
                     minSizes: minSizes,
                     usable: usable,
                     gaps: gaps,
                     floor: sliverFloor,
                     unknownUsesFloor: true
                 ) {
-                    var s = space
-                    s.setNode(adjusted)
-                    session.spaces[spaceId] = s
+                    if adjusted.ratio != container.ratio {
+                        var s = current
+                        s.setNode(adjusted)
+                        session.spaces[spaceId] = s
+                        break
+                    }
                     continue
                 }
-                // Both cannot fit. Prefer floating the newly inserted / focused leaf.
-                let offender = preferFloat.flatMap { p in container.children.contains(p) ? p : nil } ?? b
+                // Both cannot fit. Prefer floating the newly inserted / focused leaf,
+                // including when it sits under a nested container.
+                let offender = leafToFloat(in: container, space: space, prefer: preferFloat) ?? b
                 let (after, win) = session.floatLeaf(space: spaceId, nodeId: offender)
                 session = after
                 if let win { floated.append(win) }
@@ -219,6 +224,64 @@ private func axisSpan(_ rect: Rect, axis: Axis) -> Double {
     axis == .horizontal ? rect.w : rect.h
 }
 
+/// Minimum span of a leaf or subtree along `axis`.
+/// A nested split on the same axis sums its children plus inner gaps.
+/// A nested split on the other axis needs the widest child.
+private func subtreeMin(
+    id: NodeId,
+    space: Space,
+    axis: Axis,
+    minSizes: [UInt32: Size],
+    gaps: Gaps,
+    floor: Double,
+    unknownUsesFloor: Bool
+) -> Double {
+    guard let node = space.nodes[id] else { return floor }
+    if node.isLeaf {
+        return minNeeded(leaf: node, axis: axis, minSizes: minSizes, floor: floor, unknownUsesFloor: unknownUsesFloor)
+    }
+    let childMins = node.children.map {
+        subtreeMin(
+            id: $0,
+            space: space,
+            axis: axis,
+            minSizes: minSizes,
+            gaps: gaps,
+            floor: floor,
+            unknownUsesFloor: unknownUsesFloor
+        )
+    }
+    if node.axis == axis {
+        let gap = Double(gaps.inner) * Double(max(0, node.children.count - 1))
+        return childMins.reduce(0, +) + gap
+    }
+    return childMins.max() ?? floor
+}
+
+private func containsNode(_ root: Node, _ target: NodeId, space: Space) -> Bool {
+    if root.id == target { return true }
+    for child in root.children {
+        if let node = space.nodes[child], containsNode(node, target, space: space) { return true }
+    }
+    return false
+}
+
+private func leafToFloat(in container: Node, space: Space, prefer: NodeId?) -> NodeId? {
+    if let prefer, containsNode(container, prefer, space: space), space.nodes[prefer]?.isLeaf == true {
+        return prefer
+    }
+    func firstLeaf(_ id: NodeId) -> NodeId? {
+        guard let node = space.nodes[id] else { return nil }
+        if node.isLeaf { return id }
+        for child in node.children {
+            if let leaf = firstLeaf(child) { return leaf }
+        }
+        return nil
+    }
+    if let last = container.children.last, let leaf = firstLeaf(last) { return leaf }
+    return container.children.first.flatMap(firstLeaf)
+}
+
 private func minNeeded(leaf: Node, axis: Axis, minSizes: [UInt32: Size], floor: Double, unknownUsesFloor: Bool) -> Double {
     guard let window = leaf.leaf else { return floor }
     let size = minSizes[window.cgWindowId] ?? .unknown
@@ -243,11 +306,15 @@ private func childrenMeetMins(
         guard let rect = rects[childId] else { return false }
         let span = axisSpan(rect, axis: parent.axis)
         let needed: Double
-        if let child = space.nodes[childId], child.isLeaf {
-            needed = minNeeded(leaf: child, axis: parent.axis, minSizes: minSizes, floor: floor, unknownUsesFloor: unknownUsesFloor)
-        } else {
-            needed = floor
-        }
+        needed = subtreeMin(
+            id: childId,
+            space: space,
+            axis: parent.axis,
+            minSizes: minSizes,
+            gaps: gaps,
+            floor: floor,
+            unknownUsesFloor: unknownUsesFloor
+        )
         if span + 1e-9 < needed { return false }
     }
     return true
@@ -270,11 +337,15 @@ private func clampSibling(
     let a = parent.children[0]
     let b = parent.children[1]
     func needed(_ id: NodeId) -> Double {
-        guard let node = space.nodes[id] else { return floor }
-        if node.isLeaf {
-            return minNeeded(leaf: node, axis: parent.axis, minSizes: minSizes, floor: floor, unknownUsesFloor: unknownUsesFloor)
-        }
-        return floor
+        subtreeMin(
+            id: id,
+            space: space,
+            axis: parent.axis,
+            minSizes: minSizes,
+            gaps: gaps,
+            floor: floor,
+            unknownUsesFloor: unknownUsesFloor
+        )
     }
     let minA = needed(a)
     let minB = needed(b)
