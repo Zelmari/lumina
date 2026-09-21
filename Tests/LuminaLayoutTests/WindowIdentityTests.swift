@@ -45,7 +45,8 @@ struct WindowIdentityTests {
             ],
             excluding: [1]
         )
-        #expect(id == 2)
+        // The other window is 810pt away, past the 80pt match limit.
+        #expect(id == nil)
     }
 
     @Test func axFrameLooksOnScreenIgnoresWrongId() {
