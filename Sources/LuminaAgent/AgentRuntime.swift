@@ -35,6 +35,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var pasteboardCount: Int = 0
     public var moveStart: (UInt32, Point, Int)?
     public var createDebounce: DispatchWorkItem?
+    var pendingCreates: [AXUIElement] = []
     public var resizeDebounce: DispatchWorkItem?
     public var configDebounce: DispatchWorkItem?
     let preferredDisplayUUID: String?
@@ -246,12 +247,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func collectManagedWindows() -> [(WindowRef)] {
         guard let bound else { return [] }
+        let started = Date()
         var out: [WindowRef] = []
         let cg = onScreenCGWindows(intersecting: bound.axFrame)
         let onScreenIds = Set(cg.compactMap(cgWindowID))
+        let ownerPids = Set(cg.compactMap(cgOwnerPID))
         let apps = NSWorkspace.shared.runningApplications
         for app in apps {
+            if MutationQueue.shared.shouldSkip(started: started) {
+                log.info("collectManagedWindows exceeded 200ms; finishing on the next pass")
+                break
+            }
             let pid = app.processIdentifier
+            if isOurProcess(pid) || !ownerPids.contains(pid) { continue }
             observers.watch(pid: pid)
             for el in adapter.windows(pid: pid) {
                 let used = Set(out.map(\.cgWindowId))
@@ -292,8 +300,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 self?.handleAX(pid: pid, name: name, element: element)
             }
         }
-        for app in NSWorkspace.shared.runningApplications {
-            observers.watch(pid: app.processIdentifier)
+        let owners = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for pid in Set(owners.compactMap(cgOwnerPID)) where !isOurProcess(pid) {
+            observers.watch(pid: pid)
         }
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(self, selector: #selector(appLaunched(_:)), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
@@ -373,8 +382,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if userPaused || displayGone || !isCurrent { return }
         switch name {
         case kAXWindowCreatedNotification:
-            debounceCreate(pid: pid)
-            onCreate(element)
+            scheduleCreate(element)
         case kAXUIElementDestroyedNotification:
             handleDestroy(element)
         case kAXFocusedWindowChangedNotification:
@@ -388,7 +396,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 } else if let sid = session.spaceContaining(cgWindowId: id), sid != session.focusedSpace {
                     stash(ids: [id], space: sid)
                 }
-            } else {
+            } else if !inheritOffscreenTab(pid: pid, candidate: win) {
                 onCreate(win)
             }
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
@@ -411,13 +419,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func debounceCreate(pid: pid_t) {
-        createDebounce?.cancel()
-        let item = DispatchWorkItem { [weak self] in
-            self?.adoptWindows(pid: pid)
+    func scheduleCreate(_ element: AXUIElement) {
+        pendingCreates.append(element)
+        MutationQueue.shared.scheduleLayoutPass { [weak self] in
+            guard let self else { return }
+            let batch = self.pendingCreates
+            self.pendingCreates.removeAll()
+            var claimed = self.session.allWindowIds.union(self.elements.keys)
+            for el in batch {
+                self.onCreate(el, claimed: &claimed, apply: false)
+            }
+            self.applyFrames()
         }
-        createDebounce = item
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.08, execute: item)
     }
 
     func adoptWindows(pid: pid_t, apply: Bool = true) {
@@ -541,6 +554,27 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let unmatched = ownedForPid.filter { !live.contains($0.cgWindowId) }
         guard stale.count == 1, unmatched.count == 1, !owned(liveId) else { return nil }
         return stale[0].cgWindowId
+    }
+
+    /// A hidden tab keeps its AX window and CGWindowID, but drops out of the on-screen list.
+    /// When exactly one managed window of this pid left the screen and one new id appeared, keep the leaf.
+    @discardableResult
+    func inheritOffscreenTab(pid: pid_t, candidate: AXUIElement) -> Bool {
+        guard let bound, let newId = adapter.windowId(for: candidate), !ownedAnywhere(newId) else { return false }
+        let rows = onScreenCGWindows(intersecting: bound.axFrame)
+        let onScreen = Set(rows.compactMap { row -> UInt32? in
+            guard cgOwnerPID(row) == pid else { return nil }
+            return cgWindowID(row)
+        })
+        guard onScreen.contains(newId) else { return false }
+        let ownedForPid = session.current.tiledLeaves().compactMap(\.leaf).filter { $0.pid == pid }
+            + session.current.floating.filter { $0.pid == pid }
+        let left = ownedForPid.filter { !onScreen.contains($0.cgWindowId) }
+        let appeared = onScreen.filter { id in !ownedAnywhere(id) }
+        guard left.count == 1, appeared.count == 1, appeared.first == newId else { return false }
+        log.info("rebind hidden tab \(left[0].cgWindowId) -> \(newId)")
+        rebindOwned(from: left[0].cgWindowId, to: newId, element: candidate, pid: pid)
+        return true
     }
 
     func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
@@ -701,6 +735,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func onTitleChanged(_ element: AXUIElement) {
+        if let pid = adapter.pid(of: element), inheritOffscreenTab(pid: pid, candidate: element) { return }
         guard let bound, let id = adapter.windowId(for: element) else { return }
         let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         guard let (input, _, _) = classifyInput(from: element, adapter: adapter, bound: bound, onScreenIds: onScreen) else { return }
@@ -1050,8 +1085,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func recoverManagedWindows() {
         rebindStaleWindowIds()
         pruneGhostLeaves(space: session.focusedSpace)
+        let started = Date()
+        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let ownerPids = Set(info.compactMap(cgOwnerPID))
         for app in NSWorkspace.shared.runningApplications {
-            adoptWindows(pid: app.processIdentifier, apply: false)
+            if MutationQueue.shared.shouldSkip(started: started) {
+                log.info("recoverManagedWindows exceeded 200ms; finishing on the next pass")
+                break
+            }
+            let pid = app.processIdentifier
+            if isOurProcess(pid) || !ownerPids.contains(pid) { continue }
+            adoptWindows(pid: pid, apply: false)
         }
     }
 

@@ -3,15 +3,16 @@ import Darwin
 import Foundation
 import LuminaIPC
 
-@_silgen_name("responsibility_spawnattrs_setdisclaim")
-private func responsibility_spawnattrs_setdisclaim(
-    _ attr: UnsafeMutablePointer<posix_spawnattr_t?>,
-    _ disclaim: Int32
-) -> Int32
+private typealias DisclaimResponsibility = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
 
 final class AgentSpawner: @unchecked Sendable {
     var quitPids: Set<pid_t> = []
     private let log = LuminaLog(category: .extra, fileURL: LuminaLog.defaultFileURL())
+    private var loggedMissingDisclaim = false
+    private lazy var disclaim: DisclaimResponsibility? = {
+        guard let sym = dlsym(RTLD_DEFAULT, "responsibility_spawnattrs_setdisclaim") else { return nil }
+        return unsafeBitCast(sym, to: DisclaimResponsibility.self)
+    }()
 
     func spawn(
         instanceId: UUID,
@@ -100,7 +101,12 @@ final class AgentSpawner: @unchecked Sendable {
         let setsid: Int16 = 0x0400
         posix_spawnattr_setflags(&attr, setsid)
         // Child must own TCC, otherwise AXIsProcessTrusted follows the extra.
-        _ = responsibility_spawnattrs_setdisclaim(&attr, 1)
+        if let disclaim {
+            _ = disclaim(&attr, 1)
+        } else if !loggedMissingDisclaim {
+            loggedMissingDisclaim = true
+            log.info("responsibility_spawnattrs_setdisclaim missing; AX identity may follow the extra")
+        }
 
         var pid: pid_t = 0
         let rc = cArgv.withUnsafeMutableBufferPointer { argvBuf in

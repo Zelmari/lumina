@@ -12,12 +12,17 @@ public enum SetFrameResult: Equatable, Sendable {
     case failed
 }
 
-@_silgen_name("_AXUIElementGetWindow")
-private func AXUIElementGetWindow(_ element: CFTypeRef, _ identifier: UnsafeMutablePointer<UInt32>) -> Int32
+private typealias AXGetWindow = @convention(c) (CFTypeRef, UnsafeMutablePointer<UInt32>) -> Int32
+
+private let axGetWindow: AXGetWindow? = {
+    guard let sym = dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow") else { return nil }
+    return unsafeBitCast(sym, to: AXGetWindow.self)
+}()
 
 public final class AXAdapter {
     private var inFlight: [UInt32: UInt64] = [:]
     private var idCache: [UInt: UInt32] = [:]
+    private var minSizeCache: [UInt: Size] = [:]
     private var tracked: [UInt32: AXUIElement] = [:]
     private var loggedMissingPrivateAPI = false
     private let log: LuminaLog
@@ -36,14 +41,19 @@ public final class AXAdapter {
         if let cached = cachedWindowId(for: element), !excluding.contains(cached) {
             return cached
         }
-        var id: UInt32 = 0
-        let err = AXUIElementGetWindow(element, &id)
-        if err == 0, id != 0, !excluding.contains(id) {
-            return id
-        }
-        if err != 0 && !loggedMissingPrivateAPI {
+        if let axGetWindow {
+            var id: UInt32 = 0
+            let err = axGetWindow(element, &id)
+            if err == 0, id != 0, !excluding.contains(id) {
+                return id
+            }
+            if err != 0 && !loggedMissingPrivateAPI {
+                loggedMissingPrivateAPI = true
+                log.info("private _AXUIElementGetWindow failed err=\(err); using fallback matcher")
+            }
+        } else if !loggedMissingPrivateAPI {
             loggedMissingPrivateAPI = true
-            log.info("private _AXUIElementGetWindow failed err=\(err); using fallback matcher")
+            log.info("private _AXUIElementGetWindow missing; using fallback matcher")
         }
         return fallbackWindowId(for: element, excluding: excluding)
     }
@@ -68,6 +78,9 @@ public final class AXAdapter {
     }
 
     public func forgetWindowId(_ id: UInt32) {
+        if let el = tracked[id] {
+            minSizeCache[elementKey(el)] = nil
+        }
         idCache = idCache.filter { $0.value != id }
         tracked[id] = nil
         inFlight[id] = nil
@@ -275,6 +288,8 @@ public final class AXAdapter {
     }
 
     public func minSize(of element: AXUIElement) -> Size {
+        let key = elementKey(element)
+        if let cached = minSizeCache[key] { return cached }
         var ref: CFTypeRef?
         let attr = "AXMinSize" as CFString
         guard AXUIElementCopyAttributeValue(element, attr, &ref) == .success,
@@ -282,7 +297,9 @@ public final class AXAdapter {
         else { return .unknown }
         var size = CGSize.zero
         AXValueGetValue(val as! AXValue, .cgSize, &size)
-        return Size(w: Double(size.width), h: Double(size.height))
+        let measured = Size(w: Double(size.width), h: Double(size.height))
+        if measured != .unknown { minSizeCache[key] = measured }
+        return measured
     }
 
     public func windows(pid: pid_t) -> [AXUIElement] {
