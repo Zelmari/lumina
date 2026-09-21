@@ -32,8 +32,13 @@ final class MenuSocketServer {
             }
         }
         let len = socklen_t(MemoryLayout<sockaddr_un>.size)
-        _ = withUnsafePointer(to: &addr) { ptr in
+        let bound = withUnsafePointer(to: &addr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(listenFD, $0, len) }
+        }
+        guard bound == 0 else {
+            close(listenFD)
+            listenFD = -1
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EADDRINUSE)
         }
         chmod(path, 0o600)
         listen(listenFD, 8)

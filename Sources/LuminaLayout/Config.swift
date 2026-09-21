@@ -322,16 +322,20 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
     )
 }
 
-public func loadOrDefault(text: String?, bundledDefault: String = Config.bundledDefaultTOML) -> Config {
+/// Invalid user TOML keeps the bundled default and reports the parse error.
+/// An empty path is “no file yet”, which is not an error.
+public func loadOrDefault(text: String?, bundledDefault: String = Config.bundledDefaultTOML) -> (config: Config, error: String?) {
     guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         switch parseConfig(text: bundledDefault) {
-        case .success(let c): return c
-        case .failure: return Config.bundledDefault
+        case .success(let c): return (c, nil)
+        case .failure(let e): return (Config.bundledDefault, e.message)
         }
     }
     switch parseConfig(text: text) {
-    case .success(let c): return c
-    case .failure: return loadOrDefault(text: nil, bundledDefault: bundledDefault)
+    case .success(let c): return (c, nil)
+    case .failure(let e):
+        let fallback = loadOrDefault(text: nil, bundledDefault: bundledDefault).config
+        return (fallback, e.message)
     }
 }
 
@@ -345,7 +349,8 @@ public func applyReload(current: Config, newText: String) -> (config: Config, er
 }
 
 public func resolveWorkspace(id: Int, count: Int) -> SpaceId? {
-    guard let space = SpaceId.make(id), id <= count else { return nil }
+    let mapped = id == 0 ? 10 : id
+    guard let space = SpaceId.make(mapped), mapped <= count else { return nil }
     return space
 }
 

@@ -89,19 +89,27 @@ public struct Bookmark: Equatable, Sendable, Codable {
     public var indexInParent: Int
     public var ratioSnapshot: [Double]
     public var wasFloating: Bool
+    /// The other child of the split. `remove` promotes this node and deletes the parent,
+    /// so reinsert wraps this sibling rather than looking up `parentId`.
+    public var siblingId: NodeId?
+    public var axis: Axis
 
     public init(
         spaceId: SpaceId,
         parentId: NodeId?,
         indexInParent: Int,
         ratioSnapshot: [Double],
-        wasFloating: Bool
+        wasFloating: Bool,
+        siblingId: NodeId? = nil,
+        axis: Axis = .horizontal
     ) {
         self.spaceId = spaceId
         self.parentId = parentId
         self.indexInParent = indexInParent
         self.ratioSnapshot = ratioSnapshot
         self.wasFloating = wasFloating
+        self.siblingId = siblingId
+        self.axis = axis
     }
 }
 

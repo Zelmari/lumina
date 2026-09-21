@@ -99,31 +99,45 @@ extension Session {
             session.spaces[spaceId] = space
             return session
         case .tiled:
+            let fullscreenId = spaces[spaceId]?.luminaFullscreen
+            let fullscreenWindow = fullscreenId.flatMap { spaces[spaceId]?.nodes[$0]?.leaf?.cgWindowId }
             var session = insertSpiral(space: spaceId, newLeaf: window, usableIsWide: usableIsWide)
             if let space = session.spaces[spaceId], space.luminaFullscreen != nil,
                let newId = space.lastTiledLeaf
             {
+                let newWindow = space.nodes[newId]?.leaf?.cgWindowId
                 session = session.markStashed(
                     space: spaceId,
-                    ids: Set([space.nodes[newId]?.leaf?.cgWindowId].compactMap { $0 })
+                    ids: Set([newWindow].compactMap { $0 })
                 )
+                if var space = session.spaces[spaceId] {
+                    if let fullscreenWindow { space.focusedWindow = fullscreenWindow }
+                    if let fullscreenId { space.lastTiledLeaf = fullscreenId }
+                    session.spaces[spaceId] = space
+                }
             }
             return session
         }
     }
 
     public func closeFocused(space spaceId: SpaceId) -> Session {
-        guard let space = spaces[spaceId], let focused = space.focusedWindow else { return self }
-        if let fs = space.luminaFullscreen, space.nodes[fs]?.leaf?.cgWindowId == focused {
+        guard let focused = spaces[spaceId]?.focusedWindow else { return self }
+        return closeWindow(space: spaceId, cgWindowId: focused)
+    }
+
+    /// Close a specific window. The fullscreen leaf is this id, not whoever is focused.
+    public func closeWindow(space spaceId: SpaceId, cgWindowId: UInt32) -> Session {
+        guard let space = spaces[spaceId] else { return self }
+        if let fs = space.luminaFullscreen, space.nodes[fs]?.leaf?.cgWindowId == cgWindowId {
             let cleared = exitLuminaFS(space: spaceId)
-            if let leaf = cleared.spaces[spaceId]?.leaf(containing: focused) {
+            if let leaf = cleared.spaces[spaceId]?.leaf(containing: cgWindowId) {
                 return cleared.remove(space: spaceId, node: leaf.id)
             }
             return cleared
         }
-        if let leaf = space.leaf(containing: focused) {
+        if let leaf = space.leaf(containing: cgWindowId) {
             return remove(space: spaceId, node: leaf.id)
         }
-        return removeWindow(space: spaceId, cgWindowId: focused)
+        return removeWindow(space: spaceId, cgWindowId: cgWindowId)
     }
 }

@@ -132,6 +132,38 @@ struct BalanceResizeTests {
         #expect(f.values.first!.w == 200)
     }
 
+    @Test func nestedMinSizeClampsTheOuterSplit() {
+        // win1 | (win2 over win3). Width mins live on the vertical pair, so the
+        // right column must be at least 300 even though it is not a leaf.
+        let box = Rect(x: 0, y: 0, w: 500, h: 400)
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(2), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(3), usableIsWide: true)
+        var space = session[space1]!
+        let root = space.nodes[space.root!]!
+        var skewed = root
+        skewed.ratio = [0.9, 0.1]
+        space.setNode(skewed)
+        session.spaces[space1] = space
+        let mins: [UInt32: Size] = [
+            1: Size(w: 100, h: 0),
+            2: Size(w: 300, h: 0),
+            3: Size(w: 300, h: 0),
+        ]
+        let (after, floated) = session.clampOverflow(space: space1, minSizes: mins, usable: box, gaps: gaps)
+        #expect(floated.isEmpty)
+        let clamped = after[space1]!
+        let laid = frames(space: clamped, usable: box, gaps: gaps)
+        let parent = clamped.nodes[clamped.root!]!
+        let left = laid[parent.children[0]]!
+        let right = clamped.nodes[parent.children[1]]!
+        #expect(left.w + 1e-6 >= 100)
+        for child in right.children {
+            #expect(laid[child]!.w + 1e-6 >= 300)
+        }
+    }
+
     @Test func resizeIgnoredForFloatingAndSingleLeaf() {
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)

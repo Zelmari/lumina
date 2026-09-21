@@ -76,6 +76,20 @@ public func skipAlreadyRunning(bundleId: String, running: [String]) -> Bool {
     running.contains(bundleId)
 }
 
+/// Socket of a live agent. Prefer the extra's last-current row over the first live row.
+public func preferredAgentSocket(
+    registry: InstanceRegistry,
+    pidAlive: (Int32) -> Bool
+) -> String? {
+    let live = registry.agents.filter { pidAlive($0.pid) && !$0.socket.isEmpty }
+    if let id = registry.lastCurrentInstanceId,
+       let row = live.first(where: { $0.instanceId == id })
+    {
+        return row.socket
+    }
+    return live.first?.socket
+}
+
 public struct AgentStatus: Equatable, Sendable, Codable {
     public var secureInput: Bool
     public var axTrusted: Bool

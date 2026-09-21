@@ -35,7 +35,7 @@ let appleProducts: [Product] = [
 let appleTargets: [Target] = [
     .executableTarget(
         name: "LuminaCLI",
-        dependencies: ["LuminaIPC"]
+        dependencies: ["LuminaIPC", "LuminaLayout"]
     ),
     .executableTarget(
         name: "LuminaAgent",

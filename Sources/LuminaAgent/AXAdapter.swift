@@ -12,12 +12,17 @@ public enum SetFrameResult: Equatable, Sendable {
     case failed
 }
 
-@_silgen_name("_AXUIElementGetWindow")
-private func AXUIElementGetWindow(_ element: CFTypeRef, _ identifier: UnsafeMutablePointer<UInt32>) -> Int32
+private typealias AXGetWindow = @convention(c) (CFTypeRef, UnsafeMutablePointer<UInt32>) -> Int32
+
+private let axGetWindow: AXGetWindow? = {
+    guard let sym = dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow") else { return nil }
+    return unsafeBitCast(sym, to: AXGetWindow.self)
+}()
 
 public final class AXAdapter {
     private var inFlight: [UInt32: UInt64] = [:]
     private var idCache: [UInt: UInt32] = [:]
+    private var minSizeCache: [UInt: Size] = [:]
     private var tracked: [UInt32: AXUIElement] = [:]
     private var loggedMissingPrivateAPI = false
     private let log: LuminaLog
@@ -36,14 +41,19 @@ public final class AXAdapter {
         if let cached = cachedWindowId(for: element), !excluding.contains(cached) {
             return cached
         }
-        var id: UInt32 = 0
-        let err = AXUIElementGetWindow(element, &id)
-        if err == 0, id != 0, !excluding.contains(id) {
-            return id
-        }
-        if err != 0 && !loggedMissingPrivateAPI {
+        if let axGetWindow {
+            var id: UInt32 = 0
+            let err = axGetWindow(element, &id)
+            if err == 0, id != 0, !excluding.contains(id) {
+                return id
+            }
+            if err != 0 && !loggedMissingPrivateAPI {
+                loggedMissingPrivateAPI = true
+                log.info("private _AXUIElementGetWindow failed err=\(err); using fallback matcher")
+            }
+        } else if !loggedMissingPrivateAPI {
             loggedMissingPrivateAPI = true
-            log.info("private _AXUIElementGetWindow failed err=\(err); using fallback matcher")
+            log.info("private _AXUIElementGetWindow missing; using fallback matcher")
         }
         return fallbackWindowId(for: element, excluding: excluding)
     }
@@ -68,6 +78,9 @@ public final class AXAdapter {
     }
 
     public func forgetWindowId(_ id: UInt32) {
+        if let el = tracked[id] {
+            minSizeCache[elementKey(el)] = nil
+        }
         idCache = idCache.filter { $0.value != id }
         tracked[id] = nil
         inFlight[id] = nil
@@ -142,7 +155,11 @@ public final class AXAdapter {
     }
 
     public func shouldIgnoreAXGeometry(window: LuminaLayout.Window) -> Bool {
-        inFlight[window.cgWindowId] == window.generation || inFlight[window.cgWindowId] != nil
+        LuminaLayout.shouldIgnoreAXGeometry(windowGeneration: window.generation, inFlight: inFlight[window.cgWindowId])
+    }
+
+    public func clearInFlight(id: UInt32, generation: UInt64) {
+        if inFlight[id] == generation { inFlight[id] = nil }
     }
 
     public func generationInFlight(for id: UInt32) -> Bool {
@@ -185,18 +202,26 @@ public final class AXAdapter {
 
     private func applyFrame(_ rect: Rect, of element: AXUIElement) -> Bool {
         AXUIElementSetMessagingTimeout(element, 0.05)
-        var size = CGSize(width: rect.w, height: rect.h)
-        var point = CGPoint(x: rect.x, y: rect.y)
-        guard let sizeVal = AXValueCreate(.cgSize, &size),
-              let posVal = AXValueCreate(.cgPoint, &point)
-        else { return false }
-        let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
-        let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
-        if fatal.contains(s1) || fatal.contains(pos) || fatal.contains(s2) { return false }
-        // Safari/WebKit often return cannotComplete/failure even when the window moves.
-        return true
+        func write() -> Bool {
+            var size = CGSize(width: rect.w, height: rect.h)
+            var point = CGPoint(x: rect.x, y: rect.y)
+            guard let sizeVal = AXValueCreate(.cgSize, &size),
+                  let posVal = AXValueCreate(.cgPoint, &point)
+            else { return false }
+            let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+            let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+            let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+            let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
+            return !fatal.contains(s1) && !fatal.contains(pos) && !fatal.contains(s2)
+        }
+        guard write(), let got = frame(of: element) else { return false }
+        if framesClose(got, rect) { return true }
+        guard write(), let again = frame(of: element) else { return false }
+        return framesClose(again, rect)
+    }
+
+    private func framesClose(_ a: Rect, _ b: Rect) -> Bool {
+        abs(a.x - b.x) <= 2 && abs(a.y - b.y) <= 2 && abs(a.w - b.w) <= 2 && abs(a.h - b.h) <= 2
     }
 
     public func pressClose(of element: AXUIElement) {
@@ -255,11 +280,16 @@ public final class AXAdapter {
         AXUIElementSetAttributeValue(element, attr, value ? kCFBooleanTrue : kCFBooleanFalse)
     }
 
-    public func setFocused(_ element: AXUIElement) {
+    public func setFocused(_ element: AXUIElement, raise: Bool = false) {
+        if raise {
+            AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+        }
         AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
     public func minSize(of element: AXUIElement) -> Size {
+        let key = elementKey(element)
+        if let cached = minSizeCache[key] { return cached }
         var ref: CFTypeRef?
         let attr = "AXMinSize" as CFString
         guard AXUIElementCopyAttributeValue(element, attr, &ref) == .success,
@@ -267,7 +297,9 @@ public final class AXAdapter {
         else { return .unknown }
         var size = CGSize.zero
         AXValueGetValue(val as! AXValue, .cgSize, &size)
-        return Size(w: Double(size.width), h: Double(size.height))
+        let measured = Size(w: Double(size.width), h: Double(size.height))
+        if measured != .unknown { minSizeCache[key] = measured }
+        return measured
     }
 
     public func windows(pid: pid_t) -> [AXUIElement] {
@@ -409,23 +441,23 @@ public func classifyInput(
         guard cgOwnerPID(row) == pid, let rect = cgWindowRect(row), rect.w >= 8, rect.h >= 8 else { return nil }
         return rect
     }
-    let axOnScreen = axFrameLooksOnScreen(frame: frame, onScreenFrames: pidOnScreenFrames)
-    let idOnScreen = onScreenIds.contains(id) && frame.w >= 8 && frame.h >= 8
+    let idOnScreen = onScreenIds.contains(id)
     let layer = cgWindowLayer(onScreenRows.first { cgWindowID($0) == id } ?? [:])
     let screens = NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: adapter.menuBarScreenMaxY)?.axFrame }
+    let bundle = adapter.bundleId(pid: pid)
     let input = ClassifyInput(
-        bundleId: adapter.bundleId(pid: pid),
+        bundleId: bundle,
         title: adapter.title(of: element),
         role: adapter.role(of: element),
         subrole: adapter.subrole(of: element),
         hasZoomButton: adapter.hasZoomButton(element),
         width: frame.w,
         height: frame.h,
-        isOnScreen: axOnScreen || idOnScreen,
+        isOnScreen: idOnScreen,
         pidAlreadyHasOnScreenWindow: !pidOnScreenFrames.isEmpty,
-        layerOrIsHUD: layer > 0,
+        layerOrIsHUD: layer >= 3,
         isPiP: adapter.subrole(of: element) == "AXPictureInPictureWindow",
-        isVisualIntelligenceOrSiriHUD: false,
+        isVisualIntelligenceOrSiriHUD: Classify.visualIntelligenceBundleIds.contains(bundle ?? ""),
         centerOnBoundDisplay: shouldManageOnBoundDisplay(rect: frame, bound: bound.axFrame, screens: screens)
     )
     return (input, id, pid)

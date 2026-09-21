@@ -22,21 +22,25 @@ public struct NativeFSSignals: Equatable, Sendable {
     }
 }
 
-/// If unsure a new native Space appeared, do **not** take the native-FS path.
+/// Native fullscreen only when the window has left this display's on-screen list.
+/// `AXFullScreen` without that, and without a space change, is an in-place zoom.
 public func isNativeFullscreen(_ signals: NativeFSSignals) -> Bool {
-    guard signals.pidAlive else { return false }
-    let leftDisplay = signals.missingFromOnScreen || signals.axFullscreen
-    guard leftDisplay else { return false }
+    guard signals.pidAlive, signals.missingFromOnScreen else { return false }
     return signals.spaceChangeRecently || signals.axFullscreen || signals.skyLightIdChanged
 }
 
 public func bookmark(for leaf: Node, in space: Space) -> Bookmark {
-    Bookmark(
+    let parent = leaf.parent.flatMap { space.nodes[$0] }
+    let index = parent?.children.firstIndex(of: leaf.id) ?? 0
+    let sibling = parent?.children.first { $0 != leaf.id }
+    return Bookmark(
         spaceId: space.id,
         parentId: leaf.parent,
-        indexInParent: leaf.parent.flatMap { space.nodes[$0]?.children.firstIndex(of: leaf.id) } ?? 0,
-        ratioSnapshot: leaf.parent.flatMap { space.nodes[$0]?.ratio } ?? [],
-        wasFloating: false
+        indexInParent: index,
+        ratioSnapshot: parent?.ratio ?? [],
+        wasFloating: false,
+        siblingId: sibling,
+        axis: parent?.axis ?? .horizontal
     )
 }
 
@@ -54,27 +58,79 @@ extension Session {
 
     public func reinsertNativeFS(_ window: WindowRef, usableIsWide: Bool) -> Session {
         var w = window
-        guard let bookmark = w.nativeFSBookmark, let space = spaces[bookmark.spaceId] else {
-            w.nativeFSBookmark = nil
-            w.role = .tiled
-            return insertSpiral(space: focusedSpace, newLeaf: w, usableIsWide: usableIsWide)
-        }
+        let bookmark = w.nativeFSBookmark
         w.nativeFSBookmark = nil
         w.role = .tiled
-        if let parentId = bookmark.parentId,
-           let parent = space.nodes[parentId],
-           parent.children.count > bookmark.indexInParent
+        var session = self
+        session.nativeFSWindows.removeAll { $0.cgWindowId == window.cgWindowId }
+        guard let bookmark, session.spaces[bookmark.spaceId] != nil else {
+            return session.insertSpiral(space: session.focusedSpace, newLeaf: w, usableIsWide: usableIsWide)
+        }
+        if let siblingId = bookmark.siblingId,
+           session.spaces[bookmark.spaceId]?.nodes[siblingId] != nil
         {
-            // Sibling still there: insert at the remembered index by splitting that slot's sibling? Spec:
-            // put back in that slot; sibling gone → insert at focus.
-            // If parent still exists, restore as sibling of whoever is in that slot by replacing empty hole —
-            // after detach, sibling was promoted so parent is gone. That's "sibling gone" if the container collapsed.
-            return insertSpiral(space: bookmark.spaceId, newLeaf: w, usableIsWide: usableIsWide)
+            return session.wrapSibling(
+                spaceId: bookmark.spaceId,
+                siblingId: siblingId,
+                window: w,
+                index: bookmark.indexInParent,
+                axis: bookmark.axis,
+                ratio: bookmark.ratioSnapshot
+            )
         }
-        if space.root == nil {
-            return insertSpiral(space: bookmark.spaceId, newLeaf: w, usableIsWide: usableIsWide)
+        return session.insertSpiral(space: bookmark.spaceId, newLeaf: w, usableIsWide: usableIsWide)
+    }
+
+    /// Put `window` back beside `siblingId`, which `remove` promoted into the old parent's slot.
+    private func wrapSibling(
+        spaceId: SpaceId,
+        siblingId: NodeId,
+        window: WindowRef,
+        index: Int,
+        axis: Axis,
+        ratio: [Double]
+    ) -> Session {
+        var session = self
+        guard var space = session.spaces[spaceId], var sibling = space.nodes[siblingId] else {
+            return session.insertSpiral(space: spaceId, newLeaf: window, usableIsWide: true)
         }
-        return insertSpiral(space: bookmark.spaceId, newLeaf: w, usableIsWide: usableIsWide)
+        let previousParent = sibling.parent
+        let containerId = session.allocateNodeId()
+        let newId = session.allocateNodeId()
+        sibling.parent = containerId
+        space.setNode(sibling)
+        let newNode = Node(
+            id: newId,
+            parent: containerId,
+            children: [],
+            axis: .horizontal,
+            ratio: [],
+            leaf: window
+        )
+        let ratios = ratio.count == 2 ? ratio : [0.5, 0.5]
+        let children = index == 0 ? [newId, siblingId] : [siblingId, newId]
+        let container = Node(
+            id: containerId,
+            parent: previousParent,
+            children: children,
+            axis: axis,
+            ratio: ratios,
+            leaf: nil
+        )
+        space.setNode(newNode)
+        space.setNode(container)
+        if let previousParent, var parent = space.nodes[previousParent] {
+            if let idx = parent.children.firstIndex(of: siblingId) {
+                parent.children[idx] = containerId
+            }
+            space.setNode(parent)
+        } else {
+            space.root = containerId
+        }
+        space.focusedWindow = window.cgWindowId
+        space.lastTiledLeaf = newId
+        session.spaces[spaceId] = space
+        return session
     }
 
     private func rememberNativeFS(_ window: WindowRef) -> Session {

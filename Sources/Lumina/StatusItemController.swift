@@ -17,6 +17,8 @@ final class StatusItemController {
     private var spaceCount = 5
     private var focused = 1
     private var loginEnabled = false
+    var loginNote: String?
+    private var rendered = ""
     var pausedNow: Bool { paused }
 
     func install() {
@@ -25,13 +27,20 @@ final class StatusItemController {
         item?.button?.title = "Start on this Space"
         item?.button?.target = self
         item?.button?.action = #selector(clicked)
+        item?.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         rebuildMenu()
     }
 
     func updateEmpty(loginEnabled: Bool = false) {
         current = false
         self.loginEnabled = loginEnabled
-        item?.button?.title = "Start on this Space"
+        let title = "Start on this Space"
+        let tip = loginNote ?? ""
+        let key = "\(title)|\(tip)|false|\(loginEnabled)"
+        item?.button?.title = title
+        item?.button?.toolTip = tip.isEmpty ? nil : tip
+        if key == rendered { return }
+        rendered = key
         rebuildMenu()
     }
 
@@ -47,17 +56,37 @@ final class StatusItemController {
         }
         var title = parts.joined(separator: " ")
         if warning != .none { title = "! " + title }
+        let tip = [warning.tooltip, loginNote].compactMap { $0 }.joined(separator: "\n")
+        let key = "\(title)|\(tip)|\(paused)|\(loginEnabled)"
         item?.button?.title = title
-        item?.button?.toolTip = warning.tooltip
+        item?.button?.toolTip = tip.isEmpty ? nil : tip
+        if key == rendered { return }
+        rendered = key
         rebuildMenu()
     }
 
     @objc func clicked(_ sender: Any?) {
+        if let event = NSApp.currentEvent, event.type == .rightMouseUp {
+            rebuildMenu()
+            if let button = item?.button, let menu {
+                menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+            }
+            return
+        }
         if !current {
             onStart?()
             return
         }
-        // Digit click: approximate by not having per-digit tracking; menu handles switch.
+        guard let button = item?.button, let event = NSApp.currentEvent else { return }
+        let tokens = button.title.split(separator: " ").map(String.init).filter { Int($0.replacingOccurrences(of: "(", with: "").replacingOccurrences(of: ")", with: "").replacingOccurrences(of: "!", with: "")) != nil }
+        guard !tokens.isEmpty else { return }
+        let local = button.convert(event.locationInWindow, from: nil)
+        let width = max(button.bounds.width, 1)
+        let index = min(tokens.count - 1, max(0, Int(local.x / (width / CGFloat(tokens.count)))))
+        let raw = tokens[index]
+            .replacingOccurrences(of: "(", with: "")
+            .replacingOccurrences(of: ")", with: "")
+        if let n = Int(raw) { onDigit?(n) }
     }
 
     private func rebuildMenu() {
@@ -87,8 +116,12 @@ final class StatusItemController {
             menu.addItem(action("Quit this Space", #selector(quitThis)))
         }
         menu.addItem(action("Quit all", #selector(quitAll)))
-        item?.menu = menu
+        item?.menu = nil
+        item?.button?.menu = nil
+        self.menu = menu
     }
+
+    private var menu: NSMenu?
 
     private func action(_ title: String, _ sel: Selector) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")

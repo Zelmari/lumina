@@ -36,14 +36,7 @@ extension Session {
               var old = space.nodes[targetId],
               old.isLeaf
         else {
-            space.nodes = [:]
-            let id = session.allocateNodeId()
-            let node = Node(id: id, parent: nil, children: [], axis: .horizontal, ratio: [], leaf: leafRef)
-            space.setNode(node)
-            space.root = id
-            space.focusedWindow = leafRef.cgWindowId
-            space.lastTiledLeaf = id
-            session.spaces[spaceId] = space
+            // A corrupt tree is left alone. Wiping `nodes` drops every tiled window.
             return session
         }
 

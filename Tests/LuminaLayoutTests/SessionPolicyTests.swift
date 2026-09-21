@@ -9,16 +9,21 @@ struct StashTests {
             axVisibleFrame: Rect(x: 0, y: 25, w: 1440, h: 850)
         )
         let right = stashFrame(for: 600, display: display, dockRight: false, lastWidth: 800)
-        #expect(right.w == 1)
-        #expect(right.h == 8)
+        #expect(right.w == 800)
+        #expect(right.h == 600)
         #expect(right.x == 1439)
-        #expect(right.y == 0)
-        #expect(!display.axVisibleFrame.intersects(right))
-        let left = stashFrame(for: 600, display: display, dockRight: true)
-        #expect(left.x == 0)
-        #expect(left.w == 1)
+        #expect(right.y == 874)
+        #expect(isCornerParked(right, display: display))
+        let left = stashFrame(for: 600, display: display, dockRight: true, lastWidth: 800)
+        #expect(left.x == 1 - 800)
+        #expect(left.w == 800)
+        #expect(left.y == 874)
+        #expect(isCornerParked(left, display: display))
         #expect(isStashedAway(right, display: display))
         #expect(isStashedAway(left, display: display))
+        let zoom = stashFrame(for: 600, display: display, dockRight: false, lastWidth: 800, inset: 0)
+        #expect(zoom.x == 1440)
+        #expect(zoom.y == 875)
         let hung = Rect(x: 1439, y: -592, w: 800, h: 600)
         #expect(isStashedAway(hung, display: display))
         #expect(!display.axVisibleFrame.intersects(hung))
@@ -151,6 +156,8 @@ struct FullscreenTests {
         let space = session[SpaceId.require(1)]!
         #expect(space.leaf(containing: 2) != nil)
         #expect(space.leaf(containing: 2)?.leaf?.role == .stashed)
+        #expect(space.focusedWindow == 1)
+        #expect(space.lastTiledLeaf == leaf1)
         session = session.insertWhileLuminaFS(
             space: SpaceId.require(1),
             window: WindowRef(cgWindowId: 3, pid: 3),
@@ -182,7 +189,30 @@ struct NativeFSTests {
         #expect(!isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: false, spaceChangeRecently: true)))
         #expect(!isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: true)))
         #expect(isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: true, spaceChangeRecently: true)))
-        #expect(isNativeFullscreen(NativeFSSignals(missingFromOnScreen: false, pidAlive: true, axFullscreen: true)))
+        #expect(!isNativeFullscreen(NativeFSSignals(missingFromOnScreen: false, pidAlive: true, axFullscreen: true)))
+        #expect(isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: true, axFullscreen: true)))
+    }
+
+    @Test func reinsertWrapsSurvivingSibling() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 2, pid: 2), usableIsWide: true)
+        let space = session[SpaceId.require(1)]!
+        let leaf1 = space.leaf(containing: 1)!
+        let ratio = space.nodes[leaf1.parent!]!.ratio
+        session = session.detachNativeFS(space: SpaceId.require(1), nodeId: leaf1.id)
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 1) == nil)
+        #expect(session[SpaceId.require(1)]!.nodes[session[SpaceId.require(1)]!.root!]?.leaf?.cgWindowId == 2)
+        let parked = session.nativeFSWindows[0]
+        #expect(parked.nativeFSBookmark?.siblingId != nil)
+        session = session.reinsertNativeFS(parked, usableIsWide: true)
+        let restored = session[SpaceId.require(1)]!
+        #expect(restored.leaf(containing: 1) != nil)
+        #expect(restored.leaf(containing: 2) != nil)
+        #expect(restored.nodes[restored.root!]!.ratio == ratio)
+        #expect(session.nativeFSWindows.isEmpty)
+        let index = restored.nodes[restored.root!]!.children.firstIndex(of: restored.leaf(containing: 1)!.id)
+        #expect(index == 0)
     }
 }
 
@@ -391,6 +421,18 @@ struct RegistryTests {
         #expect(pidDeathAction(followedQuit: true) == .removeNoRestart)
         #expect(pidDeathAction(followedQuit: false) == .restartCrashRecover)
         #expect(decoded.lastCurrentInstanceId == id)
+        let other = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
+        let two = InstanceRegistry(
+            bootSessionUUID: "same",
+            lastCurrentInstanceId: id,
+            agents: [
+                InstanceRecord(instanceId: other, pid: 1, displayUUID: "a", socket: "/tmp/dead.sock"),
+                InstanceRecord(instanceId: id, pid: 2, displayUUID: "b", socket: "/tmp/live.sock"),
+            ]
+        )
+        #expect(preferredAgentSocket(registry: two, pidAlive: { $0 == 2 }) == "/tmp/live.sock")
+        #expect(preferredAgentSocket(registry: two, pidAlive: { $0 == 1 }) == "/tmp/dead.sock")
+        #expect(preferredAgentSocket(registry: two, pidAlive: { _ in false }) == nil)
     }
 
     @Test func skipAlreadyRunningAndWarnings() {

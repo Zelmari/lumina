@@ -3,16 +3,21 @@ import Foundation
 import ServiceManagement
 
 enum LoginService {
-    static func toggle() {
+    /// Nil when the item is enabled or was removed. A string means Login Items still needs approval.
+    static func toggle() -> String? {
         let service = SMAppService.mainApp
         do {
             if service.status == .enabled {
                 try service.unregister()
-            } else {
-                try service.register()
+                return nil
             }
+            try service.register()
+            if service.status == .requiresApproval {
+                return "System Settings → Login Items must approve Lumina"
+            }
+            return nil
         } catch {
-            // .requiresApproval surfaces in System Settings → Login Items
+            return "System Settings → Login Items must approve Lumina"
         }
     }
 

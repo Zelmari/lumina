@@ -39,6 +39,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
     let supportRoot: String
     let uid: uid_t
     let tmpdir: String
+    var pendingUnstash: String?
+    private let statusQueue = DispatchQueue(label: "com.zelmari.lumina.extra.status")
+    private var statusTimer: DispatchSourceTimer?
 
     override init() {
         uid = getuid()
@@ -68,9 +71,11 @@ final class ExtraController: NSObject, @unchecked Sendable {
         menuServer = server
         bootRegistry()
         maybeFirstRun()
-        Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            self?.pollStatus()
-        }
+        let timer = DispatchSource.makeTimerSource(queue: statusQueue)
+        timer.schedule(deadline: .now() + 0.8, repeating: 0.8)
+        timer.setEventHandler { [weak self] in self?.pollStatusBody() }
+        timer.resume()
+        statusTimer = timer
     }
 
     func writeDefaultConfigIfNeeded() {
@@ -96,7 +101,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
         let live = current.agents.filter { kill($0.pid, 0) == 0 }
         switch extraLaunchDecision(registryBootUUID: current.bootSessionUUID.isEmpty ? nil : current.bootSessionUUID, kernBootUUID: kern, livePids: live.map(\.pid)) {
         case .freshStart:
-            unstashAllSessions()
+            pendingUnstash = unstashAllSessions()
             registry.save(InstanceRegistry(bootSessionUUID: kern, lastCurrentInstanceId: nil, agents: []))
             startOnThisSpace(runLaunchApps: true)
         case .reattach:
@@ -126,17 +131,13 @@ final class ExtraController: NSObject, @unchecked Sendable {
             var next = current
             next.lastCurrentInstanceId = id
             registry.save(next)
-            if let rec = live.first(where: { $0.instanceId == id }) {
-                sendTo(instance: rec.instanceId, socket: rec.socket, .markCurrent)
-            }
+            claimCurrent(id, among: live)
             pollStatus()
         case .attach(let id):
             var next = current
             next.lastCurrentInstanceId = id
             registry.save(next)
-            if let rec = live.first(where: { $0.instanceId == id }) {
-                sendTo(instance: rec.instanceId, socket: rec.socket, .markCurrent)
-            }
+            claimCurrent(id, among: live)
             pollStatus()
         case .spawn:
             spawnAgent(runLaunchApps: runLaunchApps || current.agents.isEmpty)
@@ -152,12 +153,15 @@ final class ExtraController: NSObject, @unchecked Sendable {
             supportFallback: supportRoot
         )
         let display = currentDisplayUUID()
+        let unstashFrom = pendingUnstash
+        pendingUnstash = nil
         spawner.spawn(
             instanceId: id,
             socket: socket,
             displayUUID: display,
             crashRecover: false,
-            runLaunchApps: runLaunchApps
+            runLaunchApps: runLaunchApps,
+            unstashFrom: unstashFrom
         ) { [weak self] pid in
             guard let self else { return }
             guard let pid else {
@@ -237,6 +241,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func handleExtra(_ cmd: ExtraCmd, id: String) -> IPCResponse {
+        if !Thread.isMainThread {
+            return DispatchQueue.main.sync { self.handleExtra(cmd, id: id) }
+        }
         switch cmd {
         case .currentToken:
             if let token = registry.load().lastCurrentInstanceId {
@@ -276,6 +283,10 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func pollStatus() {
+        statusQueue.async { [weak self] in self?.pollStatusBody() }
+    }
+
+    func pollStatusBody() {
         let reg = registry.load()
         let live = reg.agents.filter { kill($0.pid, 0) == 0 }
         var claimants: [(InstanceRecord, AgentStatus)] = []
@@ -296,15 +307,24 @@ final class ExtraController: NSObject, @unchecked Sendable {
                 }
                 registry.save(next)
             }
-            status.updateCurrent(
-                spaceCount: st.spaceCount ?? 5,
-                focused: st.space ?? 1,
-                paused: st.paused,
-                loginEnabled: LoginService.enabled,
-                warning: extraWarning(status: st)
-            )
+            let spaceCount = st.spaceCount ?? 5
+            let focused = st.space ?? 1
+            let paused = st.paused
+            let warning = extraWarning(status: st)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.status.updateCurrent(
+                    spaceCount: spaceCount,
+                    focused: focused,
+                    paused: paused,
+                    loginEnabled: LoginService.enabled,
+                    warning: warning
+                )
+            }
         } else {
-            status.updateEmpty(loginEnabled: LoginService.enabled)
+            DispatchQueue.main.async { [weak self] in
+                self?.status.updateEmpty(loginEnabled: LoginService.enabled)
+            }
         }
     }
 
@@ -372,7 +392,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
     func toggleLogin() {
         #if os(macOS)
         if #available(macOS 13.0, *) {
-            LoginService.toggle()
+            status.loginNote = LoginService.toggle()
             pollStatus()
         }
         #endif
@@ -381,21 +401,44 @@ final class ExtraController: NSObject, @unchecked Sendable {
     func maybeFirstRun() {
         let flag = supportRoot + "/first-run-done"
         firstRun = FirstRunController(flagPath: flag, extra: self)
+        firstRun?.axTrusted = { [weak self] in
+            guard let self, let rec = self.currentRecord() else { return false }
+            return self.fetchAgentStatus(socket: rec.socket)?.axTrusted ?? false
+        }
         firstRun?.sheetIfNeeded()
     }
 
-    func unstashAllSessions() {
+    /// Move session files aside so the new agent can restore frames. Returns the directory.
+    func unstashAllSessions() -> String? {
         let root = supportRoot + "/spaces"
-        guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: root) else { return }
+        let pending = supportRoot + "/pending-unstash"
+        guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: root) else {
+            try? FileManager.default.removeItem(atPath: registry.path)
+            return nil
+        }
+        try? FileManager.default.createDirectory(atPath: pending, withIntermediateDirectories: true)
+        var moved = false
         for dir in dirs {
             let path = root + "/" + dir + "/session.json"
-            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                  let file = try? SessionFile.decode(data)
-            else { continue }
-            _ = file.stash
-            try? FileManager.default.removeItem(atPath: path)
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            let dest = pending + "/" + dir + ".json"
+            try? FileManager.default.removeItem(atPath: dest)
+            if (try? FileManager.default.moveItem(atPath: path, toPath: dest)) != nil {
+                moved = true
+            }
         }
         try? FileManager.default.removeItem(atPath: registry.path)
+        return moved ? pending : nil
+    }
+
+    func claimCurrent(_ id: UUID, among live: [InstanceRecord]) {
+        for rec in live {
+            if rec.instanceId == id {
+                sendTo(instance: rec.instanceId, socket: rec.socket, .markCurrent)
+            } else {
+                sendTo(instance: rec.instanceId, socket: rec.socket, .yield)
+            }
+        }
     }
 }
 
@@ -420,6 +463,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .listWorkspaces: return "list-workspaces"
     case .status: return "status"
     case .markCurrent: return "mark-current"
+    case .yield: return "yield"
     }
 }
 

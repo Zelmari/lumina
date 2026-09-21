@@ -158,7 +158,17 @@ struct ConfigTests {
         #expect(resolveWorkspace(id: 3, count: 5)?.raw == 3)
         #expect(resolveWorkspace(id: 99, count: 5) == nil)
         #expect(resolveWorkspace(id: 0, count: 5) == nil)
+        #expect(resolveWorkspace(id: 0, count: 10)?.raw == 10)
         #expect(resolveWorkspace(id: 10, count: 5) == nil)
+    }
+
+    @Test func invalidTomlKeepsDefaultAndReportsError() {
+        let (config, error) = loadOrDefault(text: "space-count = 0\n")
+        #expect(error != nil)
+        #expect(config.spaceCount == 5)
+        let (missing, missingError) = loadOrDefault(text: nil)
+        #expect(missingError == nil)
+        #expect(missing.spaceCount == 5)
     }
 
     @Test func applyReloadKeepsLastGood() {

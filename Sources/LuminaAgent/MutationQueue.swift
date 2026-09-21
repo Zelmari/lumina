@@ -23,7 +23,7 @@ public final class MutationQueue: @unchecked Sendable {
             self.pendingLayout = work
             guard !self.layoutScheduled else { return }
             self.layoutScheduled = true
-            self.queue.async {
+            self.queue.asyncAfter(deadline: .now() + 0.04) {
                 self.layoutScheduled = false
                 let job = self.pendingLayout
                 self.pendingLayout = nil

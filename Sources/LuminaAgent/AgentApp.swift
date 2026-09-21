@@ -42,12 +42,19 @@ struct AgentApp {
             runLaunchApps: launchApps,
             log: log
         )
-        signal(SIGTERM) { _ in
-            DispatchQueue.main.async { NSApp.terminate(nil) }
+        signal(SIGTERM, SIG_IGN)
+        let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        term.setEventHandler {
+            runtime.stop()
+            NSApp.terminate(nil)
         }
+        term.resume()
+        Self.termSource = term
         runtime.start()
         app.run()
         runtime.stop()
     }
+
+    private static var termSource: DispatchSourceSignal?
 }
 #endif

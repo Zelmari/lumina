@@ -7,6 +7,18 @@ struct ClassifyTests {
         let rules = [WindowRule(appId: "com.example.app", action: .tile)]
         let input = ClassifyInput(bundleId: "com.example.app", role: AXRoleName.sheet)
         #expect(classify(input, rules: rules) == .floating)
+        let subroleSheet = ClassifyInput(
+            bundleId: "com.example.app",
+            role: AXRoleName.standardWindow,
+            subrole: AXRoleName.sheet
+        )
+        #expect(classify(subroleSheet, rules: rules) == .floating)
+        let subroleDialog = ClassifyInput(
+            bundleId: "com.example.app",
+            role: "AXWindow",
+            subrole: AXRoleName.dialog
+        )
+        #expect(classify(subroleDialog, rules: rules) == .floating)
     }
 
     @Test func terminalNoZoomTiles() {

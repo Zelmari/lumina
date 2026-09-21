@@ -10,21 +10,32 @@ public struct DisplayFrame: Equatable, Sendable {
     }
 }
 
-/// 1×8 in the menu-bar / display-chrome strip, inside `axFrame` but outside `axVisibleFrame`
-/// so macOS will not clamp the window back onto the desktop.
+/// Park a window so only about `inset` points stay inside the visible rect.
+/// Size is unchanged: macOS rejects a forced 1×N size, and a full-size window
+/// whose origin sits on the bottom corner hangs off-screen (AeroSpace `hideInCorner`).
+/// Dock on the right uses the bottom-left corner. `inset` is 0 for Zoom, which
+/// jumps away from a 1px offset.
 public func stashFrame(
     for lastHeight: Double,
     display: DisplayFrame,
     dockRight: Bool,
-    lastWidth: Double = 1
+    lastWidth: Double = 1,
+    inset: Double = 1
 ) -> Rect {
-    _ = lastHeight
-    _ = lastWidth
-    let w: Double = 1
-    let h: Double = 8
-    let y = display.axFrame.minY
-    let x = dockRight ? display.axFrame.minX : display.axFrame.maxX - 1
+    let w = max(lastWidth, 1)
+    let h = max(lastHeight, 1)
+    let visible = display.axVisibleFrame
+    let y = visible.maxY - inset
+    let x = dockRight ? visible.minX + inset - w : visible.maxX - inset
     return Rect(x: x, y: y, w: w, h: h)
+}
+
+/// True when the window's origin is the bottom-corner park from `stashFrame`.
+public func isCornerParked(_ rect: Rect, display: DisplayFrame) -> Bool {
+    let visible = display.axVisibleFrame
+    let onRight = abs(rect.minX - (visible.maxX - 1)) < 4 && rect.maxY > visible.maxY - 2
+    let onLeft = abs(rect.maxX - (visible.minX + 1)) < 4 && rect.maxY > visible.maxY - 2 && rect.minX < visible.minX
+    return onRight || onLeft
 }
 
 public func isSliver(_ rect: Rect) -> Bool {
