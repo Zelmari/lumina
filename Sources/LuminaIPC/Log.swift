@@ -1,4 +1,10 @@
 import Foundation
+#if os(macOS)
+import Darwin
+import OSLog
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public enum LogCategory: String, Sendable {
     case agent
@@ -11,6 +17,10 @@ public final class LuminaLog: @unchecked Sendable {
     public let category: LogCategory
     private let fileURL: URL?
     private let lock = NSLock()
+    private var appendFD: Int32 = -1
+    #if os(macOS)
+    private let oslog: Logger
+    #endif
 
     public init(category: LogCategory, fileURL: URL? = nil, debugEnabled: Bool? = nil) {
         self.category = category
@@ -20,6 +30,9 @@ public final class LuminaLog: @unchecked Sendable {
         } else {
             self.debugEnabled = ProcessInfo.processInfo.environment["LUMINA_DEBUG"] == "1"
         }
+        #if os(macOS)
+        oslog = Logger(subsystem: "com.zelmari.lumina", category: category.rawValue)
+        #endif
     }
 
     public static func defaultFileURL() -> URL {
@@ -46,41 +59,57 @@ public final class LuminaLog: @unchecked Sendable {
     }
 
     private func write(level: String, message: String) {
+        #if os(macOS)
+        switch level {
+        case "error": oslog.error("\(message, privacy: .public)")
+        case "debug": oslog.debug("\(message, privacy: .public)")
+        default: oslog.info("\(message, privacy: .public)")
+        }
+        #endif
         let line = "[\(category.rawValue)] \(level) \(message)\n"
-        guard let fileURL else { return }
+        guard let fileURL, let data = line.data(using: .utf8) else { return }
         lock.lock()
         defer { lock.unlock() }
-        let fm = FileManager.default
+        let fd = openedAppendFD(fileURL)
+        guard fd >= 0 else { return }
+        flockFD(fd, lock: true)
+        data.withUnsafeBytes { raw in
+            if let base = raw.baseAddress {
+                _ = systemWrite(fd, base, raw.count)
+            }
+        }
+        flockFD(fd, lock: false)
+    }
+
+    private func openedAppendFD(_ fileURL: URL) -> Int32 {
+        if appendFD >= 0 { return appendFD }
         let dir = fileURL.deletingLastPathComponent()
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        if !fm.fileExists(atPath: fileURL.path) {
-        _ = fm.createFile(atPath: fileURL.path, contents: nil)
-        }
-        guard let handle = try? FileHandle(forWritingTo: fileURL) else { return }
-        defer { try? handle.close() }
-        flockFile(handle, lock: true)
-        _ = try? handle.seekToEnd()
-        if let data = line.data(using: .utf8) {
-            try? handle.write(contentsOf: data)
-        }
-        flockFile(handle, lock: false)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fd = open(fileURL.path, O_WRONLY | O_CREAT | O_APPEND, mode_t(0o644))
+        appendFD = fd
+        return fd
     }
 }
 
 #if os(macOS)
-import Darwin
-
 // Darwin.flock is `struct flock` (fcntl); bind flock(2) by symbol name.
 @_silgen_name("flock")
 private func posixFlock(_ fd: Int32, _ operation: Int32) -> Int32
 
-private func flockFile(_ handle: FileHandle, lock: Bool) {
-    let fd = handle.fileDescriptor
+private func flockFD(_ fd: Int32, lock: Bool) {
     _ = posixFlock(fd, lock ? LOCK_EX : LOCK_UN)
 }
+
+private func systemWrite(_ fd: Int32, _ buf: UnsafeRawPointer, _ count: Int) -> Int {
+    write(fd, buf, count)
+}
 #else
-private func flockFile(_ handle: FileHandle, lock: Bool) {
-    _ = handle
+private func flockFD(_ fd: Int32, lock: Bool) {
+    _ = fd
     _ = lock
+}
+
+private func systemWrite(_ fd: Int32, _ buf: UnsafeRawPointer, _ count: Int) -> Int {
+    Glibc.write(fd, buf, count)
 }
 #endif
