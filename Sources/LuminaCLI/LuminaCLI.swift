@@ -7,12 +7,14 @@ import LuminaIPC
 enum LuminaCLI {
     static func main() {
         let argv = CommandLine.arguments
-        if argv.contains("-h") || argv.contains("--help") || argv.contains("version") {
-            writeOut("lumina 0.1.0")
+        if let early = CLIArgs.earlyExit(argv) {
+            switch early {
+            case .version:
+                writeOut("lumina 0.1.0")
+            case .debug:
+                writeOut("LUMINA_DEBUG=1")
+            }
             exit(0)
-        }
-        if argv.dropFirst().first == "debug" {
-            setenv("LUMINA_DEBUG", "1", 1)
         }
         let log = LuminaLog(category: .cli, fileURL: LuminaLog.defaultFileURL())
         guard let request = CLIArgs.parse(argv) else {

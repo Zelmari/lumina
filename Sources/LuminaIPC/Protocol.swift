@@ -81,6 +81,13 @@ public enum AgentCmd: Equatable, Sendable {
     case status
     /// Extra-only: swipe-back attach without SkyLight (reason `start`).
     case markCurrent
+    /// This agent is no longer the current Space. Drop hotkeys and stop mutating.
+    case yield
+}
+
+/// Option-0 and `lumina workspace 0` mean space 10. `SpaceId` itself stays 1...10.
+public func normalizeWorkspaceId(_ id: Int) -> Int {
+    id == 0 ? 10 : id
 }
 
 public enum ExtraCmd: Equatable, Sendable {

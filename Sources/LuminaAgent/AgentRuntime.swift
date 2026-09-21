@@ -60,7 +60,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         self.supportRoot = home + "/Library/Application Support/Lumina"
         self.sessionPath = LuminaPaths.sessionPath(supportRoot: supportRoot, instanceId: instanceId.uuidString)
         let text = try? String(contentsOfFile: LuminaPaths.configPath(home: home), encoding: .utf8)
-        self.config = loadOrDefault(text: text)
+        let loaded = loadOrDefault(text: text)
+        self.config = loaded.config
+        self.configError = loaded.error
         self.session = Session.empty(spaceCount: config.spaceCount, instanceId: instanceId)
         self.preferredDisplayUUID = displayUUID
         super.init()
@@ -762,6 +764,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return .success(id: id, data: statusJSON())
         case .markCurrent:
             recomputeCurrentToken(reason: .start)
+            return .success(id: id)
+        case .yield:
+            isCurrent = false
+            hotkeys.unregister()
             return .success(id: id)
         }
     }

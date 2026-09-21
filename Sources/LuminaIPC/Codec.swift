@@ -84,10 +84,10 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
             if s == "next" { return .ok(.workspaceNext) }
         }
         guard let id = args["id"]?.int else { return .missing("missing args: id") }
-        return .ok(.workspace(id: id))
+        return .ok(.workspace(id: normalizeWorkspaceId(id)))
     case "move-node-to-workspace":
         guard let id = args["id"]?.int else { return .missing("missing args: id") }
-        return .ok(.moveNodeToWorkspace(id: id))
+        return .ok(.moveNodeToWorkspace(id: normalizeWorkspaceId(id)))
     case "focus":
         guard let dir = args["dir"]?.string, let d = DirectionArg(rawValue: dir) else {
             return .missing("missing args: dir")
@@ -119,6 +119,7 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
     case "list-workspaces": return .ok(.listWorkspaces)
     case "status": return .ok(.status)
     case "mark-current": return .ok(.markCurrent)
+    case "yield": return .ok(.yield)
     default: return .unknown
     }
 }

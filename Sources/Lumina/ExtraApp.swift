@@ -420,6 +420,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .listWorkspaces: return "list-workspaces"
     case .status: return "status"
     case .markCurrent: return "mark-current"
+    case .yield: return "yield"
     }
 }
 

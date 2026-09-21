@@ -165,6 +165,23 @@ struct ArgvTests {
         #expect(fs?.args["mode"]?.string == "lumina")
         #expect(CLIArgs.parse(["lumina", "list-windows"])?.cmd == "list-windows")
         #expect(CLIArgs.parse(["lumina", "list-workspaces"])?.cmd == "list-workspaces")
+        #expect(CLIArgs.parse(["lumina", "workspace", "0"])?.args["id"]?.int == 10)
+        #expect(CLIArgs.parse(["lumina", "move-node-to-workspace", "0"])?.args["id"]?.int == 10)
+        #expect(CLIArgs.parse(["lumina", "focus", "version"])?.cmd == "focus")
+        #expect(CLIArgs.earlyExit(["lumina", "version"]) == .version)
+        #expect(CLIArgs.earlyExit(["lumina", "debug"]) == .debug)
+        #expect(CLIArgs.earlyExit(["lumina", "focus", "version"]) == nil)
+        #expect(CLIArgs.parse(["lumina", "debug"]) == nil)
+        let zero = #"{"v":1,"id":"z","cmd":"workspace","args":{"id":0}}"#
+        guard case .request(.workspace(let zeroId), _) = parseLine(zero) else {
+            Issue.record("expected workspace 0, got \(parseLine(zero))")
+            return
+        }
+        #expect(zeroId == 10)
+        guard case .request(.yield, _) = parseLine(#"{"v":1,"id":"y","cmd":"yield","args":{}}"#) else {
+            Issue.record("expected yield")
+            return
+        }
         let mark = #"{"v":1,"id":"m","cmd":"mark-current","args":{}}"#
         let parsed = parseLine(mark)
         guard case .request(.markCurrent, let id) = parsed else {
