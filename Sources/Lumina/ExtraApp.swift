@@ -40,6 +40,8 @@ final class ExtraController: NSObject, @unchecked Sendable {
     let uid: uid_t
     let tmpdir: String
     var pendingUnstash: String?
+    private let statusQueue = DispatchQueue(label: "com.zelmari.lumina.extra.status")
+    private var statusTimer: DispatchSourceTimer?
 
     override init() {
         uid = getuid()
@@ -69,9 +71,11 @@ final class ExtraController: NSObject, @unchecked Sendable {
         menuServer = server
         bootRegistry()
         maybeFirstRun()
-        Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            self?.pollStatus()
-        }
+        let timer = DispatchSource.makeTimerSource(queue: statusQueue)
+        timer.schedule(deadline: .now() + 0.8, repeating: 0.8)
+        timer.setEventHandler { [weak self] in self?.pollStatusBody() }
+        timer.resume()
+        statusTimer = timer
     }
 
     func writeDefaultConfigIfNeeded() {
@@ -237,6 +241,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func handleExtra(_ cmd: ExtraCmd, id: String) -> IPCResponse {
+        if !Thread.isMainThread {
+            return DispatchQueue.main.sync { self.handleExtra(cmd, id: id) }
+        }
         switch cmd {
         case .currentToken:
             if let token = registry.load().lastCurrentInstanceId {
@@ -276,6 +283,10 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func pollStatus() {
+        statusQueue.async { [weak self] in self?.pollStatusBody() }
+    }
+
+    func pollStatusBody() {
         let reg = registry.load()
         let live = reg.agents.filter { kill($0.pid, 0) == 0 }
         var claimants: [(InstanceRecord, AgentStatus)] = []
@@ -296,15 +307,24 @@ final class ExtraController: NSObject, @unchecked Sendable {
                 }
                 registry.save(next)
             }
-            status.updateCurrent(
-                spaceCount: st.spaceCount ?? 5,
-                focused: st.space ?? 1,
-                paused: st.paused,
-                loginEnabled: LoginService.enabled,
-                warning: extraWarning(status: st)
-            )
+            let spaceCount = st.spaceCount ?? 5
+            let focused = st.space ?? 1
+            let paused = st.paused
+            let warning = extraWarning(status: st)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.status.updateCurrent(
+                    spaceCount: spaceCount,
+                    focused: focused,
+                    paused: paused,
+                    loginEnabled: LoginService.enabled,
+                    warning: warning
+                )
+            }
         } else {
-            status.updateEmpty(loginEnabled: LoginService.enabled)
+            DispatchQueue.main.async { [weak self] in
+                self?.status.updateEmpty(loginEnabled: LoginService.enabled)
+            }
         }
     }
 

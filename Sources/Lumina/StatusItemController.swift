@@ -34,7 +34,13 @@ final class StatusItemController {
     func updateEmpty(loginEnabled: Bool = false) {
         current = false
         self.loginEnabled = loginEnabled
-        item?.button?.title = "Start on this Space"
+        let title = "Start on this Space"
+        let tip = loginNote ?? ""
+        let key = "\(title)|\(tip)|false|\(loginEnabled)"
+        item?.button?.title = title
+        item?.button?.toolTip = tip.isEmpty ? nil : tip
+        if key == rendered { return }
+        rendered = key
         rebuildMenu()
     }
 
