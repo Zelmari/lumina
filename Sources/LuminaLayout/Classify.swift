@@ -119,10 +119,19 @@ public enum Classify {
         AXRoleName.helpTag,
     ]
 
+    /// Subrole, not role. AppKit reports dialogs and sheets as `AXWindow` plus one of these.
+    /// A `tile` rule cannot override them, same as utility and panel.
     public static let hardSubroles: Set<String> = [
         AXRoleName.floatingWindow,
         AXRoleName.systemFloatingWindow,
+        AXRoleName.dialog,
+        AXRoleName.systemDialog,
+        AXRoleName.sheet,
     ]
+
+    /// Filled in as Visual Intelligence / Siri HUD bundle ids are confirmed.
+    /// `docs/compat.md` is the record. Empty means the live path stays off.
+    public static let visualIntelligenceBundleIds: Set<String> = []
 
     public static let dialogRoles: Set<String> = [
         AXRoleName.dialog,
@@ -173,9 +182,10 @@ public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyRes
         return .floating
     }
 
-    if input.role.map(Classify.dialogRoles.contains) == true {
+    let dialogRole = input.role.map(Classify.dialogRoles.contains) == true
+    let dialogSubrole = input.subrole.map(Classify.dialogRoles.contains) == true
+    if dialogRole || dialogSubrole {
         if !allowTiled { return .floating }
-        // tile rule may force-tile a dialog-looking standard window
     }
 
     if !allowTiled && !isTerminal(input.bundleId) {
