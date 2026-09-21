@@ -5,7 +5,9 @@ import ApplicationServices
 final class FirstRunController: @unchecked Sendable {
     let flagPath: String
     weak var extra: ExtraController?
+    var axTrusted: () -> Bool = { false }
     private var showing = false
+    private var poll: Timer?
 
     init(flagPath: String, extra: ExtraController) {
         self.flagPath = flagPath
@@ -17,6 +19,7 @@ final class FirstRunController: @unchecked Sendable {
         if FileManager.default.fileExists(atPath: flagPath) { return }
         showing = true
         show()
+        startPolling()
     }
 
     private func show() {
@@ -41,10 +44,34 @@ final class FirstRunController: @unchecked Sendable {
         alert.addButton(withTitle: "Later")
         alert.window.level = .floating
         let response = alert.runModal()
-        markDone()
+        if axTrusted() {
+            markDone()
+        }
         if response == .alertFirstButtonReturn {
             openAccessibility()
         }
+    }
+
+    private func startPolling() {
+        poll?.invalidate()
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if FileManager.default.fileExists(atPath: self.flagPath) {
+                self.poll?.invalidate()
+                return
+            }
+            if self.axTrusted() {
+                self.markDone()
+                self.poll?.invalidate()
+                return
+            }
+            if !self.showing {
+                self.showing = true
+                self.show()
+            }
+        }
+        poll = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func markDone() {

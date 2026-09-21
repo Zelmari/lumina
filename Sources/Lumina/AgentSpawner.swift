@@ -19,6 +19,7 @@ final class AgentSpawner: @unchecked Sendable {
         displayUUID: String?,
         crashRecover: Bool,
         runLaunchApps: Bool,
+        unstashFrom: String? = nil,
         completion: @escaping @Sendable (pid_t?) -> Void
     ) {
         var env = ProcessInfo.processInfo.environment
@@ -26,6 +27,7 @@ final class AgentSpawner: @unchecked Sendable {
         env["LUMINA_SOCKET"] = socket
         env["LUMINA_CRASH_RECOVER"] = crashRecover ? "1" : "0"
         env["LUMINA_LAUNCH_APPS"] = runLaunchApps ? "1" : "0"
+        if let unstashFrom { env["LUMINA_UNSTASH_FROM"] = unstashFrom }
         if let displayUUID { env["LUMINA_DISPLAY_UUID"] = displayUUID }
 
         var arguments = [

@@ -43,7 +43,7 @@ Identity placeholders only — do not commit secrets.
 # Sign nested agent first, then the outer app, then notarize the outer, staple the dmg.
 codesign --force --options runtime --sign "Developer ID Application: <NAME> (<TEAMID>)" \
   --entitlements Sources/LuminaAgent/LuminaAgent.entitlements \
-  dist/Lumina.app/Contents/Helpers/lumina-agent.app
+  "dist/Lumina.app/Contents/Helpers/Lumina Agent.app"
 codesign --force --options runtime --sign "Developer ID Application: <NAME> (<TEAMID>)" \
   --entitlements Sources/Lumina/Lumina.entitlements \
   dist/Lumina.app
@@ -52,6 +52,14 @@ xcrun stapler staple dist/Lumina.dmg
 ```
 
 Do not set `com.apple.security.cs.disable-library-validation`. Sandbox stays off.
+
+After the outer `codesign --force`, check the helper still has its own designated requirement:
+
+```sh
+codesign -d -r- "dist/Lumina.app/Contents/Helpers/Lumina Agent.app"
+```
+
+`--force` on the outer bundle can replace that requirement. If it did, sign the helper again and re-check before notarizing.
 
 ## Config
 

@@ -2,6 +2,7 @@
 import Darwin
 import Foundation
 import LuminaIPC
+import LuminaLayout
 
 @main
 enum LuminaCLI {
@@ -46,22 +47,34 @@ enum LuminaCLI {
             log.error("menu extra not running")
             exit(1)
         }
-        guard let token = currentToken(menu: menu) else {
+        let path = preferredSocket() ?? {
+            guard let token = currentToken(menu: menu) else { return nil }
+            return LuminaPaths.resolvedAgentSocketPath(
+                uid: uid,
+                tmpdir: tmp,
+                instanceId: token,
+                supportFallback: FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Application Support/Lumina"
+            )
+        }()
+        guard let path else {
             log.error("agent not running on this Space")
             exit(2)
         }
-        let path = LuminaPaths.resolvedAgentSocketPath(
-            uid: uid,
-            tmpdir: tmp,
-            instanceId: token,
-            supportFallback: FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Application Support/Lumina"
-        )
         guard let resp = unixRequest(path: path, request: request) else {
             log.error("agent not running on this Space")
             exit(2)
         }
         printResponse(resp, log: log)
         exit(resp.ok ? 0 : 1)
+    }
+
+    static func preferredSocket() -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = LuminaPaths.instancesPath(supportRoot: home + "/Library/Application Support/Lumina")
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let registry = try? InstanceRegistry.decode(data)
+        else { return nil }
+        return preferredAgentSocket(registry: registry, pidAlive: { kill($0, 0) == 0 })
     }
 
     static func currentToken(menu: String) -> String? {
