@@ -29,6 +29,50 @@ struct StashTests {
         #expect(!display.axVisibleFrame.intersects(hung))
     }
 
+    @Test func menuBarHangKeepsOnePointOnDisplay() {
+        let display = DisplayFrame(
+            axFrame: Rect(x: 0, y: 0, w: 1440, h: 900),
+            axVisibleFrame: Rect(x: 0, y: 25, w: 1440, h: 850)
+        )
+        let after = Rect(x: 100, y: 40, w: 800, h: 600)
+        let hang = menuBarHangFrame(after: after, display: display, x: 1439, inset: 1)
+        #expect(hang.y == -599)
+        #expect(hang.maxY == 1)
+        #expect(hang.h == 600)
+        #expect(isMenuBarParked(hang, display: display))
+        #expect(isStashedAway(hang, display: display))
+        #expect(!display.axVisibleFrame.intersects(hang))
+    }
+
+    @Test func stashedRoleDoesNotReplaceSavedFrame() {
+        let display = DisplayFrame(
+            axFrame: Rect(x: 0, y: 0, w: 1440, h: 900),
+            axVisibleFrame: Rect(x: 0, y: 25, w: 1440, h: 850)
+        )
+        let tile = Rect(x: 40, y: 40, w: 700, h: 500)
+        let parked = stashFrame(for: 500, display: display, dockRight: false, lastWidth: 700)
+        let hang = menuBarHangFrame(after: parked, display: display, x: parked.x)
+        #expect(shouldCaptureOnscreenFrame(role: .tiled, frame: tile, display: display))
+        #expect(!shouldCaptureOnscreenFrame(role: .stashed, frame: tile, display: display))
+        #expect(!shouldCaptureOnscreenFrame(role: .floating, frame: parked, display: display))
+        #expect(!shouldCaptureOnscreenFrame(role: .tiled, frame: hang, display: display))
+    }
+
+    @Test func unlandedSetFrameDoesNotFloatAParkedWindow() {
+        let display = DisplayFrame(
+            axFrame: Rect(x: 0, y: 0, w: 1440, h: 900),
+            axVisibleFrame: Rect(x: 0, y: 25, w: 1440, h: 850)
+        )
+        let parked = stashFrame(for: 500, display: display, dockRight: false, lastWidth: 700)
+        let elsewhere = Rect(x: 80, y: 80, w: 400, h: 300)
+        let hang = menuBarHangFrame(after: elsewhere, display: display, x: parked.x)
+        #expect(unlandedSetFrameAction(live: parked, display: display, alreadyRetried: false) == .retry)
+        #expect(unlandedSetFrameAction(live: parked, display: display, alreadyRetried: true) == .keepTiled)
+        #expect(unlandedSetFrameAction(live: hang, display: display, alreadyRetried: true) == .keepTiled)
+        #expect(unlandedSetFrameAction(live: elsewhere, display: display, alreadyRetried: false) == .retry)
+        #expect(unlandedSetFrameAction(live: elsewhere, display: display, alreadyRetried: true) == .float)
+    }
+
     @Test func sessionJSONRoundTripOmitsTree() throws {
         let file = SessionFile(
             instanceId: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,

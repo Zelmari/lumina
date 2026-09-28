@@ -631,7 +631,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func onMovedOrResized(_ element: AXUIElement, resized: Bool) {
         guard let id = adapter.windowId(for: element) else { return }
-        if let w = lookup(id), adapter.shouldIgnoreAXGeometry(window: w) {
+        if let w = windowAnywhere(id), adapter.shouldIgnoreAXGeometry(window: w) {
             adapter.clearInFlight(id: id, generation: w.generation)
             return
         }
@@ -875,7 +875,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func applyFrames(retryingAfterGhosts: Bool = false) {
+    func applyFrames(retryingAfterGhosts: Bool = false, retryingUnlanded: Bool = false) {
         if userPaused || displayGone || !isCurrent { return }
         refreshBound()
         guard let bound else { return }
@@ -886,6 +886,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let fs = space.luminaFullscreen
         let liveIds = cgWindowIds()
         var ghosts: [UInt32] = []
+        var needsUnlandedRetry = false
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
         for (nodeId, rect) in rects {
             if MutationQueue.shared.shouldSkip(started: started) {
                 log.info("layout pass exceeded 200ms; skipping remaining windows")
@@ -916,9 +918,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             s.setNode(node)
             session.spaces[session.focusedSpace] = s
             if result == .failed {
-                log.info("setFrame failed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); floating")
-                let (after, _) = session.floatLeaf(space: session.focusedSpace, nodeId: nodeId)
-                session = after
+                let live = adapter.frame(of: el)
+                switch unlandedSetFrameAction(live: live, display: display, alreadyRetried: retryingUnlanded) {
+                case .retry:
+                    log.info("setFrame not landed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); retry")
+                    needsUnlandedRetry = true
+                case .keepTiled:
+                    log.info("setFrame still parked window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
+                case .float:
+                    log.info("setFrame failed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); floating")
+                    let (after, _) = session.floatLeaf(space: session.focusedSpace, nodeId: nodeId)
+                    session = after
+                }
             }
         }
         if let fs, let node = space.nodes[fs], var window = node.leaf, let el = resolvedElement(for: window) {
@@ -941,7 +952,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 elements[id] = nil
                 adapter.forgetWindowId(id)
             }
-            applyFrames(retryingAfterGhosts: true)
+            applyFrames(retryingAfterGhosts: true, retryingUnlanded: retryingUnlanded)
+            return
+        }
+        if needsUnlandedRetry, !retryingUnlanded {
+            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.applyFrames(retryingUnlanded: true)
+            }
         }
     }
 
@@ -980,7 +997,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 continue
             }
             let current = adapter.frame(of: el) ?? cgWindowRect(id: id)
-            if let current, !isSliver(current), var space = session.spaces[spaceId] {
+            let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+            if let current, shouldCaptureOnscreenFrame(role: window.role, frame: current, display: display),
+               var space = session.spaces[spaceId]
+            {
                 if var node = space.leaf(containing: id) {
                     node.leaf?.lastOnscreenFrame = current
                     space.setNode(node)
@@ -992,7 +1012,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             let height = current?.h ?? window.lastOnscreenFrame.h
             let width = current?.w ?? window.lastOnscreenFrame.w
-            let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
             let inset: Double = window.bundleId == "us.zoom.xos" ? 0 : 1
             let parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width, inset: inset)
             _ = adapter.setStashFrame(parked, of: el, tag: &window)
@@ -1000,13 +1019,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                after.intersection(bound.axVisibleFrame).w > 8,
                after.intersection(bound.axVisibleFrame).h > 8
             {
-                // Min-size apps ignore 1×8. Keep 1px on-display and hang the rest above the menu bar.
-                let hang = Rect(
-                    x: parked.x,
-                    y: bound.axFrame.minY - after.h + parked.h,
-                    w: after.w,
-                    h: after.h
-                )
+                // Corner park was clamped back on screen. Hang all but `inset` points above the menu bar.
+                let hang = menuBarHangFrame(after: after, display: display, x: parked.x, inset: inset)
                 _ = adapter.setStashFrame(hang, of: el, tag: &window)
                 if let still = adapter.frame(of: el) ?? cgWindowRect(id: id), still.intersects(bound.axVisibleFrame) {
                     log.info(
@@ -1137,6 +1151,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             log.info("unstash still sliver window=\(w.cgWindowId); retry usable")
             _ = adapter.setFrame(usableRestoreRect(Rect(x: 0, y: 0, w: 1, h: 1)), of: el2, tag: &w)
         }
+        writeWindow(w)
     }
 
     func usableRestoreRect(_ preferred: Rect) -> Rect {
@@ -1238,12 +1253,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func isStashedAway(_ rect: Rect) -> Bool {
-        if isOurStashSliver(rect) || isSliver(rect) { return true }
-        guard let bound else { return false }
+        guard let bound else { return isSliver(rect) }
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
-        if isCornerParked(rect, display: display) { return true }
-        if isStashedOffDisplay(rect, display: display) { return true }
-        return display.axFrame.intersects(rect) && !display.axVisibleFrame.intersects(rect)
+        return isFrameStashedAway(rect, display: display)
     }
 
     func ownedWindows(pid: pid_t) -> [(SpaceId, WindowRef)] {
@@ -1484,6 +1496,31 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func lookup(_ id: UInt32) -> WindowRef? {
         session.current.leaf(containing: id)?.leaf ?? session.current.floating.first(where: { $0.cgWindowId == id })
+    }
+
+    func windowAnywhere(_ id: UInt32) -> WindowRef? {
+        for space in session.spaces.values {
+            if let leaf = space.leaf(containing: id)?.leaf { return leaf }
+            if let floating = space.floating.first(where: { $0.cgWindowId == id }) { return floating }
+        }
+        return nil
+    }
+
+    func writeWindow(_ window: WindowRef) {
+        for sid in session.spaces.keys {
+            guard var space = session.spaces[sid] else { continue }
+            if var node = space.leaf(containing: window.cgWindowId), node.leaf != nil {
+                node.leaf = window
+                space.setNode(node)
+                session.spaces[sid] = space
+                return
+            }
+            if let idx = space.floating.firstIndex(where: { $0.cgWindowId == window.cgWindowId }) {
+                space.floating[idx] = window
+                session.spaces[sid] = space
+                return
+            }
+        }
     }
 
     func hitTile(at point: Point) -> SpatialWindow? {

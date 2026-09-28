@@ -46,11 +46,62 @@ public func isStashedOffDisplay(_ rect: Rect, display: DisplayFrame) -> Bool {
     rect.maxX <= display.axFrame.minX + 1 || rect.minX >= display.axFrame.maxX - 1
 }
 
-/// Hidden workspace stash: sliver, past the display, or only in the menu-bar/dock chrome.
+/// 1px strip on the top edge of the display. The rest hangs above the menu bar.
+/// `inset` is that sliver, not the window height. A full-height `inset` pins the window on screen.
+public func menuBarHangFrame(after: Rect, display: DisplayFrame, x: Double, inset: Double = 1) -> Rect {
+    Rect(
+        x: x,
+        y: display.axFrame.minY - after.h + inset,
+        w: after.w,
+        h: after.h
+    )
+}
+
+/// True when the window's bottom edge sits on the top of the display and the rest is above it.
+public func isMenuBarParked(_ rect: Rect, display: DisplayFrame) -> Bool {
+    let top = display.axFrame.minY
+    return rect.minY < top && abs(rect.maxY - (top + 1)) < 4
+}
+
+/// Same as `isStashedAway`. The agent method of that name cannot call the free function.
+public func isFrameStashedAway(_ rect: Rect, display: DisplayFrame) -> Bool {
+    isStashedAway(rect, display: display)
+}
+
+/// Hidden workspace stash: sliver, corner park, menu-bar hang, past the display, or only in the chrome.
 public func isStashedAway(_ rect: Rect, display: DisplayFrame) -> Bool {
     if isSliver(rect) { return true }
+    if isCornerParked(rect, display: display) { return true }
+    if isMenuBarParked(rect, display: display) { return true }
     if isStashedOffDisplay(rect, display: display) { return true }
     return display.axFrame.intersects(rect) && !display.axVisibleFrame.intersects(rect)
+}
+
+/// Save a frame as the on-screen tile only when it is actually on the desktop.
+/// A second stash of an already parked window must not replace the tile rect.
+public func shouldCaptureOnscreenFrame(role: WindowRole, frame: Rect, display: DisplayFrame) -> Bool {
+    if role == .stashed { return false }
+    if isStashedAway(frame, display: display) { return false }
+    return display.axVisibleFrame.contains(point: frame.center)
+}
+
+public enum UnlandedSetFrame: Equatable, Sendable {
+    case retry
+    case keepTiled
+    case float
+}
+
+/// A workspace switch reads the park back before the window has moved.
+/// Retry once. Float only a later read that is on the desktop and still not the tile.
+/// A window that is still parked stays tiled so the park is not adopted as a floater.
+public func unlandedSetFrameAction(
+    live: Rect?,
+    display: DisplayFrame,
+    alreadyRetried: Bool
+) -> UnlandedSetFrame {
+    let parked = live.map { isStashedAway($0, display: display) } ?? false
+    if !alreadyRetried { return .retry }
+    return parked ? .keepTiled : .float
 }
 
 public struct StashEntry: Equatable, Sendable, Codable {
