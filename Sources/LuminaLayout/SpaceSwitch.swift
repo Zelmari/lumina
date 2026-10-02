@@ -96,3 +96,30 @@ public func wrapWorkspace(current: Int, count: Int, delta: Int) -> Int {
     let shifted = ((current - 1 + delta) % count + count) % count
     return shifted + 1
 }
+
+extension Space {
+    /// Window to focus when arriving on this space: the recorded focus when it
+    /// still lives here, else the fullscreen leaf, else the last tiled leaf,
+    /// else the first tiled leaf, else the first floater. Nil when empty.
+    /// The agent moves the windows on screen with AX but macOS does not focus
+    /// them, so the agent raises and focuses the candidate explicitly.
+    public func focusRestorationCandidate() -> UInt32? {
+        if let focused = focusedWindow, contains(cgWindowId: focused) {
+            return focused
+        }
+        if let fs = luminaFullscreen, let w = nodes[fs]?.leaf?.cgWindowId {
+            return w
+        }
+        if let last = lastTiledLeaf, let w = nodes[last]?.leaf?.cgWindowId {
+            return w
+        }
+        if let w = tiledLeaves().first?.leaf?.cgWindowId {
+            return w
+        }
+        return floating.first?.cgWindowId
+    }
+
+    private func contains(cgWindowId: UInt32) -> Bool {
+        leaf(containing: cgWindowId) != nil || floating.contains(where: { $0.cgWindowId == cgWindowId })
+    }
+}

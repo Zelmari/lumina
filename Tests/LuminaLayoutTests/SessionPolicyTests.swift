@@ -113,6 +113,72 @@ struct SpaceSwitchTests {
         #expect(after.focusedSpace.raw == 1)
     }
 
+    @Test func focusRestorationPrefersRecordedFocus() {
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 11, pid: 1),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 22, pid: 2),
+            usableIsWide: true
+        )
+        var space = session[SpaceId.require(2)]!
+        space.focusedWindow = 11
+        session.spaces[SpaceId.require(2)] = space
+        #expect(session[SpaceId.require(2)]!.focusRestorationCandidate() == 11)
+        #expect(session[SpaceId.require(1)]!.focusRestorationCandidate() == nil)
+    }
+
+    @Test func focusRestorationFallsBackWhenRecordedFocusIsGone() {
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 11, pid: 1),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 22, pid: 2),
+            usableIsWide: true
+        )
+        var space = session[SpaceId.require(2)]!
+        // Recorded focus points at a window that no longer lives here.
+        space.focusedWindow = 99
+        session.spaces[SpaceId.require(2)] = space
+        // insertSpiral leaves lastTiledLeaf on the newest leaf.
+        #expect(session[SpaceId.require(2)]!.focusRestorationCandidate() == 22)
+        session = session.removeWindow(space: SpaceId.require(2), cgWindowId: 22)
+        #expect(session[SpaceId.require(2)]!.focusRestorationCandidate() == 11)
+    }
+
+    @Test func focusRestorationPrefersFullscreenLeafAndFloater() {
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 11, pid: 1),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 22, pid: 2),
+            usableIsWide: true
+        )
+        let leaf1 = session[SpaceId.require(2)]!.leaf(containing: 11)!.id
+        session = session.enterLuminaFS(space: SpaceId.require(2), leaf: leaf1)
+        var space = session[SpaceId.require(2)]!
+        space.focusedWindow = nil
+        space.lastTiledLeaf = nil
+        session.spaces[SpaceId.require(2)] = space
+        #expect(session[SpaceId.require(2)]!.focusRestorationCandidate() == 11)
+        var floating = session[SpaceId.require(1)]!
+        floating.floating.append(WindowRef(cgWindowId: 33, pid: 3, role: .floating))
+        session.spaces[SpaceId.require(1)] = floating
+        #expect(session[SpaceId.require(1)]!.focusRestorationCandidate() == 33)
+    }
+
     @Test func moveAndFollowUpdatesFocusedSpace() {
         var session = Session.empty(spaceCount: 5)
         session = session.insertSpiral(
