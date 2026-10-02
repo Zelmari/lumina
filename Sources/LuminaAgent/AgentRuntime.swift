@@ -394,6 +394,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 if owned(id) {
                     rememberFocus(id)
                 } else if let sid = session.spaceContaining(cgWindowId: id), sid != session.focusedSpace {
+                    // Focused elsewhere: remember it there too, so returning
+                    // to that space restores it. Then keep it parked.
+                    if var space = session.spaces[sid] {
+                        space.focusedWindow = id
+                        if let leaf = space.leaf(containing: id) {
+                            space.lastTiledLeaf = leaf.id
+                        }
+                        session.spaces[sid] = space
+                    }
                     stash(ids: [id], space: sid)
                 }
             } else if !inheritOffscreenTab(pid: pid, candidate: win) {
@@ -991,9 +1000,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     /// Remember the currently focused window on the outgoing space so a later
-    /// return trip can restore it.
+    /// return trip can restore it. Prefers the live front-to-back order over
+    /// the model, which may already have diverged from real OS focus.
     func captureFocusForSpaceSwitch() {
-        if let id = focusedId() {
+        if let id = frontmostOwnedWindow() ?? focusedId() {
             rememberFocus(id)
         }
     }
@@ -1006,14 +1016,35 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         focusWindow(target)
     }
 
-    func focusWindow(_ id: UInt32) {
+    /// Activate-first, then focus, then verify with retries. Setting
+    /// kAXFocusedAttribute on a window of an inactive app silently fails on
+    /// macOS, and activate() itself is async, so a single blind setFocused
+    /// never sticks reliably.
+    func focusWindow(_ id: UInt32, attempts: Int = 0) {
         guard let window = windowAnywhere(id) else { return }
         rememberFocus(id)
-        if let el = resolvedElement(for: window) {
-            adapter.setFocused(el, raise: true)
+        guard let el = resolvedElement(for: window) else {
+            log.info("workspace focus missing AX window=\(id)")
+            return
         }
-        NSRunningApplication(processIdentifier: window.pid)?.activate()
-        log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw)")
+        if attempts == 0 {
+            NSRunningApplication(processIdentifier: window.pid)?.activate()
+        }
+        adapter.setFocused(el, raise: true)
+        log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw) attempt=\(attempts)")
+        guard attempts < 3 else { return }
+        let space = session.focusedSpace
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, self.session.focusedSpace == space, self.windowAnywhere(id) != nil else { return }
+            if self.axFocusedWindowId(pid: window.pid) == id { return }
+            self.focusWindow(id, attempts: attempts + 1)
+        }
+    }
+
+    func axFocusedWindowId(pid: pid_t) -> UInt32? {
+        let app = AXUIElementCreateApplication(pid)
+        guard let win = adapter.focusedWindow(of: app) else { return nil }
+        return adapter.windowId(for: win)
     }
 
     func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) {
@@ -1784,6 +1815,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func ffmTick() {
         guard isCurrent, !userPaused, !displayGone else { return }
+        // Never fight an in-progress workspace focus restoration.
+        guard Date().timeIntervalSince(lastLuminaSpaceChange) > 0.5 else { return }
         let inFlight = managedWindowIds().contains { adapter.generationInFlight(for: $0) }
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
