@@ -42,6 +42,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// When a window joined the session. Pruning never removes a window
     /// younger than the grace period; it may just not be visible to AX/CG yet.
     var bornAt: [UInt32: Date] = [:]
+    /// Pre-tiling geometry by CGWindowID, including windows since pruned.
+    /// Persisted via SessionFile so restarts and drop+re-adopt churn cannot
+    /// replace true originals with tile rects.
+    var knownOriginals: [UInt32: Rect] = [:]
     public var resizeDebounce: DispatchWorkItem?
     public var configDebounce: DispatchWorkItem?
     let preferredDisplayUUID: String?
@@ -294,7 +298,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 adapter.rememberWindowId(id, for: el)
                 elements[id] = el
                 let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                var w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: frame)
+                var w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
+                knownOriginals[id] = w.originalFrame ?? frame
                 if result == .floating { w.role = .floating }
                 markBorn(id)
                 out.append(w)
@@ -563,7 +568,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(id, for: element)
         elements[id] = element
         let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: frame)
+        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
+        knownOriginals[id] = window.originalFrame ?? frame
         let usable = bound.usableRect(gaps: config.gaps)
         if session.current.luminaFullscreen != nil {
             session = session.insertWhileLuminaFS(space: session.focusedSpace, window: window, result: result, usableIsWide: usableIsWide(usable))
@@ -667,6 +673,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
         session = session.rebindWindowId(space: session.focusedSpace, from: from, to: to)
+        if let original = knownOriginals[from] {
+            knownOriginals[to] = original
+            knownOriginals[from] = nil
+        }
         elements[from] = nil
         adapter.forgetWindowId(from)
         adapter.rememberWindowId(to, for: element)
@@ -702,6 +712,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 elements[id] = nil
                 adapter.forgetWindowId(id)
                 forgetBorn(id)
+                knownOriginals[id] = nil
             }
         } else {
             log.info("destroy without cached id role=\(adapter.role(of: element) ?? "?")")
@@ -941,6 +952,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 userPaused = false
                 if isCurrent { registerHotkeys() }
                 startOrStopFFM()
+                refreshOriginalsFromLive()
             }
             return .success(id: id)
         case .reload:
@@ -1042,6 +1054,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if !ghosts.isEmpty, !retryingAfterGhosts {
             for id in ghosts {
                 log.info("prune ghost window=\(id)")
+                stashKnownOriginal(id)
                 session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
                 elements[id] = nil
                 adapter.forgetWindowId(id)
@@ -1222,6 +1235,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         for spaceId in Array(session.spaces.keys) {
             for id in session.visibleIds(on: spaceId) where !live.contains(id) && !isYoung(id) {
                 log.info("prune missing window=\(id)")
+                stashKnownOriginal(id)
                 session = session.removeWindow(space: spaceId, cgWindowId: id)
                 elements[id] = nil
                 adapter.forgetWindowId(id)
@@ -1235,6 +1249,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let windows = space.tiledLeaves().compactMap(\.leaf) + space.floating
         for w in windows where !hasAXElement(w) && !isYoung(w.cgWindowId) {
             log.info("prune ghost window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") space=\(spaceId)")
+            stashKnownOriginal(w.cgWindowId)
             session = session.removeWindow(space: spaceId, cgWindowId: w.cgWindowId)
             elements[w.cgWindowId] = nil
             adapter.forgetWindowId(w.cgWindowId)
@@ -1288,6 +1303,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 guard let newId = adapter.windowId(for: el, excluding: excluding), newId != w.cgWindowId else { continue }
                 log.info("rebind stale \(w.cgWindowId) -> \(newId) bundle=\(w.bundleId ?? "?")")
                 session = session.rebindWindowId(space: spaceId, from: w.cgWindowId, to: newId)
+                if let original = knownOriginals[w.cgWindowId] {
+                    knownOriginals[newId] = original
+                    knownOriginals[w.cgWindowId] = nil
+                }
                 elements[w.cgWindowId] = nil
                 adapter.forgetWindowId(w.cgWindowId)
                 adapter.rememberWindowId(newId, for: el)
@@ -1320,8 +1339,49 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Falls back to the tile rect for windows born while already managed.
     func restoreOriginal(_ window: WindowRef) {
         var w = window
+        let hadOriginal = w.originalFrame != nil
         w.lastOnscreenFrame = w.originalFrame ?? w.lastOnscreenFrame
+        let t = w.lastOnscreenFrame
+        log.info("quit restore window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") original=\(hadOriginal) target=\(Int(t.w))x\(Int(t.h)) @\(Int(t.x)),\(Int(t.y))")
         restoreWindow(w)
+    }
+
+    /// Remember a transiently-pruned window's original so a later re-adopt
+    /// reuses it instead of capturing the tile rect. Real closes prune the
+    /// map instead (see handleDestroy/dropPid).
+    func stashKnownOriginal(_ id: UInt32) {
+        if let w = windowAnywhere(id), let original = w.originalFrame {
+            knownOriginals[id] = original
+        }
+    }
+
+    /// Layout made while paused is the user's own: adopt it as the new
+    /// originals. Parked frames are never adopted.
+    func refreshOriginalsFromLive() {
+        guard let bound else { return }
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        for spaceId in session.spaces.keys {
+            guard var space = session.spaces[spaceId] else { continue }
+            for (nodeId, var node) in space.nodes {
+                guard var leaf = node.leaf, let el = elements[leaf.cgWindowId],
+                      let live = adapter.frame(of: el),
+                      !isFrameStashedAway(live, display: display)
+                else { continue }
+                leaf.originalFrame = live
+                node.leaf = leaf
+                space.nodes[nodeId] = node
+                knownOriginals[leaf.cgWindowId] = live
+            }
+            for i in space.floating.indices {
+                let w = space.floating[i]
+                guard let el = elements[w.cgWindowId], let live = adapter.frame(of: el),
+                      !isFrameStashedAway(live, display: display)
+                else { continue }
+                space.floating[i].originalFrame = live
+                knownOriginals[w.cgWindowId] = live
+            }
+            session.spaces[spaceId] = space
+        }
     }
 
     func usableRestoreRect(_ preferred: Rect) -> Rect {
@@ -1503,6 +1563,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                    let file = try? SessionFile.decode(data)
                 {
                     entries.append(contentsOf: file.stash)
+                    for (id, rect) in file.originals { knownOriginals[id] = rect }
                 }
                 try? FileManager.default.removeItem(atPath: path)
             }
@@ -1512,6 +1573,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
            let file = try? SessionFile.decode(data)
         {
             entries.append(contentsOf: file.stash.filter { !isSliver($0.lastOnscreenFrame) || $0.lastOnscreenFrame.h >= 8 })
+            for (id, rect) in file.originals { knownOriginals[id] = rect }
+            for e in file.stash {
+                if let original = e.originalFrame { knownOriginals[e.cgWindowId] = original }
+            }
         }
         let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
@@ -1549,7 +1614,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             bootSessionUUID: kernBootUUID() ?? "",
             focusedSpace: session.focusedSpace.raw,
             displayUUID: bound?.uuid ?? "",
-            stash: entries
+            stash: entries,
+            originals: session.collectOriginals().merging(knownOriginals) { current, _ in current }
         )
         let dir = (sessionPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -1724,6 +1790,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             elements[id] = nil
             adapter.forgetWindowId(id)
             forgetBorn(id)
+            knownOriginals[id] = nil
         }
         applyFrames()
     }
@@ -1802,6 +1869,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let liveIds = Set(live.map(\.cgWindowId))
         for node in session.current.tiledLeaves() {
             if let id = node.leaf?.cgWindowId, !liveIds.contains(id), !isYoung(id) {
+                stashKnownOriginal(id)
                 session = session.remove(space: session.focusedSpace, node: node.id)
                 elements[id] = nil
                 adapter.forgetWindowId(id)
