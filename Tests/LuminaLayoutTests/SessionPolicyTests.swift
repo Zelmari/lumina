@@ -58,21 +58,6 @@ struct StashTests {
         #expect(!shouldCaptureOnscreenFrame(role: .tiled, frame: hang, display: display))
     }
 
-    @Test func unlandedSetFrameDoesNotFloatAParkedWindow() {
-        let display = DisplayFrame(
-            axFrame: Rect(x: 0, y: 0, w: 1440, h: 900),
-            axVisibleFrame: Rect(x: 0, y: 25, w: 1440, h: 850)
-        )
-        let parked = stashFrame(for: 500, display: display, dockRight: false, lastWidth: 700)
-        let elsewhere = Rect(x: 80, y: 80, w: 400, h: 300)
-        let hang = menuBarHangFrame(after: elsewhere, display: display, x: parked.x)
-        #expect(unlandedSetFrameAction(live: parked, display: display, alreadyRetried: false) == .retry)
-        #expect(unlandedSetFrameAction(live: parked, display: display, alreadyRetried: true) == .keepTiled)
-        #expect(unlandedSetFrameAction(live: hang, display: display, alreadyRetried: true) == .keepTiled)
-        #expect(unlandedSetFrameAction(live: elsewhere, display: display, alreadyRetried: false) == .retry)
-        #expect(unlandedSetFrameAction(live: elsewhere, display: display, alreadyRetried: true) == .float)
-    }
-
     @Test func tilingOpsPreserveOriginalFrame() {
         var session = Session.empty(spaceCount: 1)
         let first = Rect(x: 100, y: 100, w: 640, h: 480)

@@ -57,10 +57,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     var knownOriginals: [UInt32: Rect] = [:]
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
-    /// Bounded per-window retries for frames whose write outcome was unsure.
-    /// Unknown/rejected writes never float; young windows get a grace period.
-    var unlandedRetryCounts: [UInt32: Int] = [:]
-    var unlandedRetryScheduled = false
     /// Stash parks that did not land, retried a little later before the model
     /// is allowed to keep claiming they are hidden.
     var pendingStashRetries: [SpaceId: Set<UInt32>] = [:]
@@ -737,18 +733,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         bornAt[id] = nil
     }
 
-    /// Bounded retry budget for frames whose write did not land or timed out.
-    /// 20 retries at the 0.25s cadence covers the 5s `isYoung` grace.
-    func registerUnlandedRetry(_ id: UInt32) -> Bool {
-        let n = (unlandedRetryCounts[id] ?? 0) + 1
-        unlandedRetryCounts[id] = n
-        return n <= 20
-    }
-
-    func clearUnlandedRetry(_ id: UInt32) {
-        unlandedRetryCounts[id] = nil
-    }
-
     func staleOwnedWindow(pid: pid_t, liveId: UInt32, element: AXUIElement) -> UInt32? {
         let live = Set(
             (CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
@@ -800,7 +784,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.forgetWindowId(id)
         forgetBorn(id)
         forgetLastFocus(id)
-        clearUnlandedRetry(id)
         knownOriginals[id] = nil
     }
 
@@ -1076,7 +1059,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func applyFrames(retryingAfterGhosts: Bool = false, retryingUnlanded: Bool = false) {
+    func applyFrames() {
         if userPaused || displayGone || !isCurrent { return }
         refreshBound()
         guard let bound else { return }
@@ -1087,12 +1070,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let fs = space.luminaFullscreen
         let liveIds = cgWindowIds()
         var ghosts: [UInt32] = []
-        var needsUnlandedRetry = false
-        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
         for (nodeId, rect) in rects {
             if MutationQueue.shared.shouldSkip(started: started) {
                 log.info("layout pass exceeded 200ms; skipping remaining windows")
-                if !retryingUnlanded { needsUnlandedRetry = true }
                 break
             }
             if let fs, fs != nodeId { continue }
@@ -1107,72 +1087,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 }
                 continue
             }
-            if let live = adapter.frame(of: el), framesClose(live, rect, slop: 1) {
-                window.lastOnscreenFrame = rect
-                node.leaf = window
-                var s = session.spaces[session.focusedSpace]!
-                s.setNode(node)
-                session.spaces[session.focusedSpace] = s
-                clearUnlandedRetry(window.cgWindowId)
-                continue
-            }
             window.lastOnscreenFrame = rect
-            var result = adapter.setFrame(rect, of: el, tag: &window)
-            if case .rejected(let err) = result, err == .invalidUIElement || err == .apiDisabled {
-                // The cached element can outlive its window: pid lookups still
-                // succeed while attribute writes are rejected. Drop it and try
-                // the freshly enumerated element once.
-                elements[window.cgWindowId] = nil
-                adapter.forgetWindowId(window.cgWindowId)
-                if let fresh = resolvedElement(for: window), !CFEqual(fresh, el) {
-                    log.info("setFrame rejected err=\(err.rawValue); refetched element window=\(window.cgWindowId)")
-                    result = adapter.setFrame(rect, of: fresh, tag: &window)
-                } else {
-                    // No AX element matches this window any more. Ask for a
-                    // refresh; the session GCs it if it is really gone.
-                    scheduleRefresh(reason: "deadElement", delay: 0.5)
-                }
-            }
+            let result = adapter.setFrame(rect, of: el, tag: &window)
             node.leaf = window
             var s = session.spaces[session.focusedSpace]!
             s.setNode(node)
             session.spaces[session.focusedSpace] = s
-            if result == .ok {
-                clearUnlandedRetry(window.cgWindowId)
-            } else if failureIsEvidence(result) {
-                let live = adapter.frame(of: el)
-                if isYoung(window.cgWindowId), registerUnlandedRetry(window.cgWindowId) {
-                    // A newly launched window has not settled yet. Never float
-                    // it out of the tree during the grace period.
-                    log.info("setFrame not landed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); young, retry")
-                    needsUnlandedRetry = true
+            if result != .ok {
+                // Best effort. The next refresh session re-issues the layout;
+                // no model state changes because of a write result.
+                if case .rejected(let err) = result {
+                    log.info("setFrame rejected(\(err.rawValue)) window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); will retry next pass")
                 } else {
-                    switch unlandedSetFrameAction(live: live, display: display, alreadyRetried: retryingUnlanded) {
-                    case .retry:
-                        log.info("setFrame not landed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); retry")
-                        needsUnlandedRetry = true
-                    case .keepTiled:
-                        log.info("setFrame still parked window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
-                        // The window is still in its park, likely mid-unstash.
-                        // Never float it; retry until the unstash lands.
-                        if registerUnlandedRetry(window.cgWindowId) { needsUnlandedRetry = true }
-                    case .float:
-                        log.info("setFrame failed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); floating")
-                        let (after, _) = session.floatLeaf(space: session.focusedSpace, nodeId: nodeId)
-                        session = after
-                        clearUnlandedRetry(window.cgWindowId)
-                    }
-                }
-            } else {
-                // Unknown/rejected are not evidence that the app refuses the
-                // tile. Keep it tiled and retry a bounded number of times.
-                if registerUnlandedRetry(window.cgWindowId) {
-                    if case .rejected(let err) = result {
-                        log.info("setFrame rejected(\(err.rawValue)) window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
-                    } else {
-                        log.info("setFrame timeout window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
-                    }
-                    needsUnlandedRetry = true
+                    log.info("setFrame timeout window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); will retry next pass")
                 }
             }
         }
@@ -1189,26 +1116,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             session.spaces[session.focusedSpace] = s
         }
-        if !ghosts.isEmpty, !retryingAfterGhosts {
+        if !ghosts.isEmpty {
             for id in ghosts {
                 log.info("prune ghost window=\(id)")
-                stashKnownOriginal(id)
-                session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
-                elements[id] = nil
-                adapter.forgetWindowId(id)
-                forgetBorn(id)
-                forgetLastFocus(id)
+                removeDestroyedWindow(id)
             }
-            applyFrames(retryingAfterGhosts: true, retryingUnlanded: retryingUnlanded)
+            applyFrames()
             return
-        }
-        if needsUnlandedRetry, !unlandedRetryScheduled {
-            unlandedRetryScheduled = true
-            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                guard let self else { return }
-                self.unlandedRetryScheduled = false
-                self.applyFrames(retryingUnlanded: true)
-            }
         }
     }
 

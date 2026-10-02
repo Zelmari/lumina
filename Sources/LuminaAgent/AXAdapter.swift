@@ -7,32 +7,15 @@ import Foundation
 import LuminaLayout
 import LuminaIPC
 
-/// Why a tile frame did not land. Collapsing these into one `failed` made every
-/// transient AX timeout look like an app that refuses to be tiled, which then
-/// got permanently demoted to floating.
+/// Why a setFrame call did not report success. This is for logging and
+/// diagnostics only. No model state changes because of a write result; the
+/// next declarative layout pass re-issues the frame.
 public enum SetFrameResult: Equatable, Sendable {
     case ok
     /// AX explicitly rejected the write (dead element, API disabled, illegal arg).
-    /// Carries the raw `AXError` so stale elements can be told from refusals.
     case rejected(AXError)
-    /// Writes reported success and reads were trustworthy, yet the frame still differs.
-    /// This is the only result that is evidence the app is fighting the tile.
-    case notLanded
-    /// A write or read timed out. We do not know whether the frame landed.
+    /// A write timed out. We do not know whether the frame landed.
     case unknown
-}
-
-/// `rejected` and `unknown` are both "no trustworthy evidence": they must never
-/// float a window. Only `notLanded` may, and only after the retry deadline.
-func failureIsEvidence(_ result: SetFrameResult) -> Bool {
-    result == .notLanded
-}
-
-private func mergeWriteResults(_ a: SetFrameResult, _ b: SetFrameResult) -> SetFrameResult {
-    if case .rejected = a { return a }
-    if case .rejected = b { return b }
-    if a == .unknown || b == .unknown { return .unknown }
-    return .notLanded
 }
 
 /// Per-element AX writes must not fail just because an app is busy launching.
@@ -197,12 +180,7 @@ public final class AXAdapter {
         let id = window.cgWindowId
         let gen = window.generation
         inFlight[id] = gen
-        let first = applyFrame(rect, of: element)
-        var result = first
-        if first != .ok {
-            let second = applyFrame(rect, of: element)
-            result = second == .ok ? .ok : mergeWriteResults(first, second)
-        }
+        let result = applyFrame(rect, of: element)
         scheduleInFlightClear(id: id, gen: gen)
         return result
     }
@@ -258,40 +236,55 @@ public final class AXAdapter {
             return .unknown
         case .accepted:
             guard let got = frame(of: element) else { return .unknown }
-            return framesClose(got, rect) ? .ok : .notLanded
+            return framesClose(got, rect) ? .ok : .unknown
         }
     }
 
     private func applyFrame(_ rect: Rect, of element: AXUIElement) -> SetFrameResult {
         AXUIElementSetMessagingTimeout(element, axWriteTimeout)
-        func write() -> AXWriteOutcome {
-            var size = CGSize(width: rect.w, height: rect.h)
-            var point = CGPoint(x: rect.x, y: rect.y)
-            guard let sizeVal = AXValueCreate(.cgSize, &size),
-                  let posVal = AXValueCreate(.cgPoint, &point)
-            else { return .rejected(.illegalArgument) }
-            let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-            let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
-            let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-            let errors = [s1, pos, s2]
-            let outcome = classifyWrite(errors)
-            if case .rejected(let err) = outcome {
-                logWriteFailure("frame", err: err, errors: errors)
-            }
-            return outcome
+        let restore = disableAnimations(element)
+        defer { restore() }
+        let errors = writeFrameValues(rect, of: element)
+        let outcome = classifyWrite(errors)
+        if case .rejected(let err) = outcome {
+            logWriteFailure("frame", err: err, errors: errors)
         }
-        let first = write()
-        if case .rejected(let err) = first { return .rejected(err) }
-        let afterFirst = frame(of: element)
-        if let afterFirst, framesClose(afterFirst, rect) { return .ok }
-        let second = write()
-        if case .rejected(let err) = second { return .rejected(err) }
-        let afterSecond = frame(of: element)
-        if let afterSecond, framesClose(afterSecond, rect) { return .ok }
-        // Writes were accepted and at least one read was trustworthy: the app
-        // saw the request and did not honor it. That is the only evidence.
-        if first == .accepted, second == .accepted, afterSecond != nil { return .notLanded }
-        return .unknown
+        switch outcome {
+        case .accepted: return .ok
+        case .rejected(let err): return .rejected(err)
+        case .timedOut: return .unknown
+        }
+    }
+
+    /// AeroSpace wraps frame writes in `AXEnhancedUserInterface` so apps do not
+    /// animate the move. Returns a closure that restores the previous value.
+    private func disableAnimations(_ element: AXUIElement) -> () -> Void {
+        let attr = "AXEnhancedUserInterface" as CFString
+        var ref: CFTypeRef?
+        var prior: Bool?
+        if AXUIElementCopyAttributeValue(element, attr, &ref) == .success {
+            prior = ref as? Bool
+        }
+        AXUIElementSetAttributeValue(element, attr, kCFBooleanTrue)
+        return { [weak element] in
+            guard let element else { return }
+            let restore = prior ?? false
+            AXUIElementSetAttributeValue(element, attr, restore ? kCFBooleanTrue : kCFBooleanFalse)
+        }
+    }
+
+    /// Writes size then position then size. The order matters: some apps clamp
+    /// on resize, and re-applying the size after the move catches that.
+    private func writeFrameValues(_ rect: Rect, of element: AXUIElement) -> [AXError] {
+        var size = CGSize(width: rect.w, height: rect.h)
+        var point = CGPoint(x: rect.x, y: rect.y)
+        guard let sizeVal = AXValueCreate(.cgSize, &size),
+              let posVal = AXValueCreate(.cgPoint, &point)
+        else { return [.illegalArgument] }
+        let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+        let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+        let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
+        return [s1, pos, s2]
     }
 
     /// Raw codes so a stale element (`.invalidUIElement`) can be told apart

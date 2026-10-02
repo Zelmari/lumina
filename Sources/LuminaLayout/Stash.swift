@@ -85,25 +85,6 @@ public func shouldCaptureOnscreenFrame(role: WindowRole, frame: Rect, display: D
     return display.axVisibleFrame.contains(point: frame.center)
 }
 
-public enum UnlandedSetFrame: Equatable, Sendable {
-    case retry
-    case keepTiled
-    case float
-}
-
-/// A workspace switch reads the park back before the window has moved.
-/// Retry once. Float only a later read that is on the desktop and still not the tile.
-/// A window that is still parked stays tiled so the park is not adopted as a floater.
-public func unlandedSetFrameAction(
-    live: Rect?,
-    display: DisplayFrame,
-    alreadyRetried: Bool
-) -> UnlandedSetFrame {
-    let parked = live.map { isStashedAway($0, display: display) } ?? false
-    if !alreadyRetried { return .retry }
-    return parked ? .keepTiled : .float
-}
-
 public struct StashEntry: Equatable, Sendable, Codable {
     public var cgWindowId: UInt32
     public var pid: Int32
