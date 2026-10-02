@@ -120,8 +120,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     public func stop() {
-        unstashAll()
-        rescueOffscreenWindows()
+        unstashAll(restoreOriginals: true)
+        rescueOffscreenWindows(restoreOriginals: true)
         writeSession(stash: [])
         unregisterHotkeys()
         server?.stop()
@@ -279,7 +279,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 adapter.rememberWindowId(id, for: el)
                 elements[id] = el
                 let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                var w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame)
+                var w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: frame)
                 if result == .floating { w.role = .floating }
                 out.append(w)
             }
@@ -515,7 +515,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(id, for: element)
         elements[id] = element
         let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame)
+        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: frame)
         let usable = bound.usableRect(gaps: config.gaps)
         if session.current.luminaFullscreen != nil {
             session = session.insertWhileLuminaFS(space: session.focusedSpace, window: window, result: result, usableIsWide: usableIsWide(usable))
@@ -696,7 +696,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if var space = session.spaces[session.focusedSpace],
                let idx = space.floating.firstIndex(where: { $0.cgWindowId == id })
             {
+                // A floater the user placed themselves: quit restores this spot.
                 space.floating[idx].lastOnscreenFrame = frame
+                space.floating[idx].originalFrame = frame
                 session.spaces[session.focusedSpace] = space
             }
             return
@@ -1080,19 +1082,23 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         stash(ids: ids)
     }
 
-    func unstashSpace(_ id: SpaceId) {
+    func unstashSpace(_ id: SpaceId, restoreOriginals: Bool = false) {
         guard let space = session.spaces[id] else { return }
         for node in space.tiledLeaves() {
-            if let w = node.leaf { restoreWindow(w) }
+            if let w = node.leaf {
+                if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
+            }
         }
-        for w in space.floating { restoreWindow(w) }
+        for w in space.floating {
+            if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
+        }
         pruneGhostLeaves(space: id)
     }
 
-    func unstashAll() {
-        for spaceId in session.spaces.keys { unstashSpace(spaceId) }
-        unstashOrphanSlivers()
-        rescueOffscreenWindows()
+    func unstashAll(restoreOriginals: Bool = false) {
+        for spaceId in session.spaces.keys { unstashSpace(spaceId, restoreOriginals: restoreOriginals) }
+        unstashOrphanSlivers(restoreOriginals: restoreOriginals)
+        rescueOffscreenWindows(restoreOriginals: restoreOriginals)
     }
 
     func pruneMissingWindows() {
@@ -1185,6 +1191,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         writeWindow(w)
     }
 
+    /// Quit path: put the window back where the user had it before tiling.
+    /// Falls back to the tile rect for windows born while already managed.
+    func restoreOriginal(_ window: WindowRef) {
+        var w = window
+        w.lastOnscreenFrame = w.originalFrame ?? w.lastOnscreenFrame
+        restoreWindow(w)
+    }
+
     func usableRestoreRect(_ preferred: Rect) -> Rect {
         let fallback = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 40, y: 48, w: 1200, h: 800)
         guard let bound else { return fallback }
@@ -1246,7 +1260,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         abs(a.x - b.x) <= slop && abs(a.y - b.y) <= slop && abs(a.w - b.w) <= slop && abs(a.h - b.h) <= slop
     }
 
-    func rescueOffscreenWindows() {
+    func rescueOffscreenWindows(restoreOriginals: Bool = false) {
         guard let bound else { return }
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
         let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
@@ -1259,7 +1273,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let w = lookup(id)
                 ?? WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: usableRestoreRect(rect))
             log.info("rescue offscreen window=\(id) pid=\(pid) \(Int(rect.w))x\(Int(rect.h))")
-            restoreWindow(w)
+            if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
         }
     }
 
@@ -1338,7 +1352,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         stash(ids: ids, space: spaceId)
     }
 
-    func unstashOrphanSlivers() {
+    func unstashOrphanSlivers(restoreOriginals: Bool = false) {
         let ownedPids = Set(session.spaces.values.flatMap { space in
             space.tiledLeaves().compactMap { $0.leaf?.pid } + space.floating.map(\.pid)
         })
@@ -1350,7 +1364,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let w = lookup(id)
                 ?? session.spaces.values.compactMap { $0.leaf(containing: id)?.leaf }.first
                 ?? WindowRef(cgWindowId: id, pid: pid, bundleId: nil, lastOnscreenFrame: usableRestoreRect(rect))
-            restoreWindow(w)
+            if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
         }
     }
 
@@ -1383,12 +1397,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                   isOurStashSliver(rect)
             else { continue }
             let known = entries.first { $0.cgWindowId == id }
-            let restore = known.flatMap { isSliver($0.lastOnscreenFrame) ? nil : $0.lastOnscreenFrame }
+            let restore = known.flatMap { isSliver($0.lastOnscreenFrame) ? nil : ($0.originalFrame ?? $0.lastOnscreenFrame) }
                 ?? usableRestoreRect(rect)
-            entries.append(StashEntry(cgWindowId: id, pid: pid, bundleId: known?.bundleId, lastOnscreenFrame: restore))
+            entries.append(StashEntry(cgWindowId: id, pid: pid, bundleId: known?.bundleId, lastOnscreenFrame: restore, originalFrame: known?.originalFrame))
         }
         for e in entries {
-            let w = WindowRef(cgWindowId: e.cgWindowId, pid: e.pid, bundleId: e.bundleId, lastOnscreenFrame: usableRestoreRect(e.lastOnscreenFrame))
+            let frame = usableRestoreRect(e.originalFrame ?? e.lastOnscreenFrame)
+            let w = WindowRef(cgWindowId: e.cgWindowId, pid: e.pid, bundleId: e.bundleId, lastOnscreenFrame: frame, originalFrame: e.originalFrame ?? e.lastOnscreenFrame)
             restoreWindow(w)
         }
         rescueOffscreenWindows()
