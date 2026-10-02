@@ -784,6 +784,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 log.info("move-node-to-workspace window=\(focused) \(from)->\(id.raw) focusedSpace=\(session.focusedSpace.raw)")
                 restashOffspace()
                 applyFrames()
+                focusWindow(focused)
                 writeSession()
             }
         case .balance:
@@ -965,22 +966,52 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func switchSpace(_ id: SpaceId) {
         guard id != session.focusedSpace else { return }
         lastLuminaSpaceChange = Date()
+        captureFocusForSpaceSwitch()
         stash(ids: Set(session.visibleIds(on: session.focusedSpace)))
         session = session.switchTo(id)
         unstashSpace(id)
         applyFrames()
         restashOffspace()
+        focusRestoredWindow(on: id)
         writeSession()
     }
 
     func switchSpaceBy(_ transform: (Session) -> Session) {
         lastLuminaSpaceChange = Date()
+        captureFocusForSpaceSwitch()
         stash(ids: Set(session.visibleIds(on: session.focusedSpace)))
         session = transform(session)
         unstashSpace(session.focusedSpace)
         applyFrames()
         restashOffspace()
+        focusRestoredWindow(on: session.focusedSpace)
         writeSession()
+    }
+
+    /// Remember the currently focused window on the outgoing space so a later
+    /// return trip can restore it.
+    func captureFocusForSpaceSwitch() {
+        if let id = focusedId() {
+            rememberFocus(id)
+        }
+    }
+
+    /// Raise and focus the destination space's restoration candidate. Moving
+    /// windows on screen via AX does not focus them, so without this the user
+    /// must click or cmd-tab after every workspace switch.
+    func focusRestoredWindow(on id: SpaceId) {
+        guard let target = session.spaces[id]?.focusRestorationCandidate() else { return }
+        focusWindow(target)
+    }
+
+    func focusWindow(_ id: UInt32) {
+        guard let window = windowAnywhere(id) else { return }
+        rememberFocus(id)
+        if let el = resolvedElement(for: window) {
+            adapter.setFocused(el, raise: true)
+        }
+        NSRunningApplication(processIdentifier: window.pid)?.activate()
+        log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw)")
     }
 
     func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) {
