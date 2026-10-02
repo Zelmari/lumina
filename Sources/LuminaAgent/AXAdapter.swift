@@ -355,9 +355,23 @@ public final class AXAdapter {
 
     public func setFocused(_ element: AXUIElement, raise: Bool = false) {
         if raise {
+            setMain(element)
             AXUIElementPerformAction(element, kAXRaiseAction as CFString)
         }
         AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    }
+
+    /// Mark the window as the app's main window before raising, so activation
+    /// brings the right window forward.
+    public func setMain(_ element: AXUIElement) {
+        AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)
+    }
+
+    /// Apply native focus once: main, raise, activate. No retries or
+    /// verification; the next activation notification re-drives focus.
+    public func nativeFocus(_ element: AXUIElement, pid: pid_t) {
+        setFocused(element, raise: true)
+        NSRunningApplication(processIdentifier: pid)?.activate()
     }
 
     public func minSize(of element: AXUIElement) -> Size {

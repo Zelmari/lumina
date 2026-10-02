@@ -25,9 +25,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var boundSkyLightId: UInt64?
     /// Latest SkyLight id, used only to notice a native Space change.
     public var observedSkyLightId: UInt64?
-    /// Last focused window per pid per Lumina space. A single global entry let
-    /// app activation raise a stale id from another space, or a recycled one.
-    var lastFocusedByPid: [pid_t: [SpaceId: UInt32]] = [:]
     public var axTrusted: Bool { AXIsProcessTrusted() }
     public var hotkeys = Hotkeys()
     public var secureInput = false
@@ -399,7 +396,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     spaceHasWindows: hasWindows,
                     elapsedSinceSpaceChange: Date().timeIntervalSince(self.lastLuminaSpaceChange)
                 ) else { return }
-                self.switchToWindowOf(pid: app.processIdentifier)
+                self.syncFocusToFrontmostApp(pid: app.processIdentifier)
             }
         }
     }
@@ -519,7 +516,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             for w in space.floating { modelPids[w.cgWindowId] = w.pid }
         }
         let delta = reconcile(model: session.allWindowIds, modelPids: modelPids, live: live)
+        let focusedBefore = session.current.focusedWindow
         for id in delta.removed { removeDestroyedWindow(id) }
+        if !delta.removed.isEmpty, session.current.focusedWindow != focusedBefore,
+           let winner = session.current.focusedWindow
+        {
+            // Stay on this (possibly now empty) space; only re-home focus when
+            // a sibling remains there.
+            nativeFocus(winner)
+        }
         for pair in delta.rebinds {
             guard let el = elementsById[pair.to], let w = windowAnywhere(pair.from) else { continue }
             log.info("refresh rebind \(pair.from) -> \(pair.to) bundle=\(w.bundleId ?? "?")")
@@ -757,11 +762,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(to, for: element)
         elements[to] = element
         observers.watchWindow(element, pid: pid)
-        let hadFocus = lastFocusedByPid[pid]?.values.contains(from) == true
-        forgetLastFocus(from)
-        if hadFocus {
-            lastFocusedByPid[pid, default: [:]][session.focusedSpace] = to
-        }
         if session.current.focusedWindow == from {
             rememberFocus(to)
         }
@@ -783,7 +783,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         elements[id] = nil
         adapter.forgetWindowId(id)
         forgetBorn(id)
-        forgetLastFocus(id)
         knownOriginals[id] = nil
     }
 
@@ -966,7 +965,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 log.info("move-node-to-workspace window=\(focused) \(from)->\(id.raw) focusedSpace=\(session.focusedSpace.raw)")
                 restashOffspace()
                 applyFrames()
-                focusWindow(focused)
+                nativeFocus(focused)
                 writeSession()
             }
         case .balance:
@@ -1174,44 +1173,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// must click or cmd-tab after every workspace switch.
     func focusRestoredWindow(on id: SpaceId) {
         guard let target = session.spaces[id]?.focusRestorationCandidate() else { return }
-        focusWindow(target)
+        nativeFocus(target)
     }
 
-    /// Activate-first, then focus, then verify with retries. Setting
-    /// kAXFocusedAttribute on a window of an inactive app silently fails on
-    /// macOS and activate() itself is async. While the app is not active, the
-    /// retries only re-activate — raising a window over the frontmost app is
-    /// what pinned hidden-space windows on top of the user's work.
-    func focusWindow(_ id: UInt32, attempts: Int = 0) {
-        guard attempts <= 3, let window = windowAnywhere(id) else { return }
+    /// Apply native focus once: main, raise, activate. No retry loop; a failed
+    /// activation is fixed by the next activation notification or refresh.
+    /// Hidden-role windows are never raised.
+    func nativeFocus(_ id: UInt32) {
+        guard let window = windowAnywhere(id) else { return }
         guard window.role == .tiled || window.role == .floating || window.role == .luminaFS else {
             return
         }
         rememberFocus(id)
         guard let el = resolvedElement(for: window) else {
-            log.info("workspace focus missing AX window=\(id)")
+            log.info("focus missing AX window=\(id)")
             return
         }
-        let app = NSRunningApplication(processIdentifier: window.pid)
-        if app?.isActive == true {
-            adapter.setFocused(el, raise: true)
-            log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw) attempt=\(attempts)")
-            if axFocusedWindowId(pid: window.pid) == id { return }
-        } else {
-            app?.activate()
-            log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw) attempt=\(attempts) waiting for activation")
-        }
-        let space = session.focusedSpace
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            guard let self, self.session.focusedSpace == space, self.windowAnywhere(id) != nil else { return }
-            self.focusWindow(id, attempts: attempts + 1)
-        }
-    }
-
-    func axFocusedWindowId(pid: pid_t) -> UInt32? {
-        let app = AXUIElementCreateApplication(pid)
-        guard let win = adapter.focusedWindow(of: app) else { return nil }
-        return adapter.windowId(for: win)
+        adapter.nativeFocus(el, pid: window.pid)
+        log.info("focus window=\(id) space=\(session.focusedSpace.raw) bundle=\(window.bundleId ?? "?")")
     }
 
     @discardableResult
@@ -1363,7 +1342,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             elements[w.cgWindowId] = nil
             adapter.forgetWindowId(w.cgWindowId)
             forgetBorn(w.cgWindowId)
-            forgetLastFocus(w.cgWindowId)
         }
     }
 
@@ -1798,18 +1776,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             space.lastTiledLeaf = leaf.id
         }
         session.spaces[sid] = space
-        lastFocusedByPid[w.pid, default: [:]][sid] = id
-    }
-
-    func forgetLastFocus(_ id: UInt32) {
-        for (pid, var bySpace) in lastFocusedByPid {
-            bySpace = bySpace.filter { $0.value != id }
-            if bySpace.isEmpty {
-                lastFocusedByPid[pid] = nil
-            } else {
-                lastFocusedByPid[pid] = bySpace
-            }
-        }
     }
 
     func frontmostOwnedWindow() -> UInt32? {
@@ -1889,40 +1855,28 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             elements[id] = nil
             adapter.forgetWindowId(id)
             forgetBorn(id)
-            forgetLastFocus(id)
             knownOriginals[id] = nil
         }
         applyFrames()
     }
 
-    func switchToWindowOf(pid: pid_t) {
+    /// Adopt the frontmost app's own idea of its focused window: if it is
+    /// managed, make its space visible and focus it. Unknown windows are left
+    /// to the next refresh session.
+    func syncFocusToFrontmostApp(pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
-        let live = adapter.focusedWindow(of: app).flatMap { adapter.windowId(for: $0) }
-        let remembered = lastFocusedByPid[pid]
-        func valid(_ id: UInt32?) -> UInt32? {
-            guard let id, ownedAnywhere(id), let w = windowAnywhere(id), hasAXElement(w) else { return nil }
-            return id
-        }
-        var candidate = valid(live)
-        if candidate == nil { candidate = valid(remembered?[session.focusedSpace]) }
-        if candidate == nil {
-            for sid in session.spaces.keys.sorted() {
-                if let id = valid(remembered?[sid]) {
-                    candidate = id
-                    break
-                }
-            }
-        }
-        guard let focused = candidate else { return }
-        if session.spaceContaining(cgWindowId: focused) == session.focusedSpace {
-            focusWindow(focused)
-        } else if let spaceId = session.spaceContaining(cgWindowId: focused) {
+        guard let focused = adapter.focusedWindow(of: app).flatMap({ adapter.windowId(for: $0) }),
+              ownedAnywhere(focused),
+              let window = windowAnywhere(focused),
+              hasAXElement(window)
+        else { return }
+        if let spaceId = session.spaceContaining(cgWindowId: focused), spaceId != session.focusedSpace {
             var s = session
             s.spaces[spaceId]?.focusedWindow = focused
             session = s
             switchSpace(spaceId)
-            focusWindow(focused)
         }
+        nativeFocus(focused)
     }
 
     func recomputeCurrentToken(reason: CurrentReason) {
