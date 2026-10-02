@@ -36,11 +36,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var lastLuminaSpaceChange = Date.distantPast
     public var pasteboardCount: Int = 0
     public var moveStart: (UInt32, Point, Int)?
-    public     var createDebounce: DispatchWorkItem?
-    var pendingCreates: [(element: AXUIElement, space: SpaceId)] = []
-    /// Elements whose creation raced WindowServer/AX (no id yet, or only a
-    /// placeholder frame). Retried a bounded number of times, then dropped.
-    var pendingRetryElements: [(element: AXUIElement, thenRegisterPlaceholder: Bool, space: SpaceId?)] = []
+    /// A coalesced refresh session. Events only carry a reason; the session
+    /// re-reads the world. `space` is where new windows land: the focused
+    /// space when the event burst started.
+    struct RefreshRequest {
+        var reason: String
+        var space: SpaceId
+    }
+    var pendingRefresh: RefreshRequest?
+    var refreshScheduled = false
+    /// Bounded follow-up passes when a window was not resolvable yet.
+    var unresolvedRefreshPasses = 0
+    var refreshUnresolved = false
     /// When a window joined the session. Pruning never removes a window
     /// younger than the grace period; it may just not be visible to AX/CG yet.
     var bornAt: [UInt32: Date] = [:]
@@ -58,9 +65,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// is allowed to keep claiming they are hidden.
     var pendingStashRetries: [SpaceId: Set<UInt32>] = [:]
     var stashRetryWork: DispatchWorkItem?
-    /// Windows whose destroy notification could not be trusted yet (CG list
-    /// lags). Checked once shortly after; deduped per window.
-    var destroyRecheckPending: Set<UInt32> = []
     /// Cascade offset for quit restore when the saved original is really the
     /// engine's tile. Reset per quit.
     var restoreCascadeIndex = 0
@@ -285,11 +289,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             defer { index += 1 }
             if MutationQueue.shared.shouldSkip(started: started) {
                 // Resume where we left off instead of dropping the tail pids.
-                let rest = apps[index...].map(\.processIdentifier)
-                log.info("collectManagedWindows exceeded 200ms; continuing with \(rest.count) pids")
+                log.info("collectManagedWindows exceeded 200ms; continuing with \(apps.count - index) pids")
                 MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                     guard let self, self.isCurrent, !self.userPaused else { return }
-                    for pid in rest { self.adoptWindows(pid: pid, apply: false) }
+                    self.scheduleRefresh(reason: "bootTail")
                     self.applyFrames()
                 }
                 break
@@ -356,15 +359,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard isCurrent, !userPaused else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             let pid = app.processIdentifier
-            let space = session.focusedSpace
             DispatchQueue.main.async { self.observers.watch(pid: pid) }
-            // Chromium/Electron shows a splash then swaps in the real window
-            // (Discord, Chrome PWAs). The late polls catch that replacement.
-            for delay in [0.2, 0.55, 1.5, 3.0] {
-                MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self, self.isCurrent else { return }
-                    self.adoptWindows(pid: pid, space: space)
-                }
+            MutationQueue.shared.hop { [weak self] in
+                self?.scheduleRefresh(reason: "appLaunched")
             }
         }
     }
@@ -391,7 +388,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard !userPaused, isCurrent else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
-                self.adoptWindows(pid: app.processIdentifier)
+                self.scheduleRefresh(reason: "appActivated")
                 // A model window may already be dead (Electron AX churn). A
                 // space full of ghosts must not count as occupied, or macOS
                 // promoting the next app after a close drags the user away.
@@ -432,14 +429,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func handleAX(pid: pid_t, name: String, element: AXUIElement) {
         if userPaused || displayGone || !isCurrent { return }
         switch name {
-        case kAXWindowCreatedNotification:
-            scheduleCreate(element)
-        case kAXUIElementDestroyedNotification:
-            handleDestroy(element)
+        case kAXWindowCreatedNotification, kAXUIElementDestroyedNotification:
+            scheduleRefresh(reason: name)
         case kAXFocusedWindowChangedNotification:
             let win = adapter.focusedWindow(of: element)
                 ?? adapter.focusedWindow(of: AXUIElementCreateApplication(pid))
-            guard let win, let id = adapter.windowId(for: win) else { return }
+            guard let win, let id = adapter.windowId(for: win) else {
+                scheduleRefresh(reason: name)
+                return
+            }
             if ownedAnywhere(id) {
                 observers.watchWindow(win, pid: pid)
                 if owned(id) {
@@ -456,8 +454,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     }
                     stashAndRetry(ids: [id], space: sid)
                 }
-            } else if !inheritOffscreenTab(pid: pid, candidate: win) {
-                onCreate(win)
+            } else {
+                // Unknown to the model: the next session adopts it.
+                scheduleRefresh(reason: name)
             }
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
             onMovedOrResized(element, resized: name == kAXWindowResizedNotification)
@@ -479,28 +478,93 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func scheduleCreate(_ element: AXUIElement) {
-        let space = session.focusedSpace
-        pendingCreates.append((element, space))
-        MutationQueue.shared.scheduleLayoutPass { [weak self] in
+    /// Coalesce every discovery event into one session. Mutation queue only.
+    func scheduleRefresh(reason: String, delay: TimeInterval = 0.04) {
+        let space = pendingRefresh?.space ?? session.focusedSpace
+        pendingRefresh = RefreshRequest(reason: reason, space: space)
+        guard !refreshScheduled else { return }
+        refreshScheduled = true
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            let batch = self.pendingCreates
-            self.pendingCreates.removeAll()
-            var claimed = self.session.allWindowIds.union(self.elements.keys)
-            for item in batch {
-                self.onCreate(item.element, claimed: &claimed, apply: false, space: item.space)
-            }
-            self.applyFrames()
+            self.refreshScheduled = false
+            guard let request = self.pendingRefresh else { return }
+            self.pendingRefresh = nil
+            self.runRefresh(reason: request.reason, space: request.space)
         }
     }
 
-    func adoptWindows(pid: pid_t, apply: Bool = true, space: SpaceId? = nil) {
-        observers.watch(pid: pid)
+    /// One declarative pass: re-read every relevant app's AX window list, GC
+    /// windows that are gone, rebind replaced ids, adopt new ones, then lay
+    /// out. Convergence by repetition; no per-event repair.
+    func runRefresh(reason: String, space: SpaceId) {
+        guard didBootLayout, isCurrent, !userPaused, !displayGone, let bound else { return }
+        let started = Date()
+        refreshUnresolved = false
+        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
+        var elementsById: [UInt32: AXUIElement] = [:]
+        var live: [LiveWindow] = []
+        for pid in refreshPids() {
+            for el in adapter.windows(pid: pid) {
+                guard let id = adapter.windowId(for: el) else { continue }
+                let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
+                live.append(LiveWindow(
+                    cgWindowId: id,
+                    pid: pid,
+                    bundleId: adapter.bundleId(pid: pid),
+                    frame: frame,
+                    onScreen: onScreen.contains(id)
+                ))
+                elementsById[id] = el
+            }
+        }
+        var modelPids: [UInt32: Int32] = [:]
+        for space in session.spaces.values {
+            for node in space.tiledLeaves() { if let w = node.leaf { modelPids[w.cgWindowId] = w.pid } }
+            for w in space.floating { modelPids[w.cgWindowId] = w.pid }
+        }
+        let delta = reconcile(model: session.allWindowIds, modelPids: modelPids, live: live)
+        for id in delta.removed { removeDestroyedWindow(id) }
+        for pair in delta.rebinds {
+            guard let el = elementsById[pair.to], let w = windowAnywhere(pair.from) else { continue }
+            log.info("refresh rebind \(pair.from) -> \(pair.to) bundle=\(w.bundleId ?? "?")")
+            rebindOwned(from: pair.from, to: pair.to, element: el, pid: w.pid)
+        }
         var claimed = session.allWindowIds.union(elements.keys)
-        for el in adapter.windows(pid: pid) {
+        for id in delta.added {
+            guard let el = elementsById[id] else { continue }
             onCreate(el, claimed: &claimed, apply: false, space: space)
         }
-        if apply { applyFrames() }
+        applyFrames()
+        restashOffspace()
+        if !delta.isEmpty || refreshUnresolved {
+            let ms = Int(Date().timeIntervalSince(started) * 1000)
+            log.info("refresh reason=\(reason) added=\(delta.added.count) removed=\(delta.removed.count) rebinds=\(delta.rebinds.count) unresolved=\(refreshUnresolved) \(ms)ms")
+        }
+        if refreshUnresolved, unresolvedRefreshPasses < 2 {
+            unresolvedRefreshPasses += 1
+            scheduleRefresh(reason: "unresolved", delay: 1.0)
+        } else if !refreshUnresolved {
+            unresolvedRefreshPasses = 0
+        }
+    }
+
+    /// Pids worth enumerating this pass: everything we manage, everything with
+    /// an on-screen window, and the frontmost app.
+    func refreshPids() -> [pid_t] {
+        var pids = Set<pid_t>()
+        for space in session.spaces.values {
+            for node in space.tiledLeaves() { if let w = node.leaf { pids.insert(w.pid) } }
+            for w in space.floating { pids.insert(w.pid) }
+        }
+        if let bound {
+            for row in onScreenCGWindows(intersecting: bound.axFrame) {
+                if let pid = cgOwnerPID(row), !isOurProcess(pid) { pids.insert(pid) }
+            }
+        }
+        if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier, !isOurProcess(front) {
+            pids.insert(front)
+        }
+        return pids.sorted()
     }
 
     func onCreate(_ element: AXUIElement, space: SpaceId? = nil, forceRegisterPlaceholder: Bool = false) {
@@ -557,7 +621,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             excludingWindowIds: claimed
         ) else {
             log.info("onCreate skip (no window id) role=\(adapter.role(of: element) ?? "?")")
-            retryCreate(element, attempts: 3, space: targetId)
+            refreshUnresolved = true
             return
         }
         if let sid = otherSpace(pid: pid, id: id, element: element) {
@@ -595,9 +659,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         )
         if result == .unmanaged || result == .ignored {
             // Classified from a placeholder frame (or before appearing
-            // on-screen): retry once settled instead of dropping forever.
+            // on-screen): resolve it on a later session.
             if input.width < 50 || input.height < 50 || !input.isOnScreen {
-                retryCreate(element, attempts: 2, space: targetId)
+                refreshUnresolved = true
             }
             return
         }
@@ -607,7 +671,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // A tiny or not-yet-on-screen frame is not a real float decision.
             // Reclassify once the app has drawn; register as a floater only if
             // it never settles.
-            retryCreate(element, attempts: 2, space: targetId, thenRegisterPlaceholder: true)
+            refreshUnresolved = true
             return
         }
         claimed.insert(id)
@@ -685,40 +749,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         unlandedRetryCounts[id] = nil
     }
 
-    /// Re-adopt a creation that raced the WindowServer (no id yet, or only a
-    /// placeholder frame). Bounded and deduped: each element retries at most
-    /// `attempts` more times, then is dropped — or, when the only thing that
-    /// failed was a placeholder float, registered as a floater.
-    func retryCreate(
-        _ element: AXUIElement,
-        attempts: Int,
-        space: SpaceId? = nil,
-        thenRegisterPlaceholder: Bool = false
-    ) {
-        guard attempts > 0 else {
-            if thenRegisterPlaceholder {
-                onCreate(element, space: space, forceRegisterPlaceholder: true)
-            }
-            return
-        }
-        if pendingRetryElements.contains(where: { CFEqual($0.element, element) }) { return }
-        pendingRetryElements.append((element, thenRegisterPlaceholder, space))
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            guard let self else { return }
-            self.pendingRetryElements.removeAll(where: { CFEqual($0.element, element) })
-            guard self.isCurrent, !self.userPaused, !self.displayGone else { return }
-            if self.trackedId(matching: element).flatMap({ self.windowAnywhere($0) }) != nil { return }
-            if attempts - 1 <= 0, thenRegisterPlaceholder {
-                self.onCreate(element, space: space, forceRegisterPlaceholder: true)
-                return
-            }
-            self.onCreate(element, space: space)
-            if self.trackedId(matching: element).flatMap({ self.windowAnywhere($0) }) == nil {
-                self.retryCreate(element, attempts: attempts - 1, space: space, thenRegisterPlaceholder: thenRegisterPlaceholder)
-            }
-        }
-    }
-
     func staleOwnedWindow(pid: pid_t, liveId: UInt32, element: AXUIElement) -> UInt32? {
         let live = Set(
             (CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
@@ -730,27 +760,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let unmatched = ownedForPid.filter { !live.contains($0.cgWindowId) }
         guard stale.count == 1, unmatched.count == 1, !owned(liveId) else { return nil }
         return stale[0].cgWindowId
-    }
-
-    /// A hidden tab keeps its AX window and CGWindowID, but drops out of the on-screen list.
-    /// When exactly one managed window of this pid left the screen and one new id appeared, keep the leaf.
-    @discardableResult
-    func inheritOffscreenTab(pid: pid_t, candidate: AXUIElement) -> Bool {
-        guard let bound, let newId = adapter.windowId(for: candidate), !ownedAnywhere(newId) else { return false }
-        let rows = onScreenCGWindows(intersecting: bound.axFrame)
-        let onScreen = Set(rows.compactMap { row -> UInt32? in
-            guard cgOwnerPID(row) == pid else { return nil }
-            return cgWindowID(row)
-        })
-        guard onScreen.contains(newId) else { return false }
-        let ownedForPid = session.current.tiledLeaves().compactMap(\.leaf).filter { $0.pid == pid }
-            + session.current.floating.filter { $0.pid == pid }
-        let left = ownedForPid.filter { !onScreen.contains($0.cgWindowId) }
-        let appeared = onScreen.filter { id in !ownedAnywhere(id) }
-        guard left.count == 1, appeared.count == 1, appeared.first == newId else { return false }
-        log.info("rebind hidden tab \(left[0].cgWindowId) -> \(newId)")
-        rebindOwned(from: left[0].cgWindowId, to: newId, element: candidate, pid: pid)
-        return true
     }
 
     func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
@@ -774,45 +783,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func handleDestroy(_ element: AXUIElement) {
-        let cached = adapter.cachedWindowId(for: element)
-        let live = Set(
-            (CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
-                .compactMap(cgWindowID)
-        )
-        let before = session.allWindowIds
-        if let id = cached {
-            if live.contains(id) {
-                // CGWindowList keeps a just-closed window for a moment. Trust
-                // AX instead: re-check shortly and remove it then.
-                log.info("destroy skipped; cg window still live id=\(id)")
-                scheduleDestroyRecheck(id)
-            } else {
-                log.info("destroy remove id=\(id)")
-                removeDestroyedWindow(id)
-            }
-        } else {
-            log.info("destroy without cached id role=\(adapter.role(of: element) ?? "?")")
-            if let pid = adapter.pid(of: element) {
-                for id in Set(modelWindowIds(pid: pid)) {
-                    scheduleDestroyRecheck(id)
-                }
-            }
-        }
-        pruneMissingWindows()
-        if session.allWindowIds != before {
-            recoverManagedWindows()
-        }
-        applyFrames()
-    }
-
-    func modelWindowIds(pid: pid_t) -> [UInt32] {
-        session.spaces.values.flatMap { space in
-            space.tiledLeaves().compactMap { $0.leaf?.pid == pid ? $0.leaf?.cgWindowId : nil }
-                + space.floating.filter { $0.pid == pid }.map(\.cgWindowId)
-        }
-    }
-
     /// Drop a window that is really gone: close it on the focused space, remove
     /// it elsewhere, and forget every per-window map entry.
     func removeDestroyedWindow(_ id: UInt32) {
@@ -832,37 +802,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         forgetLastFocus(id)
         clearUnlandedRetry(id)
         knownOriginals[id] = nil
-        destroyRecheckPending.remove(id)
-    }
-
-    /// A destroy notification cannot always be trusted at delivery time, and a
-    /// dead cached AX element can still answer `GetPid`. Re-check with a fresh
-    /// lookup; if nothing matches, remove it now so the layout reflows without
-    /// waiting for the next focus change.
-    func scheduleDestroyRecheck(_ id: UInt32) {
-        guard !destroyRecheckPending.contains(id) else { return }
-        destroyRecheckPending.insert(id)
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self else { return }
-            self.destroyRecheckPending.remove(id)
-            guard self.isCurrent, !self.userPaused, !self.displayGone else { return }
-            guard let window = self.windowAnywhere(id) else { return }
-            guard self.resolvedElement(for: window) == nil else { return }
-            if self.isYoung(id) {
-                // Chromium/Electron rebuilds its AX tree for a second or two
-                // after launch. A miss now is not proof of death; re-check
-                // after the grace period instead of dropping a live tile.
-                MutationQueue.shared.queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                    self?.scheduleDestroyRecheck(id)
-                }
-                return
-            }
-            self.log.info("destroy recheck removing window=\(id) bundle=\(window.bundleId ?? "?")")
-            self.removeDestroyedWindow(id)
-            // The app may have replaced the window with a new id.
-            self.adoptWindows(pid: window.pid)
-            self.applyFrames()
-        }
     }
 
     func isOffEveryDisplay(_ rect: Rect) -> Bool {
@@ -989,8 +928,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func onTitleChanged(_ element: AXUIElement) {
-        if let pid = adapter.pid(of: element), inheritOffscreenTab(pid: pid, candidate: element) { return }
-        guard let bound, let id = adapter.windowId(for: element) else { return }
+        guard let bound, let id = adapter.windowId(for: element) else {
+            scheduleRefresh(reason: "title")
+            return
+        }
+        guard ownedAnywhere(id) else {
+            scheduleRefresh(reason: "title")
+            return
+        }
         let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         guard let (input, _, _) = classifyInput(from: element, adapter: adapter, bound: bound, onScreenIds: onScreen) else { return }
         let result = classify(input, rules: config.windowRules)
@@ -1183,9 +1128,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     log.info("setFrame rejected err=\(err.rawValue); refetched element window=\(window.cgWindowId)")
                     result = adapter.setFrame(rect, of: fresh, tag: &window)
                 } else {
-                    // No AX element matches this window any more: it is gone
-                    // even if CGWindowList lags. Remove it so the layout reflows.
-                    scheduleDestroyRecheck(window.cgWindowId)
+                    // No AX element matches this window any more. Ask for a
+                    // refresh; the session GCs it if it is really gone.
+                    scheduleRefresh(reason: "deadElement", delay: 0.5)
                 }
             }
             node.leaf = window
@@ -1494,23 +1439,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         rescueOffscreenWindows(restoreOriginals: restoreOriginals)
     }
 
-    func pruneMissingWindows() {
-        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
-            as? [[String: Any]] ?? []
-        let live = Set(info.compactMap(cgWindowID))
-        for spaceId in Array(session.spaces.keys) {
-            for id in session.visibleIds(on: spaceId) where !live.contains(id) && !isYoung(id) {
-                log.info("prune missing window=\(id)")
-                stashKnownOriginal(id)
-                session = session.removeWindow(space: spaceId, cgWindowId: id)
-                elements[id] = nil
-                adapter.forgetWindowId(id)
-                forgetBorn(id)
-                forgetLastFocus(id)
-            }
-        }
-    }
-
     func pruneGhostLeaves(space spaceId: SpaceId) {
         guard let space = session.spaces[spaceId] else { return }
         let windows = space.tiledLeaves().compactMap(\.leaf) + space.floating
@@ -1530,57 +1458,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return true
         }
         return adapter.axWindow(pid: window.pid, cgWindowId: window.cgWindowId) != nil
-    }
-
-    func recoverManagedWindows() {
-        rebindStaleWindowIds()
-        pruneGhostLeaves(space: session.focusedSpace)
-        let started = Date()
-        let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        let ownerPids = Set(info.compactMap(cgOwnerPID))
-        let apps = NSWorkspace.shared.runningApplications
-        var index = 0
-        for app in apps {
-            defer { index += 1 }
-            if MutationQueue.shared.shouldSkip(started: started) {
-                let rest = apps[index...].map(\.processIdentifier)
-                log.info("recoverManagedWindows exceeded 200ms; continuing with \(rest.count) pids")
-                MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                    guard let self, self.isCurrent, !self.userPaused else { return }
-                    for pid in rest where !self.isOurProcess(pid) { self.adoptWindows(pid: pid, apply: false) }
-                    self.applyFrames()
-                }
-                break
-            }
-            let pid = app.processIdentifier
-            if isOurProcess(pid) || !ownerPids.contains(pid) { continue }
-            adoptWindows(pid: pid, apply: false)
-        }
-    }
-
-    func rebindStaleWindowIds() {
-        let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
-            as? [[String: Any]] ?? []
-        let live = Set(info.compactMap(cgWindowID))
-        for spaceId in Array(session.spaces.keys) {
-            guard let space = session.spaces[spaceId] else { continue }
-            let ownedWindows = space.tiledLeaves().compactMap(\.leaf) + space.floating
-            for w in ownedWindows where !live.contains(w.cgWindowId) {
-                let excluding = Set(session.visibleIds(on: spaceId).filter { $0 != w.cgWindowId })
-                guard let el = elements[w.cgWindowId] else { continue }
-                guard let newId = adapter.windowId(for: el, excluding: excluding), newId != w.cgWindowId else { continue }
-                log.info("rebind stale \(w.cgWindowId) -> \(newId) bundle=\(w.bundleId ?? "?")")
-                session = session.rebindWindowId(space: spaceId, from: w.cgWindowId, to: newId)
-                if let original = knownOriginals[w.cgWindowId] {
-                    knownOriginals[newId] = original
-                    knownOriginals[w.cgWindowId] = nil
-                }
-                elements[w.cgWindowId] = nil
-                adapter.forgetWindowId(w.cgWindowId)
-                adapter.rememberWindowId(newId, for: el)
-                elements[newId] = el
-            }
-        }
     }
 
     func restoreWindow(_ window: WindowRef) {
@@ -2155,7 +2032,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         )
         if became && !isCurrent {
             isCurrent = true
-            reconcile()
+            runRefresh(reason: "becameCurrent", space: session.focusedSpace)
             if !userPaused { registerHotkeys() }
         } else if !became && isCurrent {
             isCurrent = false
@@ -2164,7 +2041,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if reason == .start {
             isCurrent = true
             if !userPaused { registerHotkeys() }
-            reconcile()
+            runRefresh(reason: "start", space: session.focusedSpace)
         }
         startOrStopFFM()
     }
@@ -2184,32 +2061,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func ownedPid(_ pid: pid_t?) -> Bool {
         guard let pid else { return false }
         return elements.values.contains { adapter.pid(of: $0) == pid }
-    }
-
-    func reconcile() {
-        let live = collectManagedWindows()
-        let liveIds = Set(live.map(\.cgWindowId))
-        for node in session.current.tiledLeaves() {
-            if let id = node.leaf?.cgWindowId, !liveIds.contains(id), !isYoung(id) {
-                stashKnownOriginal(id)
-                session = session.remove(space: session.focusedSpace, node: node.id)
-                elements[id] = nil
-                adapter.forgetWindowId(id)
-                forgetBorn(id)
-                forgetLastFocus(id)
-            }
-        }
-        for w in live {
-            let known = session.spaces.values.contains { space in
-                space.leaf(containing: w.cgWindowId) != nil || space.floating.contains(where: { $0.cgWindowId == w.cgWindowId })
-            }
-            if !known, classifyWindow(w) == .tiled {
-                let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)
-                session = session.insertSpiral(space: session.focusedSpace, newLeaf: w, usableIsWide: usableIsWide(usable))
-            }
-        }
-        applyFrames()
-        restashOffspace()
     }
 
     func handleDisplayChange() {
