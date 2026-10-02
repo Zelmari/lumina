@@ -1,6 +1,6 @@
 # Agent rules
 
-Follow this file for how you work in this repo. Product behavior lives in `plans/SPEC_LUMINA.md` and `plans/DESIGN_DOC_LUMINA.md`. Implementation order lives in `plans/Breakpoints.md`.
+Follow this file for how you work in this repo.
 
 ## Git and GitHub
 
