@@ -54,10 +54,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     var knownOriginals: [UInt32: Rect] = [:]
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
-    /// Stash parks that did not land, retried a little later before the model
-    /// is allowed to keep claiming they are hidden.
-    var pendingStashRetries: [SpaceId: Set<UInt32>] = [:]
-    var stashRetryWork: DispatchWorkItem?
     /// Cascade offset for quit restore when the saved original is really the
     /// engine's tile. Reset per quit.
     var restoreCascadeIndex = 0
@@ -445,7 +441,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                         }
                         session.spaces[sid] = space
                     }
-                    stashAndRetry(ids: [id], space: sid)
+                    stash(ids: [id], space: sid)
                 }
             } else {
                 // Unknown to the model: the next session adopts it.
@@ -590,7 +586,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             adapter.rememberWindowId(existing, for: element)
             elements[existing] = element
             if let sid = session.spaceContaining(cgWindowId: existing), sid != session.focusedSpace {
-                stashAndRetry(ids: [existing], space: sid)
+                stash(ids: [existing], space: sid)
             }
             return
         }
@@ -687,7 +683,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if target.luminaFullscreen != nil {
             session = session.insertWhileLuminaFS(space: targetId, window: window, result: result, usableIsWide: usableIsWide(usable))
             if result == .tiled {
-                stashAndRetry(ids: [id], space: targetId)
+                stash(ids: [id], space: targetId)
             }
         } else if result == .floating {
             window.role = .floating
@@ -706,7 +702,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if targetId != session.focusedSpace {
             // The user moved on before this window settled. It belongs to the
             // space that was focused when it appeared; park it there now.
-            stashAndRetry(ids: [id], space: targetId)
+            stash(ids: [id], space: targetId)
         }
         if apply { applyFrames() }
     }
@@ -1130,14 +1126,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         lastLuminaSpaceChange = Date()
         let source = session.focusedSpace
         captureFocusForSpaceSwitch()
-        let failed = stashAndRetry(ids: Set(session.visibleIds(on: source)), space: source)
+        // Unhide the destination first, then hide the source: fewer frames
+        // cross on screen at once and there is no hole to see.
         session = session.switchTo(id)
-        if !failed.isEmpty {
-            // The park did not land. Do not claim those windows are hidden.
-            session = session.markVisible(space: source, ids: failed)
-        }
         unstashSpace(id)
         applyFrames()
+        stash(ids: Set(session.visibleIds(on: source)), space: source)
         restashOffspace()
         focusRestoredWindow(on: id)
         writeSession()
@@ -1147,13 +1141,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         lastLuminaSpaceChange = Date()
         let source = session.focusedSpace
         captureFocusForSpaceSwitch()
-        let failed = stashAndRetry(ids: Set(session.visibleIds(on: source)), space: source)
         session = transform(session)
-        if !failed.isEmpty, source != session.focusedSpace {
-            session = session.markVisible(space: source, ids: failed)
-        }
         unstashSpace(session.focusedSpace)
         applyFrames()
+        if session.focusedSpace != source {
+            stash(ids: Set(session.visibleIds(on: source)), space: source)
+        }
         restashOffspace()
         focusRestoredWindow(on: session.focusedSpace)
         writeSession()
@@ -1193,13 +1186,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         log.info("focus window=\(id) space=\(session.focusedSpace.raw) bundle=\(window.bundleId ?? "?")")
     }
 
-    @discardableResult
-    func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) -> Set<UInt32> {
-        guard isCurrent, let bound else { return ids }
+    /// Hide the windows of an inactive space: move them to the corner only.
+    /// No verification and no retry; the next refresh/layout pass re-parks any
+    /// window that did not land.
+    func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) {
+        guard isCurrent, let bound else { return }
         let spaceId = spaceId ?? session.focusedSpace
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
-        var failed: Set<UInt32> = []
         for id in ids {
             guard var window = session.spaces[spaceId]?.leaf(containing: id)?.leaf
                     ?? session.spaces[spaceId]?.floating.first(where: { $0.cgWindowId == id })
@@ -1207,7 +1201,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                   let el = resolvedElement(for: window)
             else {
                 log.info("stash skip missing AX window=\(id)")
-                failed.insert(id)
                 continue
             }
             let current = adapter.frame(of: el) ?? cgWindowRect(id: id)
@@ -1227,23 +1220,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let width = current?.w ?? window.lastOnscreenFrame.w
             let inset: Double = window.bundleId == "us.zoom.xos" ? 0 : 1
             let parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width, inset: inset)
-            _ = adapter.setStashFrame(parked, of: el, tag: &window)
-            if !stashLanded(id: id, of: el, display: display) {
-                // Corner park was clamped back on screen. Hang all but `inset` points above the menu bar.
-                let after = adapter.frame(of: el) ?? cgWindowRect(id: id) ?? parked
-                let hang = menuBarHangFrame(after: after, display: display, x: parked.x, inset: inset)
-                _ = adapter.setStashFrame(hang, of: el, tag: &window)
-                if !stashLanded(id: id, of: el, display: display) {
-                    if let still = adapter.frame(of: el) ?? cgWindowRect(id: id) {
-                        log.info(
-                            "stash still on desktop window=\(id) bundle=\(window.bundleId ?? "?") \(Int(still.w))x\(Int(still.h)) @\(Int(still.x)),\(Int(still.y))"
-                        )
-                    } else {
-                        log.info("stash unverified window=\(id) bundle=\(window.bundleId ?? "?")")
-                    }
-                    failed.insert(id)
-                }
-            }
+            _ = adapter.setStashPosition(Point(x: parked.x, y: parked.y), of: el, tag: &window)
             if var space = session.spaces[spaceId] {
                 if var node = space.leaf(containing: id), let saved = node.leaf {
                     window.lastOnscreenFrame = saved.lastOnscreenFrame
@@ -1257,60 +1234,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 session.spaces[spaceId] = space
             }
         }
-        return failed
-    }
-
-    /// A park that did not land must not leave the model claiming the window
-    /// is hidden: the window is visible, and later focus/raise paths would
-    /// fight over it.
-    private func stashLanded(id: UInt32, of el: AXUIElement, display: DisplayFrame) -> Bool {
-        guard let after = adapter.frame(of: el) ?? cgWindowRect(id: id) else { return false }
-        return isFrameStashedAway(after, display: display)
-    }
-
-    @discardableResult
-    func stashAndRetry(ids: Set<UInt32>, space spaceId: SpaceId? = nil) -> Set<UInt32> {
-        let sid = spaceId ?? session.focusedSpace
-        let failed = stash(ids: ids, space: sid)
-        if !failed.isEmpty { scheduleStashRetry(ids: failed, space: sid) }
-        return failed
-    }
-
-    /// A park can fail while an app is mid-launch. Retry once shortly after,
-    /// and promote the model to stashed only when the park actually landed.
-    func scheduleStashRetry(ids: Set<UInt32>, space: SpaceId) {
-        guard !ids.isEmpty else { return }
-        pendingStashRetries[space, default: []].formUnion(ids)
-        stashRetryWork?.cancel()
-        let item = DispatchWorkItem { [weak self] in self?.runStashRetries() }
-        stashRetryWork = item
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.35, execute: item)
-    }
-
-    func runStashRetries() {
-        guard isCurrent, !userPaused, !displayGone else {
-            pendingStashRetries.removeAll()
-            return
-        }
-        let work = pendingStashRetries
-        pendingStashRetries.removeAll()
-        for (space, ids) in work {
-            // The focused space's windows are meant to be visible, unless
-            // luminaFS is covering them.
-            guard space != session.focusedSpace || session.current.luminaFullscreen != nil else { continue }
-            let failed = stash(ids: ids, space: space)
-            if failed.isEmpty {
-                session = session.markStashed(space: space, ids: ids)
-            } else {
-                log.info("stash retry failed space=\(space) ids=\(failed)")
-            }
-        }
     }
 
     func stashSiblings() {
         let fs = session.current.nodes[session.current.luminaFullscreen ?? NodeId(raw: 0)]?.leaf?.cgWindowId
         let ids = Set(session.visibleIds(on: session.focusedSpace).filter { $0 != fs })
-        stashAndRetry(ids: ids)
+        stash(ids: ids)
     }
 
     func unstashSpace(_ id: SpaceId, restoreOriginals: Bool = false) {
@@ -1598,7 +1527,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let ids = Set(ownedWindows(pid: pid).filter { $0.0 == spaceId }.map(\.1.cgWindowId))
         guard !ids.isEmpty else { return }
         log.info("restash pid=\(pid) space=\(spaceId) ids=\(ids)")
-        stashAndRetry(ids: ids, space: spaceId)
+        stash(ids: ids, space: spaceId)
     }
 
     func unstashOrphanSlivers(restoreOriginals: Bool = false) {
@@ -1666,7 +1595,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func restashOffspace() {
         for (id, _) in session.spaces where id != session.focusedSpace {
-            stashAndRetry(ids: Set(session.visibleIds(on: id)), space: id)
+            stash(ids: Set(session.visibleIds(on: id)), space: id)
         }
         if session.current.luminaFullscreen != nil { stashSiblings() }
     }

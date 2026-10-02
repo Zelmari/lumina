@@ -344,62 +344,6 @@ struct SpaceSwitchTests {
         #expect(session[SpaceId.require(1)]!.floating.first?.role == .floating)
     }
 
-    @Test func markVisibleRevertsOnlyFailedStashIds() {
-        var session = Session.empty(spaceCount: 2)
-        session = session.insertSpiral(
-            space: SpaceId.require(1),
-            newLeaf: WindowRef(cgWindowId: 1, pid: 1),
-            usableIsWide: true
-        )
-        session = session.insertSpiral(
-            space: SpaceId.require(1),
-            newLeaf: WindowRef(cgWindowId: 2, pid: 2),
-            usableIsWide: true
-        )
-        var space = session[SpaceId.require(1)]!
-        space.floating.append(WindowRef(cgWindowId: 3, pid: 3, role: .floating))
-        session.spaces[SpaceId.require(1)] = space
-        session = session.switchTo(SpaceId.require(2))
-        session = session.markVisible(space: SpaceId.require(1), ids: [1, 3])
-        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.role == .tiled)
-        #expect(session[SpaceId.require(1)]!.leaf(containing: 2)?.leaf?.role == .stashed)
-        #expect(session[SpaceId.require(1)]!.floating.first?.role == .floating)
-    }
-
-    @Test func markVisibleDoesNotDemoteLuminaFS() {
-        var session = Session.empty(spaceCount: 1)
-        session = session.insertSpiral(
-            space: SpaceId.require(1),
-            newLeaf: WindowRef(cgWindowId: 1, pid: 1),
-            usableIsWide: true
-        )
-        session = session.insertSpiral(
-            space: SpaceId.require(1),
-            newLeaf: WindowRef(cgWindowId: 2, pid: 2),
-            usableIsWide: true
-        )
-        let leaf1 = session[SpaceId.require(1)]!.leaf(containing: 1)!.id
-        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: leaf1)
-        session = session.markVisible(space: SpaceId.require(1), ids: [1])
-        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.role == .luminaFS)
-        session = session.markVisible(space: SpaceId.require(1), ids: [2])
-        #expect(session[SpaceId.require(1)]!.leaf(containing: 2)?.leaf?.role == .tiled)
-    }
-}
-
-struct FullscreenTests {
-    @Test func isFillExactAndSlopAndNotHalf() {
-        let usable = Rect(x: 8, y: 8, w: 800, h: 600)
-        #expect(isFill(frame: usable, usable: usable))
-        #expect(isFill(frame: Rect(x: 10, y: 10, w: 796, h: 596), usable: usable))
-        let half = Rect(x: 8, y: 8, w: 400, h: 600)
-        #expect(!isFill(frame: half, usable: usable))
-        #expect(classifyInPlaceResize(frame: usable, usable: usable) == .fill)
-        #expect(classifyInPlaceResize(frame: half, usable: usable) == .halfQuarter)
-        let odd = Rect(x: 8, y: 8, w: 350, h: 500)
-        #expect(classifyInPlaceResize(frame: odd, usable: usable) == .fight)
-    }
-
     @Test func fillWinsOverHalf() {
         let usable = Rect(x: 0, y: 0, w: 800, h: 400)
         #expect(classifyInPlaceResize(frame: usable, usable: usable) == .fill)

@@ -229,25 +229,6 @@ extension Session {
         return session
     }
 
-    /// Flip `.stashed` back to visible for exactly `ids`. A park that did not
-    /// land must not leave the model claiming a still-visible window is hidden.
-    public func markVisible(space spaceId: SpaceId, ids: Set<UInt32>) -> Session {
-        var session = self
-        guard var space = session.spaces[spaceId] else { return session }
-        for (id, var node) in space.nodes {
-            if var leaf = node.leaf, ids.contains(leaf.cgWindowId), leaf.role == .stashed {
-                leaf.role = space.luminaFullscreen == id ? .luminaFS : .tiled
-                node.leaf = leaf
-                space.nodes[id] = node
-            }
-        }
-        for i in space.floating.indices
-        where ids.contains(space.floating[i].cgWindowId) && space.floating[i].role == .stashed {
-            space.floating[i].role = .floating
-        }
-        session.spaces[spaceId] = space
-        return session
-    }
 
     public func collectOriginals() -> [UInt32: Rect] {
         var out: [UInt32: Rect] = [:]

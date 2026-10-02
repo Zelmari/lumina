@@ -204,39 +204,35 @@ public final class AXAdapter {
         inFlight[id] != nil
     }
 
-    public func setStashFrame(_ rect: Rect, of element: AXUIElement, tag window: inout LuminaLayout.Window) -> SetFrameResult {
+    /// Hide a window on an inactive space: move it only. Size is left alone so
+    /// the app keeps its state and WindowServer is less likely to clamp the
+    /// move. The next layout pass re-parks it if this did not land.
+    public func setStashPosition(_ origin: Point, of element: AXUIElement, tag window: inout LuminaLayout.Window) -> SetFrameResult {
         window.generation += 1
         let id = window.cgWindowId
         let gen = window.generation
         inFlight[id] = gen
-        let result = applyStashFrame(rect, of: element)
+        let result = applyStashPosition(origin, of: element)
         scheduleInFlightClear(id: id, gen: gen)
         return result
     }
 
-    /// Position first, then shrink. Size-first would collapse the tile in-place;
-    /// origin-past-the-display is clamped back onto the desktop.
-    private func applyStashFrame(_ rect: Rect, of element: AXUIElement) -> SetFrameResult {
+    private func applyStashPosition(_ origin: Point, of element: AXUIElement) -> SetFrameResult {
         AXUIElementSetMessagingTimeout(element, axWriteTimeout)
-        var size = CGSize(width: rect.w, height: rect.h)
-        var point = CGPoint(x: rect.x, y: rect.y)
-        guard let sizeVal = AXValueCreate(.cgSize, &size),
-              let posVal = AXValueCreate(.cgPoint, &point)
-        else { return .rejected(.illegalArgument) }
-        let pos1 = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
-        let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        let pos2 = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
-        let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        let errors = [pos1, s1, pos2, s2]
+        var point = CGPoint(x: origin.x, y: origin.y)
+        guard let posVal = AXValueCreate(.cgPoint, &point) else { return .rejected(.illegalArgument) }
+        let restore = disableAnimations(element)
+        defer { restore() }
+        let err = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
+        let errors = [err]
         switch classifyWrite(errors) {
-        case .rejected(let err):
-            logWriteFailure("stash", err: err, errors: errors)
-            return .rejected(err)
+        case .rejected(let e):
+            logWriteFailure("stash", err: e, errors: errors)
+            return .rejected(e)
         case .timedOut:
             return .unknown
         case .accepted:
-            guard let got = frame(of: element) else { return .unknown }
-            return framesClose(got, rect) ? .ok : .unknown
+            return .ok
         }
     }
 
