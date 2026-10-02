@@ -83,6 +83,7 @@ public enum AgentCmd: Equatable, Sendable {
     case markCurrent
     /// This agent is no longer the current Space. Drop hotkeys and stop mutating.
     case yield
+    case debugWindows
 }
 
 /// Option-0 and `lumina workspace 0` mean space 10. `SpaceId` itself stays 1...10.

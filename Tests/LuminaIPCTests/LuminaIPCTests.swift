@@ -75,6 +75,16 @@ struct CodecTests {
         }
         #expect(id == "z")
     }
+
+    @Test func debugWindowsParses() {
+        let line = #"{"v":1,"id":"d","cmd":"debug-windows","args":{}}"#
+        let parsed = parseLine(line)
+        guard case .request(.debugWindows, let id) = parsed else {
+            Issue.record("expected debug-windows, got \(parsed)")
+            return
+        }
+        #expect(id == "d")
+    }
 }
 
 struct PathTests {
@@ -172,6 +182,8 @@ struct ArgvTests {
         #expect(CLIArgs.earlyExit(["lumina", "debug"]) == .debug)
         #expect(CLIArgs.earlyExit(["lumina", "focus", "version"]) == nil)
         #expect(CLIArgs.parse(["lumina", "debug"]) == nil)
+        #expect(CLIArgs.earlyExit(["lumina", "debug-windows"]) == nil)
+        #expect(CLIArgs.parse(["lumina", "debug-windows"])?.cmd == "debug-windows")
         let zero = #"{"v":1,"id":"z","cmd":"workspace","args":{"id":0}}"#
         guard case .request(.workspace(let zeroId), _) = parseLine(zero) else {
             Issue.record("expected workspace 0, got \(parseLine(zero))")

@@ -464,6 +464,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .status: return "status"
     case .markCurrent: return "mark-current"
     case .yield: return "yield"
+    case .debugWindows: return "debug-windows"
     }
 }
 

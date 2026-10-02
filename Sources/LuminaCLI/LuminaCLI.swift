@@ -64,8 +64,46 @@ enum LuminaCLI {
             log.error("agent not running on this Space")
             exit(2)
         }
+        if request.cmd == "debug-windows" {
+            exit(writeDebugDump(resp, log: log))
+        }
         printResponse(resp, log: log)
         exit(resp.ok ? 0 : 1)
+    }
+
+    static func writeDebugDump(_ resp: IPCResponse, log: LuminaLog) -> Int32 {
+        guard resp.ok else {
+            log.error("debug-windows failed: \(resp.error ?? "unknown error")")
+            return 1
+        }
+        guard let data = resp.data else {
+            log.error("debug-windows failed: agent returned no data")
+            return 1
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let encoded = try? encoder.encode(data) else {
+            log.error("debug-windows failed: response is not encodable")
+            return 1
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let dir = home + "/Library/Application Support/Lumina/debug"
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let path = dir + "/windows-\(timestamp).json"
+        do {
+            try FileManager.default.createDirectory(
+                atPath: dir,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+            try encoded.write(to: URL(fileURLWithPath: path), options: .atomic)
+        } catch {
+            log.error("debug-windows failed: cannot write \(path): \(error.localizedDescription)")
+            return 1
+        }
+        writeOut(path)
+        return 0
     }
 
     static func preferredSocket() -> String? {

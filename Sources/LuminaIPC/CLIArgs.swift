@@ -52,7 +52,7 @@ public enum CLIArgs {
             }
             return IPCRequest(id: id, cmd: "fullscreen")
         case "float-toggle", "balance", "close", "pause", "resume", "reload", "quit",
-             "list-windows", "list-workspaces", "status",
+             "list-windows", "list-workspaces", "status", "debug-windows",
              "start", "quit-all", "open-config", "current-token":
             return IPCRequest(id: id, cmd: head)
         default:

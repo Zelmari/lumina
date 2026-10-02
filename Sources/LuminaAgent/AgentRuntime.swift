@@ -7,6 +7,7 @@ import Darwin
 import Foundation
 import LuminaLayout
 import LuminaIPC
+import os
 
 typealias WindowRef = LuminaLayout.Window
 
@@ -476,6 +477,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// out. Convergence by repetition; no per-event repair.
     func runRefresh(reason: String, space: SpaceId) {
         guard didBootLayout, isCurrent, !userPaused, !displayGone, let bound else { return }
+        let refreshInterval = LuminaSignposts.pointsOfInterest.beginInterval("refresh-session")
+        defer { LuminaSignposts.pointsOfInterest.endInterval("refresh-session", refreshInterval) }
         let started = Date()
         refreshUnresolved = false
         let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
@@ -501,6 +504,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             for w in space.floating { modelPids[w.cgWindowId] = w.pid }
         }
         let delta = reconcile(model: session.allWindowIds, modelPids: modelPids, live: live)
+        defer {
+            recordRefreshSummary(
+                reason: reason,
+                added: delta.added.count,
+                removed: delta.removed.count,
+                rebinds: delta.rebinds.count,
+                unresolved: refreshUnresolved,
+                started: started
+            )
+        }
         if shouldSuspendMassRemoval(
             modelCount: session.allWindowIds.count,
             removedCount: delta.removed.count,
@@ -985,6 +998,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func handleAgent(_ cmd: AgentCmd, id: String) -> IPCResponse {
+        if case .debugWindows = cmd { return .success(id: id, data: debugWindowsJSON()) }
         switch cmd {
         case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces:
             break
@@ -1048,6 +1062,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             unregisterHotkeys()
             startOrStopFFM()
             return .success(id: id)
+        case .debugWindows:
+            return .success(id: id, data: debugWindowsJSON())
         }
     }
 
@@ -1055,6 +1071,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if userPaused || displayGone || !isCurrent { return }
         refreshBound()
         guard let bound else { return }
+        let applyInterval = LuminaSignposts.pointsOfInterest.beginInterval("apply-frames")
+        defer { LuminaSignposts.pointsOfInterest.endInterval("apply-frames", applyInterval) }
         let started = Date()
         let usable = bound.usableRect(gaps: config.gaps)
         let space = session.current
@@ -1985,6 +2003,103 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "skylightSpaceId": boundSkyLightId.map { .int(Int($0)) } ?? .null,
         ])
     }
+
+    struct RefreshSummary: Equatable, Sendable {
+        var reason: String
+        var added: Int
+        var removed: Int
+        var rebinds: Int
+        var unresolved: Bool
+        var durationMs: Int
+    }
+
+    var lastRefreshSummary: RefreshSummary?
+
+    func recordRefreshSummary(
+        reason: String,
+        added: Int,
+        removed: Int,
+        rebinds: Int,
+        unresolved: Bool,
+        started: Date
+    ) {
+        lastRefreshSummary = RefreshSummary(
+            reason: reason,
+            added: added,
+            removed: removed,
+            rebinds: rebinds,
+            unresolved: unresolved,
+            durationMs: Int(Date().timeIntervalSince(started) * 1000)
+        )
+    }
+
+    func debugWindowsJSON() -> JSONValue {
+        var windows: [JSONValue] = []
+        for (spaceId, space) in session.spaces {
+            for node in space.tiledLeaves() {
+                if let w = node.leaf { windows.append(debugWindowJSON(w, space: spaceId)) }
+            }
+            for w in space.floating { windows.append(debugWindowJSON(w, space: spaceId)) }
+        }
+        for w in session.nativeFSWindows { windows.append(debugWindowJSON(w, space: nil)) }
+        let lastRefresh: JSONValue = lastRefreshSummary.map { summary in
+            .object([
+                "reason": .string(summary.reason),
+                "added": .int(summary.added),
+                "removed": .int(summary.removed),
+                "rebinds": .int(summary.rebinds),
+                "unresolved": .bool(summary.unresolved),
+                "durationMs": .int(summary.durationMs),
+            ])
+        } ?? .null
+        return .object([
+            "instanceId": .string(instanceId.uuidString),
+            "focusedSpace": .int(session.focusedSpace.raw),
+            "isCurrent": .bool(isCurrent),
+            "userPaused": .bool(userPaused),
+            "displayGone": .bool(displayGone),
+            "boundDisplayUUID": bound.map { .string($0.uuid) } ?? .null,
+            "spaceCount": .int(session.spaceCount),
+            "windowCount": .int(windows.count),
+            "lastRefresh": lastRefresh,
+            "windows": .array(windows),
+        ])
+    }
+
+    func debugWindowJSON(_ window: WindowRef, space: SpaceId?) -> JSONValue {
+        let element = debugAXElement(for: window)
+        let liveFrame = element.flatMap { adapter.frame(of: $0) }
+        return .object([
+            "cgWindowId": .int(Int(window.cgWindowId)),
+            "pid": .int(Int(window.pid)),
+            "bundleId": .string(window.bundleId ?? ""),
+            "role": .string(window.role.rawValue),
+            "space": space.map { .int($0.raw) } ?? .null,
+            "lastOnscreenFrame": debugRectJSON(window.lastOnscreenFrame),
+            "axElementResolves": .bool(element != nil),
+            "liveAXFrame": liveFrame.map { debugRectJSON($0) } ?? .null,
+        ])
+    }
+
+    func debugAXElement(for window: WindowRef) -> AXUIElement? {
+        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid, adapter.isLiveElement(el) {
+            return el
+        }
+        return adapter.axWindow(pid: window.pid, cgWindowId: window.cgWindowId)
+    }
+
+    func debugRectJSON(_ rect: Rect) -> JSONValue {
+        .object([
+            "x": .double(rect.x),
+            "y": .double(rect.y),
+            "w": .double(rect.w),
+            "h": .double(rect.h),
+        ])
+    }
+}
+
+enum LuminaSignposts {
+    static let pointsOfInterest = OSSignposter(subsystem: "com.zelmari.lumina", category: .pointsOfInterest)
 }
 
 #endif
