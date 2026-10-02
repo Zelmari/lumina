@@ -58,6 +58,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// is allowed to keep claiming they are hidden.
     var pendingStashRetries: [SpaceId: Set<UInt32>] = [:]
     var stashRetryWork: DispatchWorkItem?
+    /// Windows whose destroy notification could not be trusted yet (CG list
+    /// lags). Checked once shortly after; deduped per window.
+    var destroyRecheckPending: Set<UInt32> = []
     let preferredDisplayUUID: String?
 
     let log: LuminaLog
@@ -767,33 +770,75 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let before = session.allWindowIds
         if let id = cached {
             if live.contains(id) {
+                // CGWindowList keeps a just-closed window for a moment. Trust
+                // AX instead: re-check shortly and remove it then.
                 log.info("destroy skipped; cg window still live id=\(id)")
+                scheduleDestroyRecheck(id)
             } else {
                 log.info("destroy remove id=\(id)")
-                let wasFS = session.current.luminaFullscreen != nil
-                    && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
-                for spaceId in Array(session.spaces.keys) {
-                    if spaceId == session.focusedSpace {
-                        session = session.closeWindow(space: spaceId, cgWindowId: id)
-                    } else {
-                        session = session.removeWindow(space: spaceId, cgWindowId: id)
-                    }
-                }
-                if wasFS { unstashSpace(session.focusedSpace) }
-                elements[id] = nil
-                adapter.forgetWindowId(id)
-                forgetBorn(id)
-                forgetLastFocus(id)
-                knownOriginals[id] = nil
+                removeDestroyedWindow(id)
             }
         } else {
             log.info("destroy without cached id role=\(adapter.role(of: element) ?? "?")")
+            if let pid = adapter.pid(of: element) {
+                for id in Set(modelWindowIds(pid: pid)) {
+                    scheduleDestroyRecheck(id)
+                }
+            }
         }
         pruneMissingWindows()
         if session.allWindowIds != before {
             recoverManagedWindows()
         }
         applyFrames()
+    }
+
+    func modelWindowIds(pid: pid_t) -> [UInt32] {
+        session.spaces.values.flatMap { space in
+            space.tiledLeaves().compactMap { $0.leaf?.pid == pid ? $0.leaf?.cgWindowId : nil }
+                + space.floating.filter { $0.pid == pid }.map(\.cgWindowId)
+        }
+    }
+
+    /// Drop a window that is really gone: close it on the focused space, remove
+    /// it elsewhere, and forget every per-window map entry.
+    func removeDestroyedWindow(_ id: UInt32) {
+        let wasFS = session.current.luminaFullscreen != nil
+            && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
+        for spaceId in Array(session.spaces.keys) {
+            if spaceId == session.focusedSpace {
+                session = session.closeWindow(space: spaceId, cgWindowId: id)
+            } else {
+                session = session.removeWindow(space: spaceId, cgWindowId: id)
+            }
+        }
+        if wasFS { unstashSpace(session.focusedSpace) }
+        elements[id] = nil
+        adapter.forgetWindowId(id)
+        forgetBorn(id)
+        forgetLastFocus(id)
+        clearUnlandedRetry(id)
+        knownOriginals[id] = nil
+        destroyRecheckPending.remove(id)
+    }
+
+    /// A destroy notification cannot always be trusted at delivery time, and a
+    /// dead cached AX element can still answer `GetPid`. Re-check with a fresh
+    /// lookup; if nothing matches, remove it now so the layout reflows without
+    /// waiting for the next focus change.
+    func scheduleDestroyRecheck(_ id: UInt32) {
+        guard !destroyRecheckPending.contains(id) else { return }
+        destroyRecheckPending.insert(id)
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self else { return }
+            self.destroyRecheckPending.remove(id)
+            guard self.isCurrent, !self.userPaused, !self.displayGone else { return }
+            guard let window = self.windowAnywhere(id) else { return }
+            guard self.resolvedElement(for: window) == nil else { return }
+            self.log.info("destroy recheck removing window=\(id) bundle=\(window.bundleId ?? "?")")
+            self.removeDestroyedWindow(id)
+            self.applyFrames()
+        }
     }
 
     func isOffEveryDisplay(_ rect: Rect) -> Bool {
@@ -1113,6 +1158,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 if let fresh = resolvedElement(for: window), !CFEqual(fresh, el) {
                     log.info("setFrame rejected err=\(err.rawValue); refetched element window=\(window.cgWindowId)")
                     result = adapter.setFrame(rect, of: fresh, tag: &window)
+                } else {
+                    // No AX element matches this window any more: it is gone
+                    // even if CGWindowList lags. Remove it so the layout reflows.
+                    scheduleDestroyRecheck(window.cgWindowId)
                 }
             }
             node.leaf = window
@@ -1453,7 +1502,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func hasAXElement(_ window: WindowRef) -> Bool {
-        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid {
+        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid, adapter.isLiveElement(el) {
             return true
         }
         return adapter.axWindow(pid: window.pid, cgWindowId: window.cgWindowId) != nil
@@ -1659,10 +1708,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func resolvedElement(for window: WindowRef) -> AXUIElement? {
-        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid {
+        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid, adapter.isLiveElement(el) {
             return el
         }
         adapter.forgetWindowId(window.cgWindowId)
+        elements[window.cgWindowId] = nil
         if let el = adapter.axWindow(pid: window.pid, cgWindowId: window.cgWindowId) {
             elements[window.cgWindowId] = el
             return el

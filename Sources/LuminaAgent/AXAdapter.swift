@@ -125,6 +125,16 @@ public final class AXAdapter {
         tracked[id] = element
     }
 
+    /// A destroyed window element can still answer `AXUIElementGetPid` while
+    /// every attribute read/write fails with `.invalidUIElement`. Only an
+    /// attribute read proves it is alive; other errors (timeouts, API
+    /// disabled) are not proof of death.
+    public func isLiveElement(_ element: AXUIElement) -> Bool {
+        var ref: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &ref)
+        return err != .invalidUIElement
+    }
+
     public func forgetWindowId(_ id: UInt32) {
         if let el = tracked[id] {
             minSizeCache[elementKey(el)] = nil
