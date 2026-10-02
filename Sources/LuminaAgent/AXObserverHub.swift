@@ -5,7 +5,7 @@ import Foundation
 import LuminaLayout
 import LuminaIPC
 
-public final class AXObserverHub {
+public final class AXObserverHub: @unchecked Sendable {
     private var observers: [pid_t: AXObserver] = [:]
     public var onNotification: ((pid_t, String, AXUIElement) -> Void)?
 
@@ -41,7 +41,12 @@ public final class AXObserverHub {
 
     public func watchWindow(_ element: AXUIElement, pid: pid_t) {
         if !Thread.isMainThread {
-            DispatchQueue.main.async { [weak self] in self?.watchWindow(element, pid: pid) }
+            // AXUIElement is not Sendable; hand the main queue a retained pointer.
+            nonisolated(unsafe) let token = Unmanaged.passRetained(element).toOpaque()
+            DispatchQueue.main.async { [weak self] in
+                let element = Unmanaged<AXUIElement>.fromOpaque(token).takeRetainedValue()
+                self?.watchWindow(element, pid: pid)
+            }
             return
         }
         watch(pid: pid)

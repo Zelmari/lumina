@@ -55,6 +55,6 @@ struct AgentApp {
         runtime.stop()
     }
 
-    private static var termSource: DispatchSourceSignal?
+    nonisolated(unsafe) private static var termSource: DispatchSourceSignal?
 }
 #endif

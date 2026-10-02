@@ -144,7 +144,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func unregisterHotkeys() {
-        let work = { [weak self] in self?.hotkeys.unregister() }
+        let work: () -> Void = { [weak self] in self?.hotkeys.unregister() }
         if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 

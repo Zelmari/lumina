@@ -5,12 +5,15 @@ import LuminaIPC
 
 private typealias DisclaimResponsibility = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
 
+/// `RTLD_DEFAULT` is `((void *)-2)`, which Swift cannot import.
+nonisolated(unsafe) private let dlDefault = UnsafeMutableRawPointer(bitPattern: -2)
+
 final class AgentSpawner: @unchecked Sendable {
     var quitPids: Set<pid_t> = []
     private let log = LuminaLog(category: .extra, fileURL: LuminaLog.defaultFileURL())
     private var loggedMissingDisclaim = false
     private lazy var disclaim: DisclaimResponsibility? = {
-        guard let sym = dlsym(RTLD_DEFAULT, "responsibility_spawnattrs_setdisclaim") else { return nil }
+        guard let dlDefault, let sym = dlsym(dlDefault, "responsibility_spawnattrs_setdisclaim") else { return nil }
         return unsafeBitCast(sym, to: DisclaimResponsibility.self)
     }()
 

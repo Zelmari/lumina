@@ -14,8 +14,16 @@ public enum SetFrameResult: Equatable, Sendable {
 
 private typealias AXGetWindow = @convention(c) (CFTypeRef, UnsafeMutablePointer<UInt32>) -> Int32
 
+/// `RTLD_DEFAULT` is `((void *)-2)`, which Swift cannot import.
+nonisolated(unsafe) private let dlDefault = UnsafeMutableRawPointer(bitPattern: -2)
+
+/// The `LuminaLayout` enum shadows the module, so the free function cannot be named here.
+private func ignoreAXGeometry(windowGeneration: UInt64, inFlight: UInt64?) -> Bool {
+    shouldIgnoreAXGeometry(windowGeneration: windowGeneration, inFlight: inFlight)
+}
+
 private let axGetWindow: AXGetWindow? = {
-    guard let sym = dlsym(RTLD_DEFAULT, "_AXUIElementGetWindow") else { return nil }
+    guard let dlDefault, let sym = dlsym(dlDefault, "_AXUIElementGetWindow") else { return nil }
     return unsafeBitCast(sym, to: AXGetWindow.self)
 }()
 
@@ -155,7 +163,7 @@ public final class AXAdapter {
     }
 
     public func shouldIgnoreAXGeometry(window: LuminaLayout.Window) -> Bool {
-        LuminaLayout.shouldIgnoreAXGeometry(windowGeneration: window.generation, inFlight: inFlight[window.cgWindowId])
+        ignoreAXGeometry(windowGeneration: window.generation, inFlight: inFlight[window.cgWindowId])
     }
 
     public func clearInFlight(id: UInt32, generation: UInt64) {
