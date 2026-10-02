@@ -89,4 +89,12 @@ struct ReconcileTests {
         #expect(delta.removed == [3, 5, 9])
         #expect(delta.added == [1, 2])
     }
+
+    @Test func massRemovalIsOnlySuspendedWhenLocked() {
+        #expect(shouldSuspendMassRemoval(modelCount: 6, removedCount: 4, screenLocked: true))
+        #expect(!shouldSuspendMassRemoval(modelCount: 6, removedCount: 2, screenLocked: true))
+        #expect(!shouldSuspendMassRemoval(modelCount: 6, removedCount: 4, screenLocked: false))
+        #expect(!shouldSuspendMassRemoval(modelCount: 2, removedCount: 2, screenLocked: true))
+        #expect(!shouldSuspendMassRemoval(modelCount: 6, removedCount: 0, screenLocked: true))
+    }
 }

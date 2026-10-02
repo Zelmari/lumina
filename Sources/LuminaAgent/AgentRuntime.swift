@@ -501,6 +501,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             for w in space.floating { modelPids[w.cgWindowId] = w.pid }
         }
         let delta = reconcile(model: session.allWindowIds, modelPids: modelPids, live: live)
+        if shouldSuspendMassRemoval(
+            modelCount: session.allWindowIds.count,
+            removedCount: delta.removed.count,
+            screenLocked: screenLockedOrAsleep()
+        ) {
+            log.info("refresh suspended mass removal removed=\(delta.removed.count) of \(session.allWindowIds.count); screen locked/asleep")
+            scheduleRefresh(reason: "massLossSuspended", delay: 2.0)
+            return
+        }
         let focusedBefore = session.current.focusedWindow
         for id in delta.removed { removeDestroyedWindow(id) }
         if !delta.removed.isEmpty, session.current.focusedWindow != focusedBefore,
@@ -532,6 +541,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         } else if !refreshUnresolved {
             unresolvedRefreshPasses = 0
         }
+    }
+
+    /// The lock screen and display sleep make every AX window disappear. A
+    /// refresh that sees most of the world gone must not delete the model.
+    func screenLockedOrAsleep() -> Bool {
+        if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.loginwindow" { return true }
+        return CGDisplayIsAsleep(CGMainDisplayID()) != 0
     }
 
     /// Pids worth enumerating this pass: everything we manage, everything with

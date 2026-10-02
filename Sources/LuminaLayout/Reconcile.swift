@@ -90,3 +90,12 @@ public func reconcile(
         rebinds: rebinds.sorted()
     )
 }
+
+/// A refresh that would drop most of the model is suspicious while the screen
+/// is locked or asleep: AX goes dark and every window looks closed. Keep the
+/// model for this pass; the next session after unlock retries. When the screen
+/// is not locked, trust the diff even if it is large (a real mass close).
+public func shouldSuspendMassRemoval(modelCount: Int, removedCount: Int, screenLocked: Bool) -> Bool {
+    guard screenLocked, modelCount >= 3, removedCount > 0 else { return false }
+    return removedCount * 2 > modelCount
+}
