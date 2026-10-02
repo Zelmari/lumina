@@ -61,6 +61,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Windows whose destroy notification could not be trusted yet (CG list
     /// lags). Checked once shortly after; deduped per window.
     var destroyRecheckPending: Set<UInt32> = []
+    /// Cascade offset for quit restore when the saved original is really the
+    /// engine's tile. Reset per quit.
+    var restoreCascadeIndex = 0
     let preferredDisplayUUID: String?
 
     let log: LuminaLog
@@ -143,6 +146,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     public func stop() {
+        restoreCascadeIndex = 0
         unstashAll(restoreOriginals: true)
         rescueOffscreenWindows(restoreOriginals: true)
         writeSession(stash: [])
@@ -354,13 +358,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let pid = app.processIdentifier
             let space = session.focusedSpace
             DispatchQueue.main.async { self.observers.watch(pid: pid) }
-            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                guard let self, self.isCurrent else { return }
-                self.adoptWindows(pid: pid, space: space)
-            }
-            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-                guard let self, self.isCurrent else { return }
-                self.adoptWindows(pid: pid, space: space)
+            // Chromium/Electron shows a splash then swaps in the real window
+            // (Discord, Chrome PWAs). The late polls catch that replacement.
+            for delay in [0.2, 0.55, 1.5, 3.0] {
+                MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, self.isCurrent else { return }
+                    self.adoptWindows(pid: pid, space: space)
+                }
             }
         }
     }
@@ -388,7 +392,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
                 self.adoptWindows(pid: app.processIdentifier)
-                let hasWindows = !self.session.visibleIds(on: self.session.focusedSpace).isEmpty
+                // A model window may already be dead (Electron AX churn). A
+                // space full of ghosts must not count as occupied, or macOS
+                // promoting the next app after a close drags the user away.
+                let hasWindows = self.session.visibleIds(on: self.session.focusedSpace).contains { id in
+                    guard let w = self.windowAnywhere(id) else { return false }
+                    return self.hasAXElement(w)
+                }
+                // Drop superseded activations (the notification can arrive
+                // after another app already took focus).
+                guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
                 guard shouldFollowAppActivation(
                     spaceHasWindows: hasWindows,
                     elapsedSinceSpaceChange: Date().timeIntervalSince(self.lastLuminaSpaceChange)
@@ -835,8 +848,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard self.isCurrent, !self.userPaused, !self.displayGone else { return }
             guard let window = self.windowAnywhere(id) else { return }
             guard self.resolvedElement(for: window) == nil else { return }
+            if self.isYoung(id) {
+                // Chromium/Electron rebuilds its AX tree for a second or two
+                // after launch. A miss now is not proof of death; re-check
+                // after the grace period instead of dropping a live tile.
+                MutationQueue.shared.queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.scheduleDestroyRecheck(id)
+                }
+                return
+            }
             self.log.info("destroy recheck removing window=\(id) bundle=\(window.bundleId ?? "?")")
             self.removeDestroyedWindow(id)
+            // The app may have replaced the window with a new id.
+            self.adoptWindows(pid: window.pid)
             self.applyFrames()
         }
     }
@@ -1580,14 +1604,39 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     /// Quit path: put the window back where the user had it before tiling.
-    /// Falls back to the tile rect for windows born while already managed.
+    /// A saved frame that is really the engine's tile (the app reopened at a
+    /// tile-shaped frame from an earlier Lumina session) cannot untile
+    /// anything, so it is rejected in favor of a cascade.
     func restoreOriginal(_ window: WindowRef) {
         var w = window
-        let hadOriginal = w.originalFrame != nil
-        w.lastOnscreenFrame = w.originalFrame ?? w.lastOnscreenFrame
+        var hadOriginal = w.originalFrame != nil
+        if let original = w.originalFrame, isEngineTile(original, for: window) {
+            knownOriginals[w.cgWindowId] = nil
+            w.originalFrame = nil
+            hadOriginal = false
+        }
+        w.lastOnscreenFrame = w.originalFrame ?? fallbackRestoreRect()
         let t = w.lastOnscreenFrame
         log.info("quit restore window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") original=\(hadOriginal) target=\(Int(t.w))x\(Int(t.h)) @\(Int(t.x)),\(Int(t.y))")
         restoreWindow(w)
+    }
+
+    /// True when a saved original is where the engine currently tiles this
+    /// window: the app handed back a frame Lumina itself produced.
+    func isEngineTile(_ rect: Rect, for window: WindowRef) -> Bool {
+        guard let bound, let sid = session.spaceContaining(cgWindowId: window.cgWindowId),
+              let space = session.spaces[sid],
+              let leaf = space.leaf(containing: window.cgWindowId)
+        else { return false }
+        let tiles = frames(space: space, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
+        guard let tile = tiles[leaf.id] else { return false }
+        return framesClose(rect, tile, slop: 2)
+    }
+
+    func fallbackRestoreRect() -> Rect {
+        let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 40, y: 48, w: 1200, h: 800)
+        defer { restoreCascadeIndex += 1 }
+        return cascadeRestoreRect(usable: usable, index: restoreCascadeIndex)
     }
 
     /// Remember a transiently-pruned window's original so a later re-adopt

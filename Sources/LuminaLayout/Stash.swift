@@ -197,6 +197,22 @@ public func resolveOriginal(cgWindowId: UInt32, liveFrame: Rect, knownOriginals:
     knownOriginals[cgWindowId] ?? liveFrame
 }
 
+/// A sane non-tiled frame for quit/unstash fallback. `index` cascades windows
+/// so several of them do not stack exactly once they leave the tile layout.
+public func cascadeRestoreRect(
+    usable: Rect,
+    index: Int,
+    preferredWidth: Double = 1100,
+    preferredHeight: Double = 700
+) -> Rect {
+    let w = min(preferredWidth, usable.w * 0.7)
+    let h = min(preferredHeight, usable.h * 0.7)
+    let step = 28.0 * Double(index % 8)
+    let x = min(usable.x + 40 + step, max(usable.x, usable.maxX - w))
+    let y = min(usable.y + 40 + step, max(usable.y, usable.maxY - h))
+    return Rect(x: x, y: y, w: w, h: h)
+}
+
 extension Session {
     public func markStashed(space spaceId: SpaceId, ids: Set<UInt32>) -> Session {
         var session = self

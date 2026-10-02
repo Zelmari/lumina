@@ -187,6 +187,17 @@ struct StashTests {
         #expect(resolveOriginal(cgWindowId: 7, liveFrame: live, knownOriginals: [:]) == live)
     }
 
+    @Test func cascadeRestoreStaysInsideUsableAndOffsets() {
+        let usable = Rect(x: 8, y: 8, w: 1440, h: 860)
+        let first = cascadeRestoreRect(usable: usable, index: 0)
+        let second = cascadeRestoreRect(usable: usable, index: 1)
+        #expect(usable.contains(point: first.center))
+        #expect(usable.contains(point: second.center))
+        #expect(first.w <= usable.w && first.h <= usable.h)
+        #expect(second.x > first.x && second.y > first.y)
+        #expect(cascadeRestoreRect(usable: usable, index: 8) == first)
+    }
+
     @Test func sessionJSONRoundTripOmitsTree() throws {
         let file = SessionFile(
             instanceId: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
