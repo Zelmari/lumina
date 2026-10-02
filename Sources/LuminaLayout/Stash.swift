@@ -123,25 +123,60 @@ public struct StashEntry: Equatable, Sendable, Codable {
 }
 
 /// On-disk session. Does not persist paused, tree, ratios, or bookmarks.
+/// `originals` is a global registry of pre-tiling geometry keyed by CGWindowID,
+/// so a restart while windows are tiled (or drop+re-adopt churn) does not
+/// permanently replace true originals with tile rects.
 public struct SessionFile: Equatable, Sendable, Codable {
     public var instanceId: UUID
     public var bootSessionUUID: String
     public var focusedSpace: Int
     public var displayUUID: String
     public var stash: [StashEntry]
+    public var originals: [UInt32: Rect]
 
     public init(
         instanceId: UUID,
         bootSessionUUID: String,
         focusedSpace: Int,
         displayUUID: String,
-        stash: [StashEntry]
+        stash: [StashEntry],
+        originals: [UInt32: Rect] = [:]
     ) {
         self.instanceId = instanceId
         self.bootSessionUUID = bootSessionUUID
         self.focusedSpace = focusedSpace
         self.displayUUID = displayUUID
         self.stash = stash
+        self.originals = originals
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case instanceId
+        case bootSessionUUID
+        case focusedSpace
+        case displayUUID
+        case stash
+        case originals
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        instanceId = try container.decode(UUID.self, forKey: .instanceId)
+        bootSessionUUID = try container.decode(String.self, forKey: .bootSessionUUID)
+        focusedSpace = try container.decode(Int.self, forKey: .focusedSpace)
+        displayUUID = try container.decode(String.self, forKey: .displayUUID)
+        stash = try container.decode([StashEntry].self, forKey: .stash)
+        originals = try container.decodeIfPresent([UInt32: Rect].self, forKey: .originals) ?? [:]
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(instanceId, forKey: .instanceId)
+        try container.encode(bootSessionUUID, forKey: .bootSessionUUID)
+        try container.encode(focusedSpace, forKey: .focusedSpace)
+        try container.encode(displayUUID, forKey: .displayUUID)
+        try container.encode(stash, forKey: .stash)
+        try container.encode(originals, forKey: .originals)
     }
 
     public static func encode(_ file: SessionFile) throws -> Data {
@@ -153,6 +188,13 @@ public struct SessionFile: Equatable, Sendable, Codable {
     public static func decode(_ data: Data) throws -> SessionFile {
         try JSONDecoder().decode(SessionFile.self, from: data)
     }
+}
+
+/// Prefer a previously recorded pre-tiling frame; fall back to the live frame.
+/// Pure so the agent can apply the persisted `originals` registry on re-adopt
+/// without letting a tile rect overwrite the true original.
+public func resolveOriginal(cgWindowId: UInt32, liveFrame: Rect, knownOriginals: [UInt32: Rect]) -> Rect {
+    knownOriginals[cgWindowId] ?? liveFrame
 }
 
 extension Session {
@@ -188,6 +230,23 @@ extension Session {
         }
         session.spaces[spaceId] = space
         return session
+    }
+
+    public func collectOriginals() -> [UInt32: Rect] {
+        var out: [UInt32: Rect] = [:]
+        for space in spaces.values {
+            for node in space.tiledLeaves() {
+                if let w = node.leaf, let original = w.originalFrame {
+                    out[w.cgWindowId] = original
+                }
+            }
+            for w in space.floating {
+                if let original = w.originalFrame {
+                    out[w.cgWindowId] = original
+                }
+            }
+        }
+        return out
     }
 
     public func collectStashEntries(exceptSpace: SpaceId? = nil) -> [StashEntry] {
