@@ -18,6 +18,7 @@ public final class LuminaLog: @unchecked Sendable {
     private let fileURL: URL?
     private let lock = NSLock()
     private var appendFD: Int32 = -1
+    private let stamp: DateFormatter
     #if os(macOS)
     private let oslog: Logger
     #endif
@@ -33,6 +34,10 @@ public final class LuminaLog: @unchecked Sendable {
         #if os(macOS)
         oslog = Logger(subsystem: "com.zelmari.lumina", category: category.rawValue)
         #endif
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MM-dd HH:mm:ss.SSS"
+        stamp = formatter
     }
 
     public static func defaultFileURL() -> URL {
@@ -66,10 +71,11 @@ public final class LuminaLog: @unchecked Sendable {
         default: oslog.info("\(message, privacy: .public)")
         }
         #endif
-        let line = "[\(category.rawValue)] \(level) \(message)\n"
-        guard let fileURL, let data = line.data(using: .utf8) else { return }
+        guard let fileURL else { return }
         lock.lock()
         defer { lock.unlock() }
+        let line = "[\(stamp.string(from: Date()))] [\(category.rawValue)] \(level) \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
         let fd = openedAppendFD(fileURL)
         guard fd >= 0 else { return }
         flockFD(fd, lock: true)
