@@ -329,6 +329,66 @@ struct SpaceSwitchTests {
         #expect(session[SpaceId.require(1)]!.luminaFullscreen == nil)
         #expect(session[SpaceId.require(2)]?.leaf(containing: 1) != nil)
     }
+
+    @Test func switchStashesAndUnstashesTiledAndFloating() {
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1),
+            usableIsWide: true
+        )
+        var space = session[SpaceId.require(1)]!
+        space.floating.append(WindowRef(cgWindowId: 2, pid: 2, role: .floating))
+        session.spaces[SpaceId.require(1)] = space
+        session = session.switchTo(SpaceId.require(2))
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.role == .stashed)
+        #expect(session[SpaceId.require(1)]!.floating.first?.role == .stashed)
+        session = session.switchTo(SpaceId.require(1))
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.role == .tiled)
+        #expect(session[SpaceId.require(1)]!.floating.first?.role == .floating)
+    }
+
+    @Test func markVisibleRevertsOnlyFailedStashIds() {
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 2, pid: 2),
+            usableIsWide: true
+        )
+        var space = session[SpaceId.require(1)]!
+        space.floating.append(WindowRef(cgWindowId: 3, pid: 3, role: .floating))
+        session.spaces[SpaceId.require(1)] = space
+        session = session.switchTo(SpaceId.require(2))
+        session = session.markVisible(space: SpaceId.require(1), ids: [1, 3])
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.role == .tiled)
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 2)?.leaf?.role == .stashed)
+        #expect(session[SpaceId.require(1)]!.floating.first?.role == .floating)
+    }
+
+    @Test func markVisibleDoesNotDemoteLuminaFS() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 2, pid: 2),
+            usableIsWide: true
+        )
+        let leaf1 = session[SpaceId.require(1)]!.leaf(containing: 1)!.id
+        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: leaf1)
+        session = session.markVisible(space: SpaceId.require(1), ids: [1])
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.role == .luminaFS)
+        session = session.markVisible(space: SpaceId.require(1), ids: [2])
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 2)?.leaf?.role == .tiled)
+    }
 }
 
 struct FullscreenTests {
@@ -602,6 +662,12 @@ struct InputPolicyTests {
         #expect(!shouldIgnoreAXGeometry(windowGeneration: 3, inFlight: 2))
         #expect(onMiniaturize(MiniaturizeEvent(tagged: true)) == .ignore)
         #expect(onMiniaturize(MiniaturizeEvent(tagged: false)) == .deminiaturize)
+    }
+
+    @Test func activationFollowsOnlyOnANonEmptyWorkspace() {
+        #expect(shouldFollowAppActivation(spaceHasWindows: true, elapsedSinceSpaceChange: 2))
+        #expect(!shouldFollowAppActivation(spaceHasWindows: false, elapsedSinceSpaceChange: 2))
+        #expect(!shouldFollowAppActivation(spaceHasWindows: true, elapsedSinceSpaceChange: 0.2))
     }
 
     @Test func coalesceThreeSchedulesDrainOnce() {

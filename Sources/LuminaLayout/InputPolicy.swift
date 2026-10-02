@@ -35,6 +35,18 @@ public func shouldIgnoreFFM(mouseButtonsDown: Bool, generationInFlight: Bool) ->
     mouseButtonsDown || generationInFlight
 }
 
+/// Following the activated app's window to another space is for a deliberate
+/// app switch. The OS also activates a new frontmost app when a window closes,
+/// which must not drag the user off the workspace they are on. An empty
+/// workspace is a valid place to be, and a just-performed switch must settle.
+public func shouldFollowAppActivation(
+    spaceHasWindows: Bool,
+    elapsedSinceSpaceChange: TimeInterval,
+    followDelay: TimeInterval = 0.8
+) -> Bool {
+    spaceHasWindows && elapsedSinceSpaceChange > followDelay
+}
+
 public func shouldIgnoreAXGeometry(windowGeneration: UInt64, inFlight: UInt64?) -> Bool {
     guard let inFlight else { return false }
     return windowGeneration == inFlight

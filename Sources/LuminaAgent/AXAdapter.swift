@@ -7,9 +7,49 @@ import Foundation
 import LuminaLayout
 import LuminaIPC
 
+/// Why a tile frame did not land. Collapsing these into one `failed` made every
+/// transient AX timeout look like an app that refuses to be tiled, which then
+/// got permanently demoted to floating.
 public enum SetFrameResult: Equatable, Sendable {
     case ok
-    case failed
+    /// AX explicitly rejected the write (dead element, API disabled, illegal arg).
+    /// Carries the raw `AXError` so stale elements can be told from refusals.
+    case rejected(AXError)
+    /// Writes reported success and reads were trustworthy, yet the frame still differs.
+    /// This is the only result that is evidence the app is fighting the tile.
+    case notLanded
+    /// A write or read timed out. We do not know whether the frame landed.
+    case unknown
+}
+
+/// `rejected` and `unknown` are both "no trustworthy evidence": they must never
+/// float a window. Only `notLanded` may, and only after the retry deadline.
+func failureIsEvidence(_ result: SetFrameResult) -> Bool {
+    result == .notLanded
+}
+
+private func mergeWriteResults(_ a: SetFrameResult, _ b: SetFrameResult) -> SetFrameResult {
+    if case .rejected = a { return a }
+    if case .rejected = b { return b }
+    if a == .unknown || b == .unknown { return .unknown }
+    return .notLanded
+}
+
+/// Per-element AX writes must not fail just because an app is busy launching.
+/// Reads use the same value because it is set on the window element.
+private let axWriteTimeout: Float = 0.15
+
+private enum AXWriteOutcome: Equatable {
+    case accepted
+    case rejected(AXError)
+    case timedOut
+}
+
+private func classifyWrite(_ errors: [AXError]) -> AXWriteOutcome {
+    let rejected: Set<AXError> = [.apiDisabled, .invalidUIElement, .illegalArgument, .attributeUnsupported, .notImplemented]
+    if let first = errors.first(where: rejected.contains) { return .rejected(first) }
+    if errors.contains(.cannotComplete) { return .timedOut }
+    return .accepted
 }
 
 private typealias AXGetWindow = @convention(c) (CFTypeRef, UnsafeMutablePointer<UInt32>) -> Int32
@@ -147,19 +187,21 @@ public final class AXAdapter {
         let id = window.cgWindowId
         let gen = window.generation
         inFlight[id] = gen
-        let ok = applyFrame(rect, of: element)
-        if !ok {
-            let retry = applyFrame(rect, of: element)
-            if !retry {
-                inFlight[id] = nil
-                return .failed
-            }
+        let first = applyFrame(rect, of: element)
+        var result = first
+        if first != .ok {
+            let second = applyFrame(rect, of: element)
+            result = second == .ok ? .ok : mergeWriteResults(first, second)
         }
+        scheduleInFlightClear(id: id, gen: gen)
+        return result
+    }
+
+    private func scheduleInFlightClear(id: UInt32, gen: UInt64) {
         // AXMoved/AXResized arrive after we return; keep the tag until they can be ignored.
         MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             if self?.inFlight[id] == gen { self?.inFlight[id] = nil }
         }
-        return .ok
     }
 
     public func shouldIgnoreAXGeometry(window: LuminaLayout.Window) -> Bool {
@@ -179,53 +221,73 @@ public final class AXAdapter {
         let id = window.cgWindowId
         let gen = window.generation
         inFlight[id] = gen
-        let ok = applyStashFrame(rect, of: element)
-        if !ok {
-            inFlight[id] = nil
-            return .failed
-        }
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            if self?.inFlight[id] == gen { self?.inFlight[id] = nil }
-        }
-        return .ok
+        let result = applyStashFrame(rect, of: element)
+        scheduleInFlightClear(id: id, gen: gen)
+        return result
     }
 
     /// Position first, then shrink. Size-first would collapse the tile in-place;
     /// origin-past-the-display is clamped back onto the desktop.
-    private func applyStashFrame(_ rect: Rect, of element: AXUIElement) -> Bool {
-        AXUIElementSetMessagingTimeout(element, 0.05)
+    private func applyStashFrame(_ rect: Rect, of element: AXUIElement) -> SetFrameResult {
+        AXUIElementSetMessagingTimeout(element, axWriteTimeout)
         var size = CGSize(width: rect.w, height: rect.h)
         var point = CGPoint(x: rect.x, y: rect.y)
         guard let sizeVal = AXValueCreate(.cgSize, &size),
               let posVal = AXValueCreate(.cgPoint, &point)
-        else { return false }
+        else { return .rejected(.illegalArgument) }
         let pos1 = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
         let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
         let pos2 = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
         let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-        let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
-        if fatal.contains(pos1) || fatal.contains(s1) || fatal.contains(pos2) || fatal.contains(s2) { return false }
-        return true
+        let errors = [pos1, s1, pos2, s2]
+        switch classifyWrite(errors) {
+        case .rejected(let err):
+            logWriteFailure("stash", err: err, errors: errors)
+            return .rejected(err)
+        case .timedOut:
+            return .unknown
+        case .accepted:
+            guard let got = frame(of: element) else { return .unknown }
+            return framesClose(got, rect) ? .ok : .notLanded
+        }
     }
 
-    private func applyFrame(_ rect: Rect, of element: AXUIElement) -> Bool {
-        AXUIElementSetMessagingTimeout(element, 0.05)
-        func write() -> Bool {
+    private func applyFrame(_ rect: Rect, of element: AXUIElement) -> SetFrameResult {
+        AXUIElementSetMessagingTimeout(element, axWriteTimeout)
+        func write() -> AXWriteOutcome {
             var size = CGSize(width: rect.w, height: rect.h)
             var point = CGPoint(x: rect.x, y: rect.y)
             guard let sizeVal = AXValueCreate(.cgSize, &size),
                   let posVal = AXValueCreate(.cgPoint, &point)
-            else { return false }
+            else { return .rejected(.illegalArgument) }
             let s1 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
             let pos = AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, posVal)
             let s2 = AXUIElementSetAttributeValue(element, kAXSizeAttribute as CFString, sizeVal)
-            let fatal: Set<AXError> = [.apiDisabled, .invalidUIElement]
-            return !fatal.contains(s1) && !fatal.contains(pos) && !fatal.contains(s2)
+            let errors = [s1, pos, s2]
+            let outcome = classifyWrite(errors)
+            if case .rejected(let err) = outcome {
+                logWriteFailure("frame", err: err, errors: errors)
+            }
+            return outcome
         }
-        guard write(), let got = frame(of: element) else { return false }
-        if framesClose(got, rect) { return true }
-        guard write(), let again = frame(of: element) else { return false }
-        return framesClose(again, rect)
+        let first = write()
+        if case .rejected(let err) = first { return .rejected(err) }
+        let afterFirst = frame(of: element)
+        if let afterFirst, framesClose(afterFirst, rect) { return .ok }
+        let second = write()
+        if case .rejected(let err) = second { return .rejected(err) }
+        let afterSecond = frame(of: element)
+        if let afterSecond, framesClose(afterSecond, rect) { return .ok }
+        // Writes were accepted and at least one read was trustworthy: the app
+        // saw the request and did not honor it. That is the only evidence.
+        if first == .accepted, second == .accepted, afterSecond != nil { return .notLanded }
+        return .unknown
+    }
+
+    /// Raw codes so a stale element (`.invalidUIElement`) can be told apart
+    /// from an app that refuses the attributes (`.attributeUnsupported`).
+    private func logWriteFailure(_ kind: String, err: AXError, errors: [AXError]) {
+        log.info("ax \(kind) write rejected err=\(err.rawValue) codes=[\(errors.map(\.rawValue).map(String.init).joined(separator: ","))]")
     }
 
     private func framesClose(_ a: Rect, _ b: Rect) -> Bool {

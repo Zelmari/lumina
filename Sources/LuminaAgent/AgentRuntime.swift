@@ -25,7 +25,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var boundSkyLightId: UInt64?
     /// Latest SkyLight id, used only to notice a native Space change.
     public var observedSkyLightId: UInt64?
-    var lastFocusedByPid: [pid_t: UInt32] = [:]
+    /// Last focused window per pid per Lumina space. A single global entry let
+    /// app activation raise a stale id from another space, or a recycled one.
+    var lastFocusedByPid: [pid_t: [SpaceId: UInt32]] = [:]
     public var axTrusted: Bool { AXIsProcessTrusted() }
     public var hotkeys = Hotkeys()
     public var secureInput = false
@@ -35,10 +37,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var pasteboardCount: Int = 0
     public var moveStart: (UInt32, Point, Int)?
     public     var createDebounce: DispatchWorkItem?
-    var pendingCreates: [AXUIElement] = []
+    var pendingCreates: [(element: AXUIElement, space: SpaceId)] = []
     /// Elements whose creation raced WindowServer/AX (no id yet, or only a
     /// placeholder frame). Retried a bounded number of times, then dropped.
-    var pendingRetryElements: [AXUIElement] = []
+    var pendingRetryElements: [(element: AXUIElement, thenRegisterPlaceholder: Bool, space: SpaceId?)] = []
     /// When a window joined the session. Pruning never removes a window
     /// younger than the grace period; it may just not be visible to AX/CG yet.
     var bornAt: [UInt32: Date] = [:]
@@ -46,8 +48,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Persisted via SessionFile so restarts and drop+re-adopt churn cannot
     /// replace true originals with tile rects.
     var knownOriginals: [UInt32: Rect] = [:]
-    public var resizeDebounce: DispatchWorkItem?
+    public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
+    /// Bounded per-window retries for frames whose write outcome was unsure.
+    /// Unknown/rejected writes never float; young windows get a grace period.
+    var unlandedRetryCounts: [UInt32: Int] = [:]
+    var unlandedRetryScheduled = false
+    /// Stash parks that did not land, retried a little later before the model
+    /// is allowed to keep claiming they are hidden.
+    var pendingStashRetries: [SpaceId: Set<UInt32>] = [:]
+    var stashRetryWork: DispatchWorkItem?
     let preferredDisplayUUID: String?
 
     let log: LuminaLog
@@ -339,14 +349,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard isCurrent, !userPaused else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             let pid = app.processIdentifier
+            let space = session.focusedSpace
             DispatchQueue.main.async { self.observers.watch(pid: pid) }
             MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
                 guard let self, self.isCurrent else { return }
-                self.adoptWindows(pid: pid)
+                self.adoptWindows(pid: pid, space: space)
             }
             MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.55) { [weak self] in
                 guard let self, self.isCurrent else { return }
-                self.adoptWindows(pid: pid)
+                self.adoptWindows(pid: pid, space: space)
             }
         }
     }
@@ -374,9 +385,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
                 self.adoptWindows(pid: app.processIdentifier)
-                if Date().timeIntervalSince(self.lastLuminaSpaceChange) > 0.8 {
-                    self.switchToWindowOf(pid: app.processIdentifier)
-                }
+                let hasWindows = !self.session.visibleIds(on: self.session.focusedSpace).isEmpty
+                guard shouldFollowAppActivation(
+                    spaceHasWindows: hasWindows,
+                    elapsedSinceSpaceChange: Date().timeIntervalSince(self.lastLuminaSpaceChange)
+                ) else { return }
+                self.switchToWindowOf(pid: app.processIdentifier)
             }
         }
     }
@@ -424,7 +438,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                         }
                         session.spaces[sid] = space
                     }
-                    stash(ids: [id], space: sid)
+                    stashAndRetry(ids: [id], space: sid)
                 }
             } else if !inheritOffscreenTab(pid: pid, candidate: win) {
                 onCreate(win)
@@ -450,35 +464,43 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func scheduleCreate(_ element: AXUIElement) {
-        pendingCreates.append(element)
+        let space = session.focusedSpace
+        pendingCreates.append((element, space))
         MutationQueue.shared.scheduleLayoutPass { [weak self] in
             guard let self else { return }
             let batch = self.pendingCreates
             self.pendingCreates.removeAll()
             var claimed = self.session.allWindowIds.union(self.elements.keys)
-            for el in batch {
-                self.onCreate(el, claimed: &claimed, apply: false)
+            for item in batch {
+                self.onCreate(item.element, claimed: &claimed, apply: false, space: item.space)
             }
             self.applyFrames()
         }
     }
 
-    func adoptWindows(pid: pid_t, apply: Bool = true) {
+    func adoptWindows(pid: pid_t, apply: Bool = true, space: SpaceId? = nil) {
         observers.watch(pid: pid)
         var claimed = session.allWindowIds.union(elements.keys)
         for el in adapter.windows(pid: pid) {
-            onCreate(el, claimed: &claimed, apply: false)
+            onCreate(el, claimed: &claimed, apply: false, space: space)
         }
         if apply { applyFrames() }
     }
 
-    func onCreate(_ element: AXUIElement) {
+    func onCreate(_ element: AXUIElement, space: SpaceId? = nil, forceRegisterPlaceholder: Bool = false) {
         var claimed = session.allWindowIds.union(elements.keys)
-        onCreate(element, claimed: &claimed, apply: true)
+        onCreate(element, claimed: &claimed, apply: true, space: space, forceRegisterPlaceholder: forceRegisterPlaceholder)
     }
 
-    func onCreate(_ element: AXUIElement, claimed: inout Set<UInt32>, apply: Bool = true) {
+    func onCreate(
+        _ element: AXUIElement,
+        claimed: inout Set<UInt32>,
+        apply: Bool = true,
+        space preferredSpace: SpaceId? = nil,
+        forceRegisterPlaceholder: Bool = false
+    ) {
         guard let bound else { return }
+        let targetId = preferredSpace.flatMap { session.spaces[$0] != nil ? $0 : nil } ?? session.focusedSpace
         if let existing = trackedId(matching: element), ownedAnywhere(existing) {
             claimed.insert(existing)
             if let pid = adapter.pid(of: element) {
@@ -487,7 +509,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             adapter.rememberWindowId(existing, for: element)
             elements[existing] = element
             if let sid = session.spaceContaining(cgWindowId: existing), sid != session.focusedSpace {
-                stash(ids: [existing], space: sid)
+                stashAndRetry(ids: [existing], space: sid)
             }
             return
         }
@@ -519,7 +541,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             excludingWindowIds: claimed
         ) else {
             log.info("onCreate skip (no window id) role=\(adapter.role(of: element) ?? "?")")
-            retryCreate(element, attempts: 3)
+            retryCreate(element, attempts: 3, space: targetId)
             return
         }
         if let sid = otherSpace(pid: pid, id: id, element: element) {
@@ -559,8 +581,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // Classified from a placeholder frame (or before appearing
             // on-screen): retry once settled instead of dropping forever.
             if input.width < 50 || input.height < 50 || !input.isOnScreen {
-                retryCreate(element, attempts: 2)
+                retryCreate(element, attempts: 2, space: targetId)
             }
+            return
+        }
+        if result == .floating, !forceRegisterPlaceholder,
+           input.width < 50 || input.height < 50 || !input.isOnScreen
+        {
+            // A tiny or not-yet-on-screen frame is not a real float decision.
+            // Reclassify once the app has drawn; register as a floater only if
+            // it never settles.
+            retryCreate(element, attempts: 2, space: targetId, thenRegisterPlaceholder: true)
             return
         }
         claimed.insert(id)
@@ -571,23 +602,31 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
         knownOriginals[id] = window.originalFrame ?? frame
         let usable = bound.usableRect(gaps: config.gaps)
-        if session.current.luminaFullscreen != nil {
-            session = session.insertWhileLuminaFS(space: session.focusedSpace, window: window, result: result, usableIsWide: usableIsWide(usable))
-            if result == .tiled { stash(ids: [id]) }
+        let target = session.spaces[targetId] ?? session.current
+        if target.luminaFullscreen != nil {
+            session = session.insertWhileLuminaFS(space: targetId, window: window, result: result, usableIsWide: usableIsWide(usable))
+            if result == .tiled {
+                stashAndRetry(ids: [id], space: targetId)
+            }
         } else if result == .floating {
             window.role = .floating
-            var space = session.current
+            var space = target
             space.floating.append(window)
-            session.spaces[session.focusedSpace] = space
+            session.spaces[targetId] = space
         } else {
-            pruneGhostLeaves(space: session.focusedSpace)
-            session = session.insertSpiral(space: session.focusedSpace, newLeaf: window, usableIsWide: usableIsWide(usable))
+            pruneGhostLeaves(space: targetId)
+            session = session.insertSpiral(space: targetId, newLeaf: window, usableIsWide: usableIsWide(usable))
             let mins = minSizes()
-            let (clamped, floated) = session.clampOverflow(space: session.focusedSpace, minSizes: mins, usable: usable, gaps: config.gaps, preferFloat: session.current.lastTiledLeaf)
+            let (clamped, floated) = session.clampOverflow(space: targetId, minSizes: mins, usable: usable, gaps: config.gaps, preferFloat: (session.spaces[targetId] ?? target).lastTiledLeaf)
             session = clamped
-            placeFloated(floated)
+            placeFloated(floated, space: targetId)
         }
         markBorn(id)
+        if targetId != session.focusedSpace {
+            // The user moved on before this window settled. It belongs to the
+            // space that was focused when it appeared; park it there now.
+            stashAndRetry(ids: [id], space: targetId)
+        }
         if apply { applyFrames() }
     }
 
@@ -618,21 +657,48 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         bornAt[id] = nil
     }
 
+    /// Bounded retry budget for frames whose write did not land or timed out.
+    /// 20 retries at the 0.25s cadence covers the 5s `isYoung` grace.
+    func registerUnlandedRetry(_ id: UInt32) -> Bool {
+        let n = (unlandedRetryCounts[id] ?? 0) + 1
+        unlandedRetryCounts[id] = n
+        return n <= 20
+    }
+
+    func clearUnlandedRetry(_ id: UInt32) {
+        unlandedRetryCounts[id] = nil
+    }
+
     /// Re-adopt a creation that raced the WindowServer (no id yet, or only a
     /// placeholder frame). Bounded and deduped: each element retries at most
-    /// `attempts` more times, then is dropped.
-    func retryCreate(_ element: AXUIElement, attempts: Int) {
-        guard attempts > 0 else { return }
-        if pendingRetryElements.contains(where: { CFEqual($0, element) }) { return }
-        pendingRetryElements.append(element)
+    /// `attempts` more times, then is dropped — or, when the only thing that
+    /// failed was a placeholder float, registered as a floater.
+    func retryCreate(
+        _ element: AXUIElement,
+        attempts: Int,
+        space: SpaceId? = nil,
+        thenRegisterPlaceholder: Bool = false
+    ) {
+        guard attempts > 0 else {
+            if thenRegisterPlaceholder {
+                onCreate(element, space: space, forceRegisterPlaceholder: true)
+            }
+            return
+        }
+        if pendingRetryElements.contains(where: { CFEqual($0.element, element) }) { return }
+        pendingRetryElements.append((element, thenRegisterPlaceholder, space))
         MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             guard let self else { return }
-            self.pendingRetryElements.removeAll(where: { CFEqual($0, element) })
+            self.pendingRetryElements.removeAll(where: { CFEqual($0.element, element) })
             guard self.isCurrent, !self.userPaused, !self.displayGone else { return }
             if self.trackedId(matching: element).flatMap({ self.windowAnywhere($0) }) != nil { return }
-            self.onCreate(element)
+            if attempts - 1 <= 0, thenRegisterPlaceholder {
+                self.onCreate(element, space: space, forceRegisterPlaceholder: true)
+                return
+            }
+            self.onCreate(element, space: space)
             if self.trackedId(matching: element).flatMap({ self.windowAnywhere($0) }) == nil {
-                self.retryCreate(element, attempts: attempts - 1)
+                self.retryCreate(element, attempts: attempts - 1, space: space, thenRegisterPlaceholder: thenRegisterPlaceholder)
             }
         }
     }
@@ -682,6 +748,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(to, for: element)
         elements[to] = element
         observers.watchWindow(element, pid: pid)
+        let hadFocus = lastFocusedByPid[pid]?.values.contains(from) == true
+        forgetLastFocus(from)
+        if hadFocus {
+            lastFocusedByPid[pid, default: [:]][session.focusedSpace] = to
+        }
         if session.current.focusedWindow == from {
             rememberFocus(to)
         }
@@ -712,6 +783,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 elements[id] = nil
                 adapter.forgetWindowId(id)
                 forgetBorn(id)
+                forgetLastFocus(id)
                 knownOriginals[id] = nil
             }
         } else {
@@ -732,24 +804,35 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func onMovedOrResized(_ element: AXUIElement, resized: Bool) {
         guard let id = adapter.windowId(for: element) else { return }
         if let w = windowAnywhere(id), adapter.shouldIgnoreAXGeometry(window: w) {
-            adapter.clearInFlight(id: id, generation: w.generation)
+            // A single setFrame emits several Moved/Resized notifications. Keep
+            // the tag until its timer expires so the rest of the burst is not
+            // mistaken for a user drag.
             return
         }
         if !resized {
             handleTitleBarMove(id: id, element: element)
             return
         }
-        resizeDebounce?.cancel()
+        resizeDebounce[id]?.cancel()
         let item = DispatchWorkItem { [weak self] in
+            self?.resizeDebounce[id] = nil
             self?.handleUntaggedResize(id: id, element: element)
         }
-        resizeDebounce = item
+        resizeDebounce[id] = item
         MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.05, execute: item)
     }
 
     func handleUntaggedResize(id: UInt32, element: AXUIElement) {
         guard let bound, let frame = adapter.frame(of: element) else { return }
         let usable = bound.usableRect(gaps: config.gaps)
+        // Our own layout landing late: if the frame is the model tile, this is
+        // not a user resize and must not be classified as a fill.
+        if let leaf = session.current.leaf(containing: id),
+           let expected = frames(space: session.current, usable: usable, gaps: config.gaps)[leaf.id],
+           framesClose(frame, expected, slop: 2)
+        {
+            return
+        }
         let pidAlive = adapter.pid(of: element).map { kill($0, 0) == 0 } ?? false
         let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         let signals = NativeFSSignals(
@@ -995,6 +1078,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         for (nodeId, rect) in rects {
             if MutationQueue.shared.shouldSkip(started: started) {
                 log.info("layout pass exceeded 200ms; skipping remaining windows")
+                if !retryingUnlanded { needsUnlandedRetry = true }
                 break
             }
             if let fs, fs != nodeId { continue }
@@ -1015,26 +1099,62 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 var s = session.spaces[session.focusedSpace]!
                 s.setNode(node)
                 session.spaces[session.focusedSpace] = s
+                clearUnlandedRetry(window.cgWindowId)
                 continue
             }
             window.lastOnscreenFrame = rect
-            let result = adapter.setFrame(rect, of: el, tag: &window)
+            var result = adapter.setFrame(rect, of: el, tag: &window)
+            if case .rejected(let err) = result, err == .invalidUIElement || err == .apiDisabled {
+                // The cached element can outlive its window: pid lookups still
+                // succeed while attribute writes are rejected. Drop it and try
+                // the freshly enumerated element once.
+                elements[window.cgWindowId] = nil
+                adapter.forgetWindowId(window.cgWindowId)
+                if let fresh = resolvedElement(for: window), !CFEqual(fresh, el) {
+                    log.info("setFrame rejected err=\(err.rawValue); refetched element window=\(window.cgWindowId)")
+                    result = adapter.setFrame(rect, of: fresh, tag: &window)
+                }
+            }
             node.leaf = window
             var s = session.spaces[session.focusedSpace]!
             s.setNode(node)
             session.spaces[session.focusedSpace] = s
-            if result == .failed {
+            if result == .ok {
+                clearUnlandedRetry(window.cgWindowId)
+            } else if failureIsEvidence(result) {
                 let live = adapter.frame(of: el)
-                switch unlandedSetFrameAction(live: live, display: display, alreadyRetried: retryingUnlanded) {
-                case .retry:
-                    log.info("setFrame not landed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); retry")
+                if isYoung(window.cgWindowId), registerUnlandedRetry(window.cgWindowId) {
+                    // A newly launched window has not settled yet. Never float
+                    // it out of the tree during the grace period.
+                    log.info("setFrame not landed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); young, retry")
                     needsUnlandedRetry = true
-                case .keepTiled:
-                    log.info("setFrame still parked window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
-                case .float:
-                    log.info("setFrame failed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); floating")
-                    let (after, _) = session.floatLeaf(space: session.focusedSpace, nodeId: nodeId)
-                    session = after
+                } else {
+                    switch unlandedSetFrameAction(live: live, display: display, alreadyRetried: retryingUnlanded) {
+                    case .retry:
+                        log.info("setFrame not landed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); retry")
+                        needsUnlandedRetry = true
+                    case .keepTiled:
+                        log.info("setFrame still parked window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
+                        // The window is still in its park, likely mid-unstash.
+                        // Never float it; retry until the unstash lands.
+                        if registerUnlandedRetry(window.cgWindowId) { needsUnlandedRetry = true }
+                    case .float:
+                        log.info("setFrame failed window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); floating")
+                        let (after, _) = session.floatLeaf(space: session.focusedSpace, nodeId: nodeId)
+                        session = after
+                        clearUnlandedRetry(window.cgWindowId)
+                    }
+                }
+            } else {
+                // Unknown/rejected are not evidence that the app refuses the
+                // tile. Keep it tiled and retry a bounded number of times.
+                if registerUnlandedRetry(window.cgWindowId) {
+                    if case .rejected(let err) = result {
+                        log.info("setFrame rejected(\(err.rawValue)) window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
+                    } else {
+                        log.info("setFrame timeout window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); keeping tiled")
+                    }
+                    needsUnlandedRetry = true
                 }
             }
         }
@@ -1059,13 +1179,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 elements[id] = nil
                 adapter.forgetWindowId(id)
                 forgetBorn(id)
+                forgetLastFocus(id)
             }
             applyFrames(retryingAfterGhosts: true, retryingUnlanded: retryingUnlanded)
             return
         }
-        if needsUnlandedRetry, !retryingUnlanded {
-            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-                self?.applyFrames(retryingUnlanded: true)
+        if needsUnlandedRetry, !unlandedRetryScheduled {
+            unlandedRetryScheduled = true
+            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                guard let self else { return }
+                self.unlandedRetryScheduled = false
+                self.applyFrames(retryingUnlanded: true)
             }
         }
     }
@@ -1073,9 +1197,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func switchSpace(_ id: SpaceId) {
         guard id != session.focusedSpace else { return }
         lastLuminaSpaceChange = Date()
+        let source = session.focusedSpace
         captureFocusForSpaceSwitch()
-        stash(ids: Set(session.visibleIds(on: session.focusedSpace)))
+        let failed = stashAndRetry(ids: Set(session.visibleIds(on: source)), space: source)
         session = session.switchTo(id)
+        if !failed.isEmpty {
+            // The park did not land. Do not claim those windows are hidden.
+            session = session.markVisible(space: source, ids: failed)
+        }
         unstashSpace(id)
         applyFrames()
         restashOffspace()
@@ -1085,9 +1214,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func switchSpaceBy(_ transform: (Session) -> Session) {
         lastLuminaSpaceChange = Date()
+        let source = session.focusedSpace
         captureFocusForSpaceSwitch()
-        stash(ids: Set(session.visibleIds(on: session.focusedSpace)))
+        let failed = stashAndRetry(ids: Set(session.visibleIds(on: source)), space: source)
         session = transform(session)
+        if !failed.isEmpty, source != session.focusedSpace {
+            session = session.markVisible(space: source, ids: failed)
+        }
         unstashSpace(session.focusedSpace)
         applyFrames()
         restashOffspace()
@@ -1114,25 +1247,31 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     /// Activate-first, then focus, then verify with retries. Setting
     /// kAXFocusedAttribute on a window of an inactive app silently fails on
-    /// macOS, and activate() itself is async, so a single blind setFocused
-    /// never sticks reliably.
+    /// macOS and activate() itself is async. While the app is not active, the
+    /// retries only re-activate — raising a window over the frontmost app is
+    /// what pinned hidden-space windows on top of the user's work.
     func focusWindow(_ id: UInt32, attempts: Int = 0) {
-        guard let window = windowAnywhere(id) else { return }
+        guard attempts <= 3, let window = windowAnywhere(id) else { return }
+        guard window.role == .tiled || window.role == .floating || window.role == .luminaFS else {
+            return
+        }
         rememberFocus(id)
         guard let el = resolvedElement(for: window) else {
             log.info("workspace focus missing AX window=\(id)")
             return
         }
-        if attempts == 0 {
-            NSRunningApplication(processIdentifier: window.pid)?.activate()
+        let app = NSRunningApplication(processIdentifier: window.pid)
+        if app?.isActive == true {
+            adapter.setFocused(el, raise: true)
+            log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw) attempt=\(attempts)")
+            if axFocusedWindowId(pid: window.pid) == id { return }
+        } else {
+            app?.activate()
+            log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw) attempt=\(attempts) waiting for activation")
         }
-        adapter.setFocused(el, raise: true)
-        log.info("workspace focus window=\(id) space=\(session.focusedSpace.raw) attempt=\(attempts)")
-        guard attempts < 3 else { return }
         let space = session.focusedSpace
         MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             guard let self, self.session.focusedSpace == space, self.windowAnywhere(id) != nil else { return }
-            if self.axFocusedWindowId(pid: window.pid) == id { return }
             self.focusWindow(id, attempts: attempts + 1)
         }
     }
@@ -1143,10 +1282,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         return adapter.windowId(for: win)
     }
 
-    func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) {
-        guard isCurrent, let bound else { return }
+    @discardableResult
+    func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) -> Set<UInt32> {
+        guard isCurrent, let bound else { return ids }
         let spaceId = spaceId ?? session.focusedSpace
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        var failed: Set<UInt32> = []
         for id in ids {
             guard var window = session.spaces[spaceId]?.leaf(containing: id)?.leaf
                     ?? session.spaces[spaceId]?.floating.first(where: { $0.cgWindowId == id })
@@ -1154,10 +1296,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                   let el = resolvedElement(for: window)
             else {
                 log.info("stash skip missing AX window=\(id)")
+                failed.insert(id)
                 continue
             }
             let current = adapter.frame(of: el) ?? cgWindowRect(id: id)
-            let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
             if let current, shouldCaptureOnscreenFrame(role: window.role, frame: current, display: display),
                var space = session.spaces[spaceId]
             {
@@ -1175,17 +1317,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let inset: Double = window.bundleId == "us.zoom.xos" ? 0 : 1
             let parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width, inset: inset)
             _ = adapter.setStashFrame(parked, of: el, tag: &window)
-            if let after = adapter.frame(of: el) ?? cgWindowRect(id: id),
-               after.intersection(bound.axVisibleFrame).w > 8,
-               after.intersection(bound.axVisibleFrame).h > 8
-            {
+            if !stashLanded(id: id, of: el, display: display) {
                 // Corner park was clamped back on screen. Hang all but `inset` points above the menu bar.
+                let after = adapter.frame(of: el) ?? cgWindowRect(id: id) ?? parked
                 let hang = menuBarHangFrame(after: after, display: display, x: parked.x, inset: inset)
                 _ = adapter.setStashFrame(hang, of: el, tag: &window)
-                if let still = adapter.frame(of: el) ?? cgWindowRect(id: id), still.intersects(bound.axVisibleFrame) {
-                    log.info(
-                        "stash still on desktop window=\(id) bundle=\(window.bundleId ?? "?") \(Int(still.w))x\(Int(still.h)) @\(Int(still.x)),\(Int(still.y))"
-                    )
+                if !stashLanded(id: id, of: el, display: display) {
+                    if let still = adapter.frame(of: el) ?? cgWindowRect(id: id) {
+                        log.info(
+                            "stash still on desktop window=\(id) bundle=\(window.bundleId ?? "?") \(Int(still.w))x\(Int(still.h)) @\(Int(still.x)),\(Int(still.y))"
+                        )
+                    } else {
+                        log.info("stash unverified window=\(id) bundle=\(window.bundleId ?? "?")")
+                    }
+                    failed.insert(id)
                 }
             }
             if var space = session.spaces[spaceId] {
@@ -1201,12 +1346,60 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 session.spaces[spaceId] = space
             }
         }
+        return failed
+    }
+
+    /// A park that did not land must not leave the model claiming the window
+    /// is hidden: the window is visible, and later focus/raise paths would
+    /// fight over it.
+    private func stashLanded(id: UInt32, of el: AXUIElement, display: DisplayFrame) -> Bool {
+        guard let after = adapter.frame(of: el) ?? cgWindowRect(id: id) else { return false }
+        return isFrameStashedAway(after, display: display)
+    }
+
+    @discardableResult
+    func stashAndRetry(ids: Set<UInt32>, space spaceId: SpaceId? = nil) -> Set<UInt32> {
+        let sid = spaceId ?? session.focusedSpace
+        let failed = stash(ids: ids, space: sid)
+        if !failed.isEmpty { scheduleStashRetry(ids: failed, space: sid) }
+        return failed
+    }
+
+    /// A park can fail while an app is mid-launch. Retry once shortly after,
+    /// and promote the model to stashed only when the park actually landed.
+    func scheduleStashRetry(ids: Set<UInt32>, space: SpaceId) {
+        guard !ids.isEmpty else { return }
+        pendingStashRetries[space, default: []].formUnion(ids)
+        stashRetryWork?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.runStashRetries() }
+        stashRetryWork = item
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.35, execute: item)
+    }
+
+    func runStashRetries() {
+        guard isCurrent, !userPaused, !displayGone else {
+            pendingStashRetries.removeAll()
+            return
+        }
+        let work = pendingStashRetries
+        pendingStashRetries.removeAll()
+        for (space, ids) in work {
+            // The focused space's windows are meant to be visible, unless
+            // luminaFS is covering them.
+            guard space != session.focusedSpace || session.current.luminaFullscreen != nil else { continue }
+            let failed = stash(ids: ids, space: space)
+            if failed.isEmpty {
+                session = session.markStashed(space: space, ids: ids)
+            } else {
+                log.info("stash retry failed space=\(space) ids=\(failed)")
+            }
+        }
     }
 
     func stashSiblings() {
         let fs = session.current.nodes[session.current.luminaFullscreen ?? NodeId(raw: 0)]?.leaf?.cgWindowId
         let ids = Set(session.visibleIds(on: session.focusedSpace).filter { $0 != fs })
-        stash(ids: ids)
+        stashAndRetry(ids: ids)
     }
 
     func unstashSpace(_ id: SpaceId, restoreOriginals: Bool = false) {
@@ -1240,6 +1433,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 elements[id] = nil
                 adapter.forgetWindowId(id)
                 forgetBorn(id)
+                forgetLastFocus(id)
             }
         }
     }
@@ -1254,6 +1448,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             elements[w.cgWindowId] = nil
             adapter.forgetWindowId(w.cgWindowId)
             forgetBorn(w.cgWindowId)
+            forgetLastFocus(w.cgWindowId)
         }
     }
 
@@ -1415,18 +1610,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         shouldPullOnScreen(frame) || isOurStashSliver(frame)
     }
 
-    func placeFloated(_ windows: [WindowRef]) {
+    func placeFloated(_ windows: [WindowRef], space spaceId: SpaceId? = nil) {
+        let sid = spaceId ?? session.focusedSpace
         for orig in windows {
             var w = orig
             w.lastOnscreenFrame = usableRestoreRect(w.lastOnscreenFrame)
             if let el = resolvedElement(for: w) {
                 _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &w)
             }
-            if var space = session.spaces[session.focusedSpace],
+            if var space = session.spaces[sid],
                let idx = space.floating.firstIndex(where: { $0.cgWindowId == w.cgWindowId })
             {
                 space.floating[idx] = w
-                session.spaces[session.focusedSpace] = space
+                session.spaces[sid] = space
             }
             log.info("floated overflow window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?")")
         }
@@ -1534,7 +1730,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let ids = Set(ownedWindows(pid: pid).filter { $0.0 == spaceId }.map(\.1.cgWindowId))
         guard !ids.isEmpty else { return }
         log.info("restash pid=\(pid) space=\(spaceId) ids=\(ids)")
-        stash(ids: ids, space: spaceId)
+        stashAndRetry(ids: ids, space: spaceId)
     }
 
     func unstashOrphanSlivers(restoreOriginals: Bool = false) {
@@ -1602,7 +1798,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func restashOffspace() {
         for (id, _) in session.spaces where id != session.focusedSpace {
-            stash(ids: Set(session.visibleIds(on: id)), space: id)
+            stashAndRetry(ids: Set(session.visibleIds(on: id)), space: id)
         }
         if session.current.luminaFullscreen != nil { stashSiblings() }
     }
@@ -1704,13 +1900,26 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func rememberFocus(_ id: UInt32) {
-        var space = session.current
+        guard let w = windowAnywhere(id) else { return }
+        let sid = session.spaceContaining(cgWindowId: id) ?? session.focusedSpace
+        var space = session.spaces[sid] ?? session.current
         space.focusedWindow = id
         if let leaf = space.leaf(containing: id) {
             space.lastTiledLeaf = leaf.id
         }
-        session.spaces[session.focusedSpace] = space
-        if let w = lookup(id) { lastFocusedByPid[w.pid] = id }
+        session.spaces[sid] = space
+        lastFocusedByPid[w.pid, default: [:]][sid] = id
+    }
+
+    func forgetLastFocus(_ id: UInt32) {
+        for (pid, var bySpace) in lastFocusedByPid {
+            bySpace = bySpace.filter { $0.value != id }
+            if bySpace.isEmpty {
+                lastFocusedByPid[pid] = nil
+            } else {
+                lastFocusedByPid[pid] = bySpace
+            }
+        }
     }
 
     func frontmostOwnedWindow() -> UInt32? {
@@ -1790,6 +1999,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             elements[id] = nil
             adapter.forgetWindowId(id)
             forgetBorn(id)
+            forgetLastFocus(id)
             knownOriginals[id] = nil
         }
         applyFrames()
@@ -1797,18 +2007,31 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func switchToWindowOf(pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
-        let focused = adapter.focusedWindow(of: app).flatMap { adapter.windowId(for: $0) } ?? lastFocusedByPid[pid]
-        if let focused, owned(focused) {
-            rememberFocus(focused)
-            if let el = elements[focused] { adapter.setFocused(el, raise: true) }
-            return
+        let live = adapter.focusedWindow(of: app).flatMap { adapter.windowId(for: $0) }
+        let remembered = lastFocusedByPid[pid]
+        func valid(_ id: UInt32?) -> UInt32? {
+            guard let id, ownedAnywhere(id), let w = windowAnywhere(id), hasAXElement(w) else { return nil }
+            return id
         }
-        if let focused, let spaceId = session.spaceContaining(cgWindowId: focused), spaceId != session.focusedSpace {
+        var candidate = valid(live)
+        if candidate == nil { candidate = valid(remembered?[session.focusedSpace]) }
+        if candidate == nil {
+            for sid in session.spaces.keys.sorted() {
+                if let id = valid(remembered?[sid]) {
+                    candidate = id
+                    break
+                }
+            }
+        }
+        guard let focused = candidate else { return }
+        if session.spaceContaining(cgWindowId: focused) == session.focusedSpace {
+            focusWindow(focused)
+        } else if let spaceId = session.spaceContaining(cgWindowId: focused) {
             var s = session
             s.spaces[spaceId]?.focusedWindow = focused
             session = s
             switchSpace(spaceId)
-            if let el = elements[focused] { adapter.setFocused(el, raise: true) }
+            focusWindow(focused)
         }
     }
 
@@ -1874,6 +2097,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 elements[id] = nil
                 adapter.forgetWindowId(id)
                 forgetBorn(id)
+                forgetLastFocus(id)
             }
         }
         for w in live {
