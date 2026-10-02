@@ -73,6 +73,50 @@ struct StashTests {
         #expect(unlandedSetFrameAction(live: elsewhere, display: display, alreadyRetried: true) == .float)
     }
 
+    @Test func tilingOpsPreserveOriginalFrame() {
+        var session = Session.empty(spaceCount: 1)
+        let first = Rect(x: 100, y: 100, w: 640, h: 480)
+        let second = Rect(x: 200, y: 200, w: 800, h: 600)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1, lastOnscreenFrame: first, originalFrame: first),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 2, pid: 2, lastOnscreenFrame: second, originalFrame: second),
+            usableIsWide: true
+        )
+        session = session.swap(space: SpaceId.require(1), a: 1, b: 2)
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.originalFrame == first)
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 2)?.leaf?.originalFrame == second)
+        let entries = session.collectStashEntries()
+        #expect(entries.first(where: { $0.cgWindowId == 1 })?.originalFrame == first)
+        #expect(entries.first(where: { $0.cgWindowId == 2 })?.originalFrame == second)
+    }
+
+    @Test func sessionFileRoundTripsOriginalFrame() throws {
+        let tile = Rect(x: 1, y: 2, w: 3, h: 4)
+        let original = Rect(x: 10, y: 20, w: 640, h: 480)
+        let file = SessionFile(
+            instanceId: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            bootSessionUUID: "boot",
+            focusedSpace: 1,
+            displayUUID: "disp",
+            stash: [StashEntry(cgWindowId: 10, pid: 20, bundleId: "com.apple.Terminal", lastOnscreenFrame: tile, originalFrame: original)]
+        )
+        let decoded = try SessionFile.decode(try SessionFile.encode(file))
+        #expect(decoded == file)
+        #expect(decoded.stash.first?.originalFrame == original)
+        // Files written before originalFrame existed still decode, with nil.
+        let legacy = """
+        {"instanceId":"00000000-0000-0000-0000-000000000001","bootSessionUUID":"boot","focusedSpace":1,"displayUUID":"disp","stash":[{"cgWindowId":10,"pid":20,"bundleId":"com.apple.Terminal","lastOnscreenFrame":{"x":1,"y":2,"w":3,"h":4}}]}
+        """
+        let legacyFile = try SessionFile.decode(Data(legacy.utf8))
+        #expect(legacyFile.stash.first?.originalFrame == nil)
+        #expect(legacyFile.stash.first?.lastOnscreenFrame == tile)
+    }
+
     @Test func sessionJSONRoundTripOmitsTree() throws {
         let file = SessionFile(
             instanceId: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,

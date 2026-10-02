@@ -120,6 +120,10 @@ public struct WindowRef: Equatable, Sendable, Codable {
     public var bundleId: String?
     public var role: WindowRole
     public var lastOnscreenFrame: Rect
+    /// Frame before Lumina first managed the window. Never overwritten by
+    /// tiling, so quitting can put windows back where the user had them.
+    /// Nil for windows born while already managed.
+    public var originalFrame: Rect?
     public var nativeFSBookmark: Bookmark?
     /// Starts at 0. Agent increments on own setFrame / stash / unstash.
     public var generation: UInt64
@@ -130,6 +134,7 @@ public struct WindowRef: Equatable, Sendable, Codable {
         bundleId: String? = nil,
         role: WindowRole = .tiled,
         lastOnscreenFrame: Rect = Rect(x: 0, y: 0, w: 0, h: 0),
+        originalFrame: Rect? = nil,
         nativeFSBookmark: Bookmark? = nil,
         generation: UInt64 = 0
     ) {
@@ -138,6 +143,7 @@ public struct WindowRef: Equatable, Sendable, Codable {
         self.bundleId = bundleId
         self.role = role
         self.lastOnscreenFrame = lastOnscreenFrame
+        self.originalFrame = originalFrame
         self.nativeFSBookmark = nativeFSBookmark
         self.generation = generation
     }

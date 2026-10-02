@@ -109,12 +109,16 @@ public struct StashEntry: Equatable, Sendable, Codable {
     public var pid: Int32
     public var bundleId: String?
     public var lastOnscreenFrame: Rect
+    /// Pre-tiling frame, when known. Lets a fresh agent or a quit restore the
+    /// user's own geometry instead of the last tile rect.
+    public var originalFrame: Rect?
 
-    public init(cgWindowId: UInt32, pid: Int32, bundleId: String?, lastOnscreenFrame: Rect) {
+    public init(cgWindowId: UInt32, pid: Int32, bundleId: String?, lastOnscreenFrame: Rect, originalFrame: Rect? = nil) {
         self.cgWindowId = cgWindowId
         self.pid = pid
         self.bundleId = bundleId
         self.lastOnscreenFrame = lastOnscreenFrame
+        self.originalFrame = originalFrame
     }
 }
 
@@ -192,11 +196,11 @@ extension Session {
             if id == exceptSpace { continue }
             for node in space.tiledLeaves() {
                 if let w = node.leaf {
-                    out.append(StashEntry(cgWindowId: w.cgWindowId, pid: w.pid, bundleId: w.bundleId, lastOnscreenFrame: w.lastOnscreenFrame))
+                    out.append(StashEntry(cgWindowId: w.cgWindowId, pid: w.pid, bundleId: w.bundleId, lastOnscreenFrame: w.lastOnscreenFrame, originalFrame: w.originalFrame))
                 }
             }
             for w in space.floating {
-                out.append(StashEntry(cgWindowId: w.cgWindowId, pid: w.pid, bundleId: w.bundleId, lastOnscreenFrame: w.lastOnscreenFrame))
+                out.append(StashEntry(cgWindowId: w.cgWindowId, pid: w.pid, bundleId: w.bundleId, lastOnscreenFrame: w.lastOnscreenFrame, originalFrame: w.originalFrame))
             }
         }
         return out
