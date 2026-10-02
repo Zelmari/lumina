@@ -34,8 +34,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var lastLuminaSpaceChange = Date.distantPast
     public var pasteboardCount: Int = 0
     public var moveStart: (UInt32, Point, Int)?
-    public var createDebounce: DispatchWorkItem?
+    public     var createDebounce: DispatchWorkItem?
     var pendingCreates: [AXUIElement] = []
+    /// Elements whose creation raced WindowServer/AX (no id yet, or only a
+    /// placeholder frame). Retried a bounded number of times, then dropped.
+    var pendingRetryElements: [AXUIElement] = []
+    /// When a window joined the session. Pruning never removes a window
+    /// younger than the grace period; it may just not be visible to AX/CG yet.
+    var bornAt: [UInt32: Date] = [:]
     public var resizeDebounce: DispatchWorkItem?
     public var configDebounce: DispatchWorkItem?
     let preferredDisplayUUID: String?
@@ -253,9 +259,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let onScreenIds = Set(cg.compactMap(cgWindowID))
         let ownerPids = Set(cg.compactMap(cgOwnerPID))
         let apps = NSWorkspace.shared.runningApplications
+        var index = 0
         for app in apps {
+            defer { index += 1 }
             if MutationQueue.shared.shouldSkip(started: started) {
-                log.info("collectManagedWindows exceeded 200ms; finishing on the next pass")
+                // Resume where we left off instead of dropping the tail pids.
+                let rest = apps[index...].map(\.processIdentifier)
+                log.info("collectManagedWindows exceeded 200ms; continuing with \(rest.count) pids")
+                MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, self.isCurrent, !self.userPaused else { return }
+                    for pid in rest { self.adoptWindows(pid: pid, apply: false) }
+                    self.applyFrames()
+                }
                 break
             }
             let pid = app.processIdentifier
@@ -281,6 +296,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
                 var w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: frame)
                 if result == .floating { w.role = .floating }
+                markBorn(id)
                 out.append(w)
             }
         }
@@ -471,13 +487,21 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return
         }
         if let frame = adapter.frame(of: element), isStashedAway(frame) {
-            log.info("onCreate skip stashed-away role=\(adapter.role(of: element) ?? "?")")
-            return
+            // A fresh window's first AX read can be an empty frame while it
+            // animates in; that is not our park. Our parks always keep height.
+            let empty = frame.w < 8 && frame.h < 8
+            if !empty {
+                log.info("onCreate skip stashed-away role=\(adapter.role(of: element) ?? "?")")
+                return
+            }
         }
         let peekId = adapter.windowId(for: element, excluding: claimed)
         let peekPid = adapter.pid(of: element)
         if let peekId, let peekPid, let sid = otherSpace(pid: peekPid, id: peekId, element: element) {
             claimed.insert(peekId)
+            observers.watchWindow(element, pid: peekPid)
+            adapter.rememberWindowId(peekId, for: element)
+            elements[peekId] = element
             restashPid(peekPid, on: sid)
             return
         }
@@ -490,6 +514,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             excludingWindowIds: claimed
         ) else {
             log.info("onCreate skip (no window id) role=\(adapter.role(of: element) ?? "?")")
+            retryCreate(element, attempts: 3)
             return
         }
         if let sid = otherSpace(pid: pid, id: id, element: element) {
@@ -501,11 +526,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return
         }
         if ownedAnywhere(id) {
-            claimed.insert(id)
-            observers.watchWindow(element, pid: pid)
-            adapter.rememberWindowId(id, for: element)
-            elements[id] = element
-            return
+            // CGWindowIDs get recycled. If the previous owner is dead, forget
+            // the stale binding and adopt this as a new window.
+            if let current = windowAnywhere(id), hasAXElement(current) {
+                claimed.insert(id)
+                observers.watchWindow(element, pid: pid)
+                adapter.rememberWindowId(id, for: element)
+                elements[id] = element
+                return
+            }
+            log.info("onCreate id reuse, forgetting dead owner id=\(id)")
+            adapter.forgetWindowId(id)
+            elements[id] = nil
         }
         if let stale = staleOwnedWindow(pid: pid, liveId: id, element: element) {
             log.info("rebind onCreate \(stale) -> \(id) bundle=\(input.bundleId ?? "?")")
@@ -518,7 +550,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         log.info(
             "onCreate \(input.bundleId ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
         )
-        if result == .unmanaged || result == .ignored { return }
+        if result == .unmanaged || result == .ignored {
+            // Classified from a placeholder frame (or before appearing
+            // on-screen): retry once settled instead of dropping forever.
+            if input.width < 50 || input.height < 50 || !input.isOnScreen {
+                retryCreate(element, attempts: 2)
+            }
+            return
+        }
         claimed.insert(id)
         observers.watchWindow(element, pid: pid)
         adapter.rememberWindowId(id, for: element)
@@ -542,6 +581,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             session = clamped
             placeFloated(floated)
         }
+        markBorn(id)
         if apply { applyFrames() }
     }
 
@@ -550,6 +590,45 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return id
         }
         return elements.first(where: { CFEqual($0.value, element) })?.key
+    }
+
+    func markBorn(_ id: UInt32) {
+        bornAt[id] = Date()
+        if bornAt.count > 2000 {
+            let cutoff = Date().addingTimeInterval(-120)
+            bornAt = bornAt.filter { $0.value > cutoff }
+        }
+    }
+
+    /// True within the grace period after a window joined the session. Fresh
+    /// windows are often briefly invisible to AX/CG; pruning them immediately
+    /// just forces a lossy re-adopt (or loses them entirely).
+    func isYoung(_ id: UInt32) -> Bool {
+        guard let b = bornAt[id] else { return false }
+        return Date().timeIntervalSince(b) < 5
+    }
+
+    func forgetBorn(_ id: UInt32) {
+        bornAt[id] = nil
+    }
+
+    /// Re-adopt a creation that raced the WindowServer (no id yet, or only a
+    /// placeholder frame). Bounded and deduped: each element retries at most
+    /// `attempts` more times, then is dropped.
+    func retryCreate(_ element: AXUIElement, attempts: Int) {
+        guard attempts > 0 else { return }
+        if pendingRetryElements.contains(where: { CFEqual($0, element) }) { return }
+        pendingRetryElements.append(element)
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            self.pendingRetryElements.removeAll(where: { CFEqual($0, element) })
+            guard self.isCurrent, !self.userPaused, !self.displayGone else { return }
+            if self.trackedId(matching: element).flatMap({ self.windowAnywhere($0) }) != nil { return }
+            self.onCreate(element)
+            if self.trackedId(matching: element).flatMap({ self.windowAnywhere($0) }) == nil {
+                self.retryCreate(element, attempts: attempts - 1)
+            }
+        }
     }
 
     func staleOwnedWindow(pid: pid_t, liveId: UInt32, element: AXUIElement) -> UInt32? {
@@ -622,6 +701,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 if wasFS { unstashSpace(session.focusedSpace) }
                 elements[id] = nil
                 adapter.forgetWindowId(id)
+                forgetBorn(id)
             }
         } else {
             log.info("destroy without cached id role=\(adapter.role(of: element) ?? "?")")
@@ -909,7 +989,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard var node = space.nodes[nodeId], var window = node.leaf,
                   let el = resolvedElement(for: window)
             else {
-                if let node = space.nodes[nodeId], let window = node.leaf, !liveIds.contains(window.cgWindowId) {
+                if let node = space.nodes[nodeId], let window = node.leaf, !liveIds.contains(window.cgWindowId),
+                   !isYoung(window.cgWindowId)
+                {
                     log.info("applyFrames missing window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
                     ghosts.append(window.cgWindowId)
                 }
@@ -963,6 +1045,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 session = session.removeWindow(space: session.focusedSpace, cgWindowId: id)
                 elements[id] = nil
                 adapter.forgetWindowId(id)
+                forgetBorn(id)
             }
             applyFrames(retryingAfterGhosts: true, retryingUnlanded: retryingUnlanded)
             return
@@ -1137,11 +1220,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             as? [[String: Any]] ?? []
         let live = Set(info.compactMap(cgWindowID))
         for spaceId in Array(session.spaces.keys) {
-            for id in session.visibleIds(on: spaceId) where !live.contains(id) {
+            for id in session.visibleIds(on: spaceId) where !live.contains(id) && !isYoung(id) {
                 log.info("prune missing window=\(id)")
                 session = session.removeWindow(space: spaceId, cgWindowId: id)
                 elements[id] = nil
                 adapter.forgetWindowId(id)
+                forgetBorn(id)
             }
         }
     }
@@ -1149,11 +1233,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func pruneGhostLeaves(space spaceId: SpaceId) {
         guard let space = session.spaces[spaceId] else { return }
         let windows = space.tiledLeaves().compactMap(\.leaf) + space.floating
-        for w in windows where !hasAXElement(w) {
+        for w in windows where !hasAXElement(w) && !isYoung(w.cgWindowId) {
             log.info("prune ghost window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") space=\(spaceId)")
             session = session.removeWindow(space: spaceId, cgWindowId: w.cgWindowId)
             elements[w.cgWindowId] = nil
             adapter.forgetWindowId(w.cgWindowId)
+            forgetBorn(w.cgWindowId)
         }
     }
 
@@ -1170,9 +1255,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let started = Date()
         let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let ownerPids = Set(info.compactMap(cgOwnerPID))
-        for app in NSWorkspace.shared.runningApplications {
+        let apps = NSWorkspace.shared.runningApplications
+        var index = 0
+        for app in apps {
+            defer { index += 1 }
             if MutationQueue.shared.shouldSkip(started: started) {
-                log.info("recoverManagedWindows exceeded 200ms; finishing on the next pass")
+                let rest = apps[index...].map(\.processIdentifier)
+                log.info("recoverManagedWindows exceeded 200ms; continuing with \(rest.count) pids")
+                MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self, self.isCurrent, !self.userPaused else { return }
+                    for pid in rest where !self.isOurProcess(pid) { self.adoptWindows(pid: pid, apply: false) }
+                    self.applyFrames()
+                }
                 break
             }
             let pid = app.processIdentifier
@@ -1629,6 +1723,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             session.nativeFSWindows.removeAll { $0.cgWindowId == id }
             elements[id] = nil
             adapter.forgetWindowId(id)
+            forgetBorn(id)
         }
         applyFrames()
     }
@@ -1706,8 +1801,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let live = collectManagedWindows()
         let liveIds = Set(live.map(\.cgWindowId))
         for node in session.current.tiledLeaves() {
-            if let id = node.leaf?.cgWindowId, !liveIds.contains(id) {
+            if let id = node.leaf?.cgWindowId, !liveIds.contains(id), !isYoung(id) {
                 session = session.remove(space: session.focusedSpace, node: node.id)
+                elements[id] = nil
+                adapter.forgetWindowId(id)
+                forgetBorn(id)
             }
         }
         for w in live {
