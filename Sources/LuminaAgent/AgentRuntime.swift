@@ -1313,10 +1313,23 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     log.info("setFrame timeout window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); will retry next pass")
                 }
             }
+            // A busy app can land the size but drop the position, leaving the
+            // window overlapping its neighbours. Re-issue once when the
+            // position is wrong. Size clamps are left alone on purpose:
+            // read-back size checks retried forever on apps like Ghostty.
+            if let live = adapter.frame(of: el), abs(live.x - rect.x) > 24 || abs(live.y - rect.y) > 24 {
+                log.info("layout retry window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?") live=\(Int(live.x)),\(Int(live.y)) target=\(Int(rect.x)),\(Int(rect.y))")
+                _ = adapter.setFrame(rect, of: el, tag: &window)
+            }
         }
         if let fs, let node = space.nodes[fs], var window = node.leaf, let el = resolvedElement(for: window) {
             if let live = adapter.frame(of: el), !framesClose(live, usable, slop: 2) {
                 _ = adapter.setFrame(usable, of: el, tag: &window)
+                if let retryLive = adapter.frame(of: el),
+                   abs(retryLive.x - usable.x) > 24 || abs(retryLive.y - usable.y) > 24
+                {
+                    _ = adapter.setFrame(usable, of: el, tag: &window)
+                }
             }
         }
         if var s = session.spaces[session.focusedSpace] {
@@ -1384,6 +1397,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 } else if result == .unknown {
                     log.info("continuation setFrame timeout window=\(window.cgWindowId)")
                 }
+            }
+            if let live = adapter.frame(of: el), abs(live.x - rect.x) > 24 || abs(live.y - rect.y) > 24 {
+                log.info("continuation retry window=\(window.cgWindowId) live=\(Int(live.x)),\(Int(live.y)) target=\(Int(rect.x)),\(Int(rect.y))")
+                _ = adapter.setFrame(rect, of: el, tag: &window)
             }
         }
     }
