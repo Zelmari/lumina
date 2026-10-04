@@ -68,8 +68,8 @@ public final class AXAdapter {
     }
 
     public func setSystemTimeout() {
-        let system = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(system, 0.05)
+        // Do not set a 50ms system-wide timeout; busy apps time out AX calls with -25201.
+        // Writes use axWriteTimeout (150ms) per element.
     }
 
     public func windowId(for element: AXUIElement, excluding: Set<UInt32> = []) -> UInt32? {
@@ -144,11 +144,7 @@ public final class AXAdapter {
         if let last = accessibilityWakeAt[pid], now.timeIntervalSince(last) < accessibilityWakeRetry { return }
         accessibilityWakeAt[pid] = now
         let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.05)
-        var err = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        if err == .attributeUnsupported {
-            err = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-        }
+        let err = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         if err == .success {
             accessibilityDelivered.insert(pid)
             log.info("ax wake pid=\(pid) bundle=\(bundleId(pid: pid) ?? "?")")
@@ -295,20 +291,23 @@ public final class AXAdapter {
         }
     }
 
-    /// AeroSpace wraps frame writes in `AXEnhancedUserInterface` so apps do not
-    /// animate the move. Returns a closure that restores the previous value.
+    /// In macOS Accessibility, AXEnhancedUserInterface is an application-level attribute.
+    /// When true, macOS forces animations on window moves and resizes. Setting it to false
+    /// temporarily disables window animations so moves and resizes snap immediately.
     private func disableAnimations(_ element: AXUIElement) -> () -> Void {
+        guard let pid = pid(of: element) else { return {} }
+        let app = AXUIElementCreateApplication(pid)
         let attr = "AXEnhancedUserInterface" as CFString
         var ref: CFTypeRef?
         var prior: Bool?
-        if AXUIElementCopyAttributeValue(element, attr, &ref) == .success {
+        if AXUIElementCopyAttributeValue(app, attr, &ref) == .success {
             prior = ref as? Bool
         }
-        AXUIElementSetAttributeValue(element, attr, kCFBooleanTrue)
-        return { [weak element] in
-            guard let element else { return }
-            let restore = prior ?? false
-            AXUIElementSetAttributeValue(element, attr, restore ? kCFBooleanTrue : kCFBooleanFalse)
+        AXUIElementSetAttributeValue(app, attr, kCFBooleanFalse)
+        return {
+            if let prior, prior == true {
+                AXUIElementSetAttributeValue(app, attr, kCFBooleanTrue)
+            }
         }
     }
 
