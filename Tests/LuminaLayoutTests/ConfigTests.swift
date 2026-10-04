@@ -178,6 +178,15 @@ struct ConfigTests {
         #expect(config.spaceCount == 5)
     }
 
+    @Test func applyReloadBlankTextKeepsCurrent() throws {
+        var current = try parseConfig(text: Config.bundledDefaultTOML).get()
+        current.spaceCount = 7
+        let (config, error) = applyReload(current: current, newText: "   \n\n")
+        #expect(error == nil)
+        #expect(config.spaceCount == 7)
+        #expect(config == current)
+    }
+
     @Test func keycodesMatchDesignTable() {
         #expect(VirtualKey.table["h"] == 0x04)
         #expect(VirtualKey.table["j"] == 0x26)

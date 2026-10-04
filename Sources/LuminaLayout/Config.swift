@@ -340,7 +340,7 @@ public func loadOrDefault(text: String?, bundledDefault: String = Config.bundled
 }
 
 public func applyReload(current: Config, newText: String) -> (config: Config, error: String?) {
-    switch parseConfig(text: newText) {
+    switch parseConfig(text: newText, defaults: current) {
     case .success(let c):
         return (c, nil)
     case .failure(let e):
