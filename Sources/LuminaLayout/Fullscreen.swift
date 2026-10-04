@@ -48,6 +48,8 @@ extension Session {
             w.role = .luminaFS
             node.leaf = w
             space.nodes[leaf] = node
+            space.focusedWindow = w.cgWindowId
+            space.lastTiledLeaf = leaf
         }
         session.spaces[spaceId] = space
         let others = Set(session.visibleIds(on: spaceId).filter { id in

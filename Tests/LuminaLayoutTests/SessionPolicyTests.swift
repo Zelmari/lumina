@@ -367,6 +367,22 @@ struct SpaceSwitchTests {
         #expect(session[SpaceId.require(1)]!.leaf(containing: 2)?.leaf?.role == .tiled)
     }
 
+    @Test func enterLuminaFSFromNonFocusedLeafFocusesIt() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 2, pid: 2), usableIsWide: true)
+        var space = session[SpaceId.require(1)]!
+        space.focusedWindow = 2
+        session.spaces[SpaceId.require(1)] = space
+        let leaf1 = session[SpaceId.require(1)]!.leaf(containing: 1)!.id
+        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: leaf1)
+        let entered = session[SpaceId.require(1)]!
+        #expect(entered.focusedWindow == 1)
+        #expect(entered.lastTiledLeaf == leaf1)
+        session = session.toggleLuminaFS(space: SpaceId.require(1))
+        #expect(session[SpaceId.require(1)]!.luminaFullscreen == nil)
+    }
+
     @Test func newTiledDuringLuminaFSIsSliveredInTree() {
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
