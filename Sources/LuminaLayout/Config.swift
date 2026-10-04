@@ -268,7 +268,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
 
     var bindings: [Binding] = []
     var seen: [Chord: Int] = [:]
-    for (chordRaw, commandRaw) in raw.bindings ?? [:] {
+    for (chordRaw, commandRaw) in (raw.bindings ?? [:]).sorted(by: { $0.key < $1.key }) {
         guard let chord = parseChord(chordRaw) else {
             return .failure(ConfigError("unknown chord: \(chordRaw)"))
         }

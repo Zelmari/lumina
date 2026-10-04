@@ -130,6 +130,28 @@ struct ConfigTests {
         #expect(h[0].command == .focus(.right))
     }
 
+    @Test func duplicateNormalizedChordLastWinsDeterministically() throws {
+        // `alt-cmd-h` drops the unsupported `cmd` modifier, so both raw keys
+        // normalize to the same chord. The lexicographically later key wins.
+        let text = """
+        space-count = 5
+        focus-follows-mouse = false
+        launch-tiling = "z-order"
+        launch-apps = []
+        [gaps]
+        inner = 8
+        outer = 8
+        [bindings]
+        alt-cmd-h = "focus left"
+        alt-h = "focus right"
+        """
+        let config = try parseConfig(text: text).get()
+        let h = config.bindings.filter { $0.chord.keyName == "h" && !$0.chord.shift }
+        #expect(h.count == 1)
+        #expect(h[0].command == .focus(.right))
+        #expect(config.diagnostics.contains(where: { $0.contains("duplicate chord") }))
+    }
+
     @Test func applySpaceCountPoursOntoSpace1() {
         var session = Session.empty(spaceCount: 7)
         session.focusedSpace = SpaceId.require(7)
