@@ -27,7 +27,11 @@ public final class AgentSocketServer {
         addr.sun_family = sa_family_t(AF_UNIX)
         let maxLen = unixSocketPathMaxBytes
         let pathBytes = Array(path.utf8)
-        guard pathBytes.count <= maxLen else { throw POSIXError(.ENAMETOOLONG) }
+        guard pathBytes.count <= maxLen else {
+            close(listenFD)
+            listenFD = -1
+            throw POSIXError(.ENAMETOOLONG)
+        }
         withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
             ptr.withMemoryRebound(to: UInt8.self, capacity: maxLen + 1) { buf in
                 for (i, b) in pathBytes.enumerated() { buf[i] = b }
@@ -42,10 +46,17 @@ public final class AgentSocketServer {
         }
         guard bindOK else {
             let code = POSIXError.Code(rawValue: errno) ?? .EADDRINUSE
+            close(listenFD)
+            listenFD = -1
             throw POSIXError(code)
         }
         chmod(path, 0o600)
-        listen(listenFD, 8)
+        guard listen(listenFD, 8) == 0 else {
+            let code = POSIXError.Code(rawValue: errno) ?? .EADDRINUSE
+            close(listenFD)
+            listenFD = -1
+            throw POSIXError(code)
+        }
         let src = DispatchSource.makeReadSource(fileDescriptor: listenFD, queue: queue)
         src.setEventHandler { [weak self] in self?.acceptOne() }
         src.resume()
