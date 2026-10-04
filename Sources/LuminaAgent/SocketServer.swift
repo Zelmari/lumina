@@ -80,6 +80,16 @@ public final class AgentSocketServer {
             close(client)
             return
         }
+        // A client that stops reading must not block the serial queue in
+        // write; time the send out so a stalled reader fails instead.
+        var sendTimeout = timeval(tv_sec: 2, tv_usec: 0)
+        _ = setsockopt(
+            client,
+            SOL_SOCKET,
+            SO_SNDTIMEO,
+            &sendTimeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
         queue.async { self.serve(client) }
     }
 
@@ -123,13 +133,37 @@ public final class AgentSocketServer {
                     response = IPCResponse.failure(id: id, error: "unknown cmd")
                 }
                 if let encoded = try? encode(response), let data = encoded.data(using: .utf8) {
-                    _ = data.withUnsafeBytes { raw in
-                        write(fd, raw.baseAddress, data.count)
+                    guard writeAll(fd, data) else {
+                        close(fd)
+                        return
                     }
                 }
             }
         }
         close(fd)
+    }
+
+    /// Write every byte of `data`, bounded by the client fd's `SO_SNDTIMEO`
+    /// plus a total deadline. Returns false if the peer stops reading, so the
+    /// caller can drop the connection instead of holding the serial queue.
+    private func writeAll(_ fd: Int32, _ data: Data) -> Bool {
+        let deadline = DispatchTime.now() + 2.0
+        var offset = 0
+        return data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return true }
+            while offset < data.count {
+                if DispatchTime.now() >= deadline { return false }
+                let n = write(fd, base + offset, data.count - offset)
+                if n > 0 {
+                    offset += n
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
     }
 }
 #endif
