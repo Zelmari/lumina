@@ -69,6 +69,17 @@ than a few minutes.
 - `shouldSuspendMassRemoval` only guards the lock screen. It is not a general
   "lots of windows disappeared" guard.
 
+## Focus and activation
+
+- App activation fires for many reasons (Dock click, cmd-tab, our own
+  `activate()` calls). Following the activated window to its model space
+  teleports the user between workspaces, and re-raising it on every
+  activation makes app switches flicker. Remember focus; do not switch or
+  raise.
+- Re-writing every tile frame on every refresh makes apps repaint and
+  flicker even when nothing changed. Skip windows already at their tile;
+  write only when needed, then verify and retry once.
+
 ## Build, deploy, test
 
 - `swift build` only writes `.build/`. The menu extra launches
