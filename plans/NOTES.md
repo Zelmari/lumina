@@ -7,6 +7,13 @@ than a few minutes.
 
 - `AXWindows` can succeed but omit a live window. Seen with Ghostty, Safari,
   and Electron apps. One enumeration missing a window is not proof it closed.
+- Adopt the frontmost app's `kAXFocusedWindowAttribute` window on every
+  refresh. It is readable even when `AXWindows` is empty, and it is how
+  AeroSpace picks up Chromium/Electron windows without any accessibility
+  wake-up flag.
+- Never GC a model window just because one AX enumeration omitted it. Real
+  removal is CG's call; AeroSpace revalidates cached elements directly and
+  treats the window list as additive.
 - The read can also fail outright (`kAXErrorCannotComplete`) under the 50ms
   messaging timeout. "Failed" and "empty" are different: a failed read says
   nothing; a successful empty list is evidence. `enumerateWindows` keeps them
@@ -71,14 +78,24 @@ than a few minutes.
 
 ## Focus and activation
 
-- App activation fires for many reasons (Dock click, cmd-tab, our own
-  `activate()` calls). Following the activated window to its model space
-  teleports the user between workspaces, and re-raising it on every
-  activation makes app switches flicker. Remember focus; do not switch or
-  raise.
+- Follow the activated app to the workspace containing its focused window,
+  but only when the native focused window id changed since the last sync.
+  Re-processing the same window on every activation caused focus ping-pong
+  between apps (AeroSpace's `lastKnownNativeFocusedWindowId` guard).
 - Re-writing every tile frame on every refresh makes apps repaint and
-  flicker even when nothing changed. Skip windows already at their tile;
-  write only when needed, then verify and retry once.
+  flicker even when nothing changed. Skip windows already at their tile.
+- Do not read back and retry a frame write because it "did not land": apps
+  clamp sizes (Ghostty snaps to its terminal grid) and macOS clamps park
+  positions, so the check never passes and retries forever. Re-issue on the
+  next refresh instead, as AeroSpace does.
+
+## Hiding windows
+
+- macOS never lets a window go fully off screen. Park just past a screen
+  corner, position only, and accept the clamp; a 1px sliver stays visible.
+  Do not verify the parked position against the requested one.
+- Treat a window already outside the visible area as parked and leave it
+  alone. Re-park only when it is back on screen.
 
 ## Build, deploy, test
 
