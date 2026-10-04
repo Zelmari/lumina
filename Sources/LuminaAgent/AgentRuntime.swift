@@ -428,6 +428,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 // A model window may already be dead (Electron AX churn). A
                 // space full of ghosts must not count as occupied, or macOS
                 // promoting the next app after a close drags the user away.
+                // An empty workspace is a valid place to be, so only the
+                // predicate decides; it declines to follow without windows.
                 let hasWindows = self.session.visibleIds(on: self.session.focusedSpace).contains { id in
                     guard let w = self.windowAnywhere(id) else { return false }
                     return self.hasAXElement(w)
@@ -438,10 +440,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 let elapsedSinceClose = Date().timeIntervalSince(self.lastWindowClosedAt)
                 let elapsedSinceSpaceChange = Date().timeIntervalSince(self.lastLuminaSpaceChange)
                 let isWindowCloseCascade = elapsedSinceClose < 0.4
-                let shouldFollow = !isWindowCloseCascade && (shouldFollowAppActivation(
+                let shouldFollow = !isWindowCloseCascade && shouldFollowAppActivation(
                     spaceHasWindows: hasWindows,
                     elapsedSinceSpaceChange: elapsedSinceSpaceChange
-                ) || (!hasWindows && elapsedSinceSpaceChange > 0.4))
+                )
                 guard shouldFollow else {
                     self.restashOffspace()
                     return
