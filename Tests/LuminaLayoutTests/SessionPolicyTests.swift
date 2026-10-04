@@ -456,6 +456,11 @@ struct SpaceSwitchTests {
         session.spaces[SpaceId.require(1)] = space
         let fsLeaf = session[SpaceId.require(1)]!.leaf(containing: 1)!.id
         session = session.enterLuminaFS(space: SpaceId.require(1), leaf: fsLeaf)
+        // `enterLuminaFS` focuses the fullscreen leaf; a floater can still own
+        // focus (FFM, focus commands), which is the branch under test.
+        var fsSpace = session[SpaceId.require(1)]!
+        fsSpace.focusedWindow = 2
+        session.spaces[SpaceId.require(1)] = fsSpace
         session = session.floatToggle(space: SpaceId.require(1), usableIsWide: true)
         let after = session[SpaceId.require(1)]!
         #expect(after.luminaFullscreen == fsLeaf)
