@@ -36,19 +36,29 @@ public struct RebindPair: Equatable, Sendable, Comparable {
 }
 
 /// What changed between the model and a fresh enumeration. `added` and
-/// `removed` exclude ids that became rebinds. Sorted for deterministic tests.
+/// `removed` exclude ids that became rebinds. `recycled` holds ids that are
+/// still live but now belong to a different pid: the CGWindowID was reused,
+/// so the old model entry must be torn down and the live window re-adopted.
+/// Sorted for deterministic tests.
 public struct ReconcileDelta: Equatable, Sendable {
     public var added: [UInt32]
     public var removed: [UInt32]
     public var rebinds: [RebindPair]
+    public var recycled: [UInt32]
 
-    public init(added: [UInt32] = [], removed: [UInt32] = [], rebinds: [RebindPair] = []) {
+    public init(
+        added: [UInt32] = [],
+        removed: [UInt32] = [],
+        rebinds: [RebindPair] = [],
+        recycled: [UInt32] = []
+    ) {
         self.added = added
         self.removed = removed
         self.rebinds = rebinds
+        self.recycled = recycled
     }
 
-    public var isEmpty: Bool { added.isEmpty && removed.isEmpty && rebinds.isEmpty }
+    public var isEmpty: Bool { added.isEmpty && removed.isEmpty && rebinds.isEmpty && recycled.isEmpty }
 }
 
 /// Diff the model's ids against a live enumeration. A pid that lost exactly
@@ -64,6 +74,14 @@ public func reconcile(
 
     let removedIds = model.subtracting(liveById.keys)
     let addedIds = Set(liveById.keys).subtracting(model)
+    // Same id on both sides but a different owner: the CGWindowID was
+    // recycled while the model still points at the old window. These stay out
+    // of added/removed and the rebind pairing; the agent tears the old entry
+    // down and re-adopts the live window.
+    let recycledIds = model.filter { id in
+        guard let liveWindow = liveById[id], let modelPid = modelPids[id] else { return false }
+        return modelPid != liveWindow.pid
+    }
 
     var removedByPid: [Int32: [UInt32]] = [:]
     for id in removedIds {
@@ -87,7 +105,8 @@ public func reconcile(
     return ReconcileDelta(
         added: addedIds.subtracting(rebindTo).sorted(),
         removed: removedIds.subtracting(rebindFrom).sorted(),
-        rebinds: rebinds.sorted()
+        rebinds: rebinds.sorted(),
+        recycled: recycledIds.sorted()
     )
 }
 

@@ -69,6 +69,41 @@ struct ReconcileTests {
         #expect(delta.added == [8])
     }
 
+    @Test func sameIdNewPidIsRecycledNotAddedOrRemoved() {
+        let delta = reconcile(
+            model: [7],
+            modelPids: [7: 10],
+            live: [live(7, pid: 20)]
+        )
+        #expect(delta.recycled == [7])
+        #expect(delta.added.isEmpty)
+        #expect(delta.removed.isEmpty)
+        #expect(delta.rebinds.isEmpty)
+        #expect(!delta.isEmpty)
+    }
+
+    @Test func sameIdSamePidIsNotRecycled() {
+        let delta = reconcile(
+            model: [7],
+            modelPids: [7: 10],
+            live: [live(7, pid: 10)]
+        )
+        #expect(delta.recycled.isEmpty)
+        #expect(delta.isEmpty)
+    }
+
+    @Test func recycledIdDoesNotPairAsRebind() {
+        let delta = reconcile(
+            model: [7],
+            modelPids: [7: 10],
+            live: [live(7, pid: 20), live(8, pid: 10)]
+        )
+        #expect(delta.recycled == [7])
+        #expect(delta.added == [8])
+        #expect(delta.removed.isEmpty)
+        #expect(delta.rebinds.isEmpty)
+    }
+
     @Test func rebindsPerPidAreIndependentAndSorted() {
         let delta = reconcile(
             model: [7, 30],

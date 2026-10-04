@@ -656,7 +656,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         defer {
             recordRefreshSummary(
                 reason: reason,
-                added: delta.added.count,
+                added: delta.added.count + delta.recycled.count,
                 removed: removals.real.count,
                 rebinds: delta.rebinds.count,
                 unresolved: refreshUnresolved,
@@ -686,8 +686,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             refreshUnresolved = true
         }
         let focusedBefore = session.current.focusedWindow
-        for id in removals.real { removeDestroyedWindow(id) }
-        if !delta.removed.isEmpty, session.current.focusedWindow != focusedBefore,
+        // A recycled id is torn down like a removal, then re-adopted from the
+        // live enumeration below, so its old model entry must go first.
+        for id in removals.real + delta.recycled { removeDestroyedWindow(id) }
+        if (!delta.removed.isEmpty || !delta.recycled.isEmpty), session.current.focusedWindow != focusedBefore,
            let winner = session.current.focusedWindow
         {
             // Stay on this (possibly now empty) space; only re-home focus when
@@ -701,7 +703,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             reclassifyRebound(id: pair.to, pid: w.pid, element: el, onScreen: onScreen)
         }
         var claimed = session.allWindowIds.union(elements.keys)
-        for id in delta.added {
+        for id in delta.added + delta.recycled {
             guard let el = elementsById[id] else { continue }
             onCreate(el, claimed: &claimed, apply: false, space: space)
         }
@@ -709,7 +711,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         restashOffspace()
         if !delta.isEmpty || refreshUnresolved || !removals.deferred.isEmpty {
             let ms = Int(Date().timeIntervalSince(started) * 1000)
-            log.info("refresh reason=\(reason) added=\(delta.added.count) removed=\(removals.real.count) deferred=\(removals.deferred.count) rebinds=\(delta.rebinds.count) unresolved=\(refreshUnresolved) \(ms)ms")
+            log.info("refresh reason=\(reason) added=\(delta.added.count + delta.recycled.count) removed=\(removals.real.count) deferred=\(removals.deferred.count) rebinds=\(delta.rebinds.count) unresolved=\(refreshUnresolved) \(ms)ms")
         }
         if refreshUnresolved, unresolvedRefreshPasses < 2 {
             unresolvedRefreshPasses += 1
