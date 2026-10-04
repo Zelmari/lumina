@@ -13,7 +13,7 @@ enum LuminaCLI {
             case .version:
                 writeOut("lumina 0.1.0")
             case .debug:
-                writeOut("LUMINA_DEBUG=1")
+                writeOut("LUMINA_DEBUG=\(ProcessInfo.processInfo.environment["LUMINA_DEBUG"] ?? "0")")
             }
             exit(0)
         }
