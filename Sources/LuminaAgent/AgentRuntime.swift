@@ -323,6 +323,33 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 out.append(w)
             }
         }
+        if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier,
+           !isOurProcess(front),
+           !out.contains(where: { $0.pid == front }),
+           let focusedEl = adapter.focusedWindow(of: AXUIElementCreateApplication(front)),
+           adapter.windowId(for: focusedEl) != nil,
+           let (input, id, pid) = classifyInput(
+               from: focusedEl,
+               adapter: adapter,
+               bound: bound,
+               onScreenIds: onScreenIds,
+               excludingWindowIds: Set(out.map(\.cgWindowId))
+           ),
+           !out.contains(where: { $0.cgWindowId == id })
+        {
+            let result = classify(input, rules: config.windowRules)
+            if result != .unmanaged && result != .ignored {
+                observers.watchWindow(focusedEl, pid: pid)
+                adapter.rememberWindowId(id, for: focusedEl)
+                elements[id] = focusedEl
+                let frame = adapter.frame(of: focusedEl) ?? Rect(x: 0, y: 0, w: 0, h: 0)
+                let w = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
+                knownOriginals[id] = w.originalFrame ?? frame
+                markBorn(id)
+                out.append(w)
+                log.info("adopt focused window at boot pid=\(pid) id=\(id) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
+            }
+        }
         // front-to-back: CG list is front-to-back already (index 0 frontmost)
         let order = cg.compactMap(cgWindowID)
         out.sort { a, b in
@@ -497,6 +524,33 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Chromium/Electron can answer AXWindows with an empty or partial list.
+    /// The frontmost app's focused window is still readable, so adopt it even
+    /// when the enumeration misses it (AeroSpace does this on every refresh).
+    @discardableResult
+    func adoptFocusedWindow(
+        pid: pid_t,
+        live: inout [LiveWindow],
+        elementsById: inout [UInt32: AXUIElement],
+        onScreen: Set<UInt32>
+    ) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        guard let el = adapter.focusedWindow(of: app), let id = adapter.windowId(for: el) else { return false }
+        guard !elementsById.keys.contains(id) else { return false }
+        let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
+        live.append(LiveWindow(
+            cgWindowId: id,
+            pid: pid,
+            bundleId: adapter.bundleId(pid: pid),
+            frame: frame,
+            onScreen: onScreen.contains(id)
+        ))
+        elementsById[id] = el
+        adapter.markAccessibilityHealthy(pid: pid)
+        log.info("adopt focused window pid=\(pid) id=\(id) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
+        return true
+    }
+
     /// One declarative pass: re-read every relevant app's AX window list, GC
     /// windows that are gone, rebind replaced ids, adopt new ones, then lay
     /// out. Convergence by repetition; no per-event repair.
@@ -563,6 +617,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     elementsById[id] = el
                 }
             }
+        }
+        if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier, !isOurProcess(front) {
+            _ = adoptFocusedWindow(pid: front, live: &live, elementsById: &elementsById, onScreen: onScreen)
         }
         let failedManaged = axFailedPids.intersection(Set(modelPids.values))
         let unmanagedFailed = onScreenRows.contains { row in
