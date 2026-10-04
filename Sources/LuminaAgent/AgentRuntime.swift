@@ -992,6 +992,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         resizeDebounce[id]?.cancel()
         resizeDebounce[id] = nil
+        if let element = elements[id] {
+            // Rebound elements can be replaced without a destroyed note; drop
+            // their observer registrations explicitly.
+            observers.forgetWindow(element)
+        }
         elements[id] = nil
         adapter.forgetWindowId(id)
         forgetBorn(id)

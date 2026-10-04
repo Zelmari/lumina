@@ -85,6 +85,23 @@ public final class AXObserverHub: @unchecked Sendable {
         if watchedWindows[pid]?.isEmpty == true { watchedWindows[pid] = nil }
     }
 
+    /// Stop watching `element` even when it never sent a destroyed
+    /// notification (rebinds and model-side removals). Hops to main, where
+    /// the observer run-loop source and `watchedWindows` are owned.
+    public func forgetWindow(_ element: AXUIElement) {
+        if !Thread.isMainThread {
+            nonisolated(unsafe) let token = Unmanaged.passRetained(element).toOpaque()
+            DispatchQueue.main.async { [weak self] in
+                let element = Unmanaged<AXUIElement>.fromOpaque(token).takeRetainedValue()
+                self?.forgetWindow(element)
+            }
+            return
+        }
+        var pid: pid_t = 0
+        AXUIElementGetPid(element, &pid)
+        unwatchWindow(element, pid: pid)
+    }
+
     public func unwatch(pid: pid_t) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in self?.unwatch(pid: pid) }
