@@ -177,6 +177,39 @@ struct PathTests {
         )
     }
 
+    @Test func supportFallbackWinsWhenItFits() {
+        let tmpdir = "/var/folders/lf/gqssmzzn47z1rt274bk0cc780000gn/T"
+        let uuid = "8A29DD3F-0A9E-4CF5-8B1B-F2FDBED3BE43"
+        let support = "/tmp/lumina-support"
+        let paths = LuminaPaths.agentSocketPath(
+            uid: 501,
+            tmpdir: tmpdir,
+            instanceId: uuid,
+            supportFallback: support
+        )
+        #expect(!unixSocketPathFits(paths.primary))
+        #expect(unixSocketPathFits(paths.fallback ?? ""))
+        let resolved = LuminaPaths.resolvedAgentSocketPath(
+            uid: 501,
+            tmpdir: tmpdir,
+            instanceId: uuid,
+            supportFallback: support
+        )
+        #expect(resolved == paths.fallback)
+    }
+
+    @Test func overlongInstanceIdShortensFinalFallback() {
+        let instanceId = String(repeating: "a", count: 100)
+        let resolved = LuminaPaths.resolvedAgentSocketPath(
+            uid: 501,
+            tmpdir: "/var/folders/lf/gqssmzzn47z1rt274bk0cc780000gn/T",
+            instanceId: instanceId,
+            supportFallback: "/Users/zelmari/Library/Application Support/Lumina"
+        )
+        #expect(unixSocketPathFits(resolved))
+        #expect(resolved == "/tmp/lumina-501/2885d0ac2e5a9d79.sock")
+    }
+
     @Test func shortTmpdirKeepsDesignedAgentSocket() {
         let resolved = LuminaPaths.resolvedAgentSocketPath(
             uid: 501,

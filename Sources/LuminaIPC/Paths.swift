@@ -10,6 +10,18 @@ public func unixSocketPathFits(_ path: String) -> Bool {
     path.utf8.count <= unixSocketPathMaxBytes
 }
 
+/// FNV-1a 64-bit hash of `instanceId`, rendered as 16 lowercase hex chars.
+/// Deterministic and Foundation-only so agent, extra, and CLI agree.
+private func shortInstanceId(_ instanceId: String) -> String {
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for byte in instanceId.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x0000_0100_0000_01b3
+    }
+    let hex = String(hash, radix: 16)
+    return String(repeating: "0", count: 16 - hex.count) + hex
+}
+
 public enum LuminaPaths {
     public static func runtimeRoot(uid: uid_t, tmpdir: String) -> String {
         "\(tmpdir)/lumina-\(uid)"
@@ -57,7 +69,7 @@ public enum LuminaPaths {
             "/tmp/lumina-\(uid)/\(instanceId).sock",
         ].compactMap { $0 }
         return candidates.first(where: unixSocketPathFits)
-            ?? "/tmp/lumina-\(uid)/\(instanceId).sock"
+            ?? "/tmp/lumina-\(uid)/\(shortInstanceId(instanceId)).sock"
     }
 
     public static func sessionPath(supportRoot: String, instanceId: String) -> String {
