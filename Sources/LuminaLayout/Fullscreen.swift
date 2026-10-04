@@ -103,9 +103,10 @@ extension Session {
         case .tiled:
             let fullscreenId = spaces[spaceId]?.luminaFullscreen
             let fullscreenWindow = fullscreenId.flatMap { spaces[spaceId]?.nodes[$0]?.leaf?.cgWindowId }
+            let previousLeaf = spaces[spaceId]?.lastTiledLeaf
             var session = insertSpiral(space: spaceId, newLeaf: window, usableIsWide: usableIsWide)
             if let space = session.spaces[spaceId], space.luminaFullscreen != nil,
-               let newId = space.lastTiledLeaf
+               let newId = space.lastTiledLeaf, newId != previousLeaf
             {
                 let newWindow = space.nodes[newId]?.leaf?.cgWindowId
                 session = session.markStashed(

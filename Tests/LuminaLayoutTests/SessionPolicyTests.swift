@@ -409,6 +409,64 @@ struct SpaceSwitchTests {
         #expect(session[SpaceId.require(1)]!.floating.first(where: { $0.cgWindowId == 3 })?.role == .floating)
     }
 
+    @Test func floatToggleRetileDuringLuminaFSStashesWindow() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
+        var space = session[SpaceId.require(1)]!
+        space.floating.append(WindowRef(cgWindowId: 2, pid: 2, role: .floating))
+        space.focusedWindow = 2
+        session.spaces[SpaceId.require(1)] = space
+        let fsLeaf = session[SpaceId.require(1)]!.leaf(containing: 1)!.id
+        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: fsLeaf)
+        session = session.floatToggle(space: SpaceId.require(1), usableIsWide: true)
+        let after = session[SpaceId.require(1)]!
+        #expect(after.luminaFullscreen == fsLeaf)
+        #expect(after.floating.isEmpty)
+        #expect(after.leaf(containing: 2)?.leaf?.role == .stashed)
+    }
+
+    @Test func tileFloaterDuringLuminaFSStashesWindow() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
+        var space = session[SpaceId.require(1)]!
+        space.floating.append(WindowRef(cgWindowId: 2, pid: 2, role: .floating))
+        session.spaces[SpaceId.require(1)] = space
+        let fsLeaf = session[SpaceId.require(1)]!.leaf(containing: 1)!.id
+        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: fsLeaf)
+        session = session.tileFloater(space: SpaceId.require(1), cgWindowId: 2, usableIsWide: true)
+        let after = session[SpaceId.require(1)]!
+        #expect(after.luminaFullscreen == fsLeaf)
+        #expect(after.floating.isEmpty)
+        #expect(after.leaf(containing: 2)?.leaf?.role == .stashed)
+    }
+
+    @Test func failedInsertDuringLuminaFSLeavesFSWindowUnstashed() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
+        let leaf1 = session[SpaceId.require(1)]!.root!
+        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: leaf1)
+        // Corrupt the FS leaf so `insertSpiral` no-ops: a non-leaf node with a
+        // dangling child. `lastTiledLeaf` still points at the FS leaf, so a
+        // failed insert must not stash the visible fullscreen window.
+        var space = session[SpaceId.require(1)]!
+        if var corrupted = space.nodes[leaf1] {
+            corrupted.children = [NodeId(raw: 999)]
+            space.nodes[leaf1] = corrupted
+        }
+        session.spaces[SpaceId.require(1)] = space
+        session = session.insertWhileLuminaFS(
+            space: SpaceId.require(1),
+            window: WindowRef(cgWindowId: 2, pid: 2),
+            result: .tiled,
+            usableIsWide: true
+        )
+        let after = session[SpaceId.require(1)]!
+        #expect(after.leaf(containing: 2) == nil)
+        #expect(after.nodes[leaf1]?.leaf?.role == .luminaFS)
+        #expect(after.focusedWindow == 1)
+        #expect(after.lastTiledLeaf == leaf1)
+    }
+
     @Test func closeLuminaFSLeafClearsFlag() {
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
