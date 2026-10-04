@@ -108,6 +108,11 @@ public final class AXAdapter {
             tracked[old] = nil
             idCache = idCache.filter { $0.value != old }
         }
+        if let previous = tracked[id], !CFEqual(previous, element) {
+            let key = elementKey(previous)
+            idCache[key] = nil
+            minSizeCache[key] = nil
+        }
         idCache[elementKey(element)] = id
         tracked[id] = element
     }
