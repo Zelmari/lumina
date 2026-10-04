@@ -1119,11 +1119,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let fs = space.luminaFullscreen
         let liveIds = cgWindowIds()
         var ghosts: [UInt32] = []
+        var budgetBroke = false
+        var visited: Set<NodeId> = []
         for (nodeId, rect) in rects {
             if MutationQueue.shared.shouldSkip(started: started) {
-                log.info("layout pass exceeded 200ms; skipping remaining windows")
+                budgetBroke = true
+                log.info("layout pass exceeded 200ms; rescheduling remaining windows")
                 break
             }
+            visited.insert(nodeId)
             if let fs, fs != nodeId { continue }
             guard var node = space.nodes[nodeId], var window = node.leaf,
                   let el = resolvedElement(for: window)
@@ -1172,6 +1176,54 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             applyFrames()
             return
+        }
+        if budgetBroke, isCurrent, !userPaused, !displayGone {
+            // One continuation pass covers exactly the windows this pass
+            // skipped, so a hot spot in front of the loop never leaves a tile
+            // at a stale frame until some unrelated event.
+            let deferredNodes = rects.keys.filter { !visited.contains($0) && $0 != fs }
+            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self, self.isCurrent, !self.userPaused, !self.displayGone else { return }
+                let pending = self.framePending(spaceId: self.session.focusedSpace, nodeIds: deferredNodes)
+                guard !pending.isEmpty else { return }
+                log.info("layout continuation windows=\(pending.count)")
+                self.applyLayout(pending)
+            }
+        }
+    }
+
+    /// Frames for `nodeIds`, recomputed after the budget break (the tree may
+    /// have moved on). All tiled leaves are returned; `applyLayout` applies
+    /// exactly these rects.
+    func framePending(spaceId: SpaceId, nodeIds: [NodeId]) -> [NodeId: Rect] {
+        guard let bound, let space = session.spaces[spaceId] else { return [:] }
+        let wanted = Set(nodeIds)
+        let usable = bound.usableRect(gaps: config.gaps)
+        return frames(space: space, usable: usable, gaps: config.gaps).filter { wanted.contains($0.key) }
+    }
+
+    /// Apply a subset of frames, without the ghost/budget machinery.
+    func applyLayout(_ rects: [NodeId: Rect]) {
+        let space = session.current
+        let fs = space.luminaFullscreen
+        for (nodeId, rect) in rects {
+            if let fs, fs != nodeId { continue }
+            guard var node = space.nodes[nodeId], var window = node.leaf,
+                  let el = resolvedElement(for: window)
+            else { continue }
+            window.lastOnscreenFrame = rect
+            let result = adapter.setFrame(rect, of: el, tag: &window)
+            node.leaf = window
+            var s = session.spaces[session.focusedSpace]
+            s?.setNode(node)
+            if let s { session.spaces[session.focusedSpace] = s }
+            if result != .ok {
+                if case .rejected(let err) = result {
+                    log.info("continuation setFrame rejected(\(err.rawValue)) window=\(window.cgWindowId)")
+                } else if result == .unknown {
+                    log.info("continuation setFrame timeout window=\(window.cgWindowId)")
+                }
+            }
         }
     }
 
