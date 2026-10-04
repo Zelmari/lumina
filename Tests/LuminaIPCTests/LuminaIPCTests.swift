@@ -145,28 +145,33 @@ struct PathTests {
         #expect(paths.primary == "/tmp/lumina-501/spaces/abc/agent.sock")
         #expect(paths.fallback == "/Users/me/Library/Application Support/Lumina/spaces/abc/agent.sock")
         #expect(LuminaPaths.menuSocketPath(uid: 501, tmpdir: "/tmp") == "/tmp/lumina-501/menu.sock")
-        #expect(unixSocketPathFits("/tmp/lumina-501/spaces/abc/agent.sock"))
+        #expect(unixSocketPathFits(paths.primary))
+        #expect(unixSocketPathFits(paths.fallback ?? ""))
     }
 
     @Test func longTmpdirResolvesToFittingAgentSocket() {
         let tmpdir = "/var/folders/lf/gqssmzzn47z1rt274bk0cc780000gn/T"
         let uuid = "8A29DD3F-0A9E-4CF5-8B1B-F2FDBED3BE43"
         let support = "/Users/zelmari/Library/Application Support/Lumina"
-        let primary = LuminaPaths.agentSocketPath(
+        let paths = LuminaPaths.agentSocketPath(
             uid: 501,
             tmpdir: tmpdir,
             instanceId: uuid,
             supportFallback: support
-        ).primary
-        #expect(!unixSocketPathFits(primary))
+        )
+        #expect(!unixSocketPathFits(paths.primary))
+        #expect(!unixSocketPathFits(paths.fallback ?? ""))
         let resolved = LuminaPaths.resolvedAgentSocketPath(
             uid: 501,
             tmpdir: tmpdir,
             instanceId: uuid,
             supportFallback: support
         )
+        // Primary and the support fallback are too long, so the tmpdir
+        // fallback is the first candidate that fits; pin it exactly so a
+        // candidate reorder cannot silently pass.
+        #expect(resolved == "\(tmpdir)/lumina-501/\(uuid).sock")
         #expect(unixSocketPathFits(resolved))
-        #expect(resolved.contains(uuid))
         #expect(
             LuminaPaths.resolvedAgentSocketPath(
                 uid: 501,
