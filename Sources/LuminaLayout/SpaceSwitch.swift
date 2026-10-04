@@ -66,7 +66,11 @@ extension Session {
             var w = s.floating.remove(at: idx)
             session.spaces[spaceId] = s
             w.role = .tiled
-            return session.insertSpiral(space: spaceId, newLeaf: w, usableIsWide: usableIsWide)
+            session = session.insertSpiral(space: spaceId, newLeaf: w, usableIsWide: usableIsWide)
+            if session.spaces[spaceId]?.luminaFullscreen != nil {
+                session = session.markStashed(space: spaceId, ids: [w.cgWindowId])
+            }
+            return session
         }
         return self
     }
