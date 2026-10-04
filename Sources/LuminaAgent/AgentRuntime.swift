@@ -979,15 +979,31 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Drop a window that is really gone: close it on the focused space, remove
-    /// it elsewhere, and forget every per-window map entry.
-    func removeDestroyedWindow(_ id: UInt32) {
+    /// Per-window teardown shared by every removal path: stop the resize
+    /// debounce, drop a move/resize tag, clear the native-focus sync guard,
+    /// and forget every per-window map entry.
+    func forgetWindowState(_ id: UInt32) {
         lastWindowClosedAt = Date()
         if lastSyncedNativeFocusedId == id {
             lastSyncedNativeFocusedId = nil
         }
+        if let start = moveStart, start.0 == id {
+            moveStart = nil
+        }
+        resizeDebounce[id]?.cancel()
+        resizeDebounce[id] = nil
+        elements[id] = nil
+        adapter.forgetWindowId(id)
+        forgetBorn(id)
+        knownOriginals[id] = nil
+    }
+
+    /// Drop a window that is really gone: close it on the focused space, remove
+    /// it elsewhere, and forget every per-window map entry.
+    func removeDestroyedWindow(_ id: UInt32) {
         let wasFS = session.current.luminaFullscreen != nil
             && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
+        forgetWindowState(id)
         for spaceId in Array(session.spaces.keys) {
             if spaceId == session.focusedSpace {
                 session = session.closeWindow(space: spaceId, cgWindowId: id)
@@ -996,10 +1012,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
         }
         if wasFS { unstashSpace(session.focusedSpace) }
-        elements[id] = nil
-        adapter.forgetWindowId(id)
-        forgetBorn(id)
-        knownOriginals[id] = nil
     }
 
     func isOffEveryDisplay(_ rect: Rect) -> Bool {
@@ -2180,10 +2192,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 session = session.removeWindow(space: spaceId, cgWindowId: id)
             }
             session.nativeFSWindows.removeAll { $0.cgWindowId == id }
-            elements[id] = nil
-            adapter.forgetWindowId(id)
-            forgetBorn(id)
-            knownOriginals[id] = nil
+            forgetWindowState(id)
         }
         applyFrames()
     }
