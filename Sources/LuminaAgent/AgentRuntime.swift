@@ -295,6 +295,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let pid = app.processIdentifier
             if isOurProcess(pid) || !ownerPids.contains(pid) { continue }
             observers.watch(pid: pid)
+            adapter.wakeAccessibility(pid: pid)
             for el in adapter.windows(pid: pid) {
                 let used = Set(out.map(\.cgWindowId))
                 guard let (input, id, _) = classifyInput(
@@ -304,6 +305,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     onScreenIds: onScreenIds,
                     excludingWindowIds: used
                 ) else { continue }
+                adapter.markAccessibilityHealthy(pid: pid)
                 let result = classify(input, rules: config.windowRules)
                 log.info(
                     "classify \(app.bundleIdentifier ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
@@ -366,6 +368,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
                 self.observers.unwatch(pid: app.processIdentifier)
+                self.adapter.forgetAccessibility(pid: app.processIdentifier)
                 self.dropPid(app.processIdentifier)
             }
         }
@@ -519,12 +522,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         /// the unresolved retry covers newly created windows.
         var axFailedPids: Set<pid_t> = []
         for pid in refreshPids() {
+            adapter.wakeAccessibility(pid: pid)
             switch adapter.enumerateWindows(pid: pid) {
             case .failed:
                 axFailedPids.insert(pid)
             case .list(let elements):
                 for el in elements {
-                    guard let id = adapter.windowId(for: el) else { continue }
+                    guard let id = adapter.windowId(for: el) else {
+                        log.info("refresh unresolved window id pid=\(pid) role=\(adapter.role(of: el) ?? "?")")
+                        continue
+                    }
+                    adapter.markAccessibilityHealthy(pid: pid)
                     let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
                     live.append(LiveWindow(
                         cgWindowId: id,
