@@ -1119,7 +1119,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             session = after
             applyFrames()
         } else if result == .tiled, session.current.floating.contains(where: { $0.cgWindowId == id }) {
-            session = session.floatToggle(space: session.focusedSpace, usableIsWide: usableIsWide(bound.usableRect(gaps: config.gaps)))
+            session = session.tileFloater(space: session.focusedSpace, cgWindowId: id, usableIsWide: usableIsWide(bound.usableRect(gaps: config.gaps)))
             applyFrames()
         }
     }
@@ -1405,11 +1405,37 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
+    func captureOnscreenFrames(for spaceId: SpaceId) {
+        guard let bound else { return }
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        guard var space = session.spaces[spaceId] else { return }
+        for (nodeId, var node) in space.nodes {
+            guard var leaf = node.leaf, let el = elements[leaf.cgWindowId] ?? resolvedElement(for: leaf) else { continue }
+            if let current = adapter.frame(of: el) ?? cgWindowRect(id: leaf.cgWindowId),
+               shouldCaptureOnscreenFrame(role: leaf.role, frame: current, display: display) {
+                leaf.lastOnscreenFrame = current
+                node.leaf = leaf
+                space.nodes[nodeId] = node
+            }
+        }
+        for i in space.floating.indices {
+            let id = space.floating[i].cgWindowId
+            guard let el = elements[id] ?? resolvedElement(for: space.floating[i]) else { continue }
+            if let current = adapter.frame(of: el) ?? cgWindowRect(id: id),
+               shouldCaptureOnscreenFrame(role: space.floating[i].role, frame: current, display: display) {
+                space.floating[i].lastOnscreenFrame = current
+            }
+        }
+        session.spaces[spaceId] = space
+    }
+
     func switchSpace(_ id: SpaceId) {
         guard id != session.focusedSpace else { return }
         lastLuminaSpaceChange = Date()
         let source = session.focusedSpace
         captureFocusForSpaceSwitch()
+        captureOnscreenFrames(for: source)
+        lastSyncedNativeFocusedId = nil
         // Unhide the destination first, then hide the source: fewer frames
         // cross on screen at once and there is no hole to see.
         session = session.switchTo(id)
@@ -1428,6 +1454,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         lastLuminaSpaceChange = Date()
         let source = session.focusedSpace
         captureFocusForSpaceSwitch()
+        captureOnscreenFrames(for: source)
+        lastSyncedNativeFocusedId = nil
         session = transform(session)
         unstashSpace(session.focusedSpace)
         applyFrames()
