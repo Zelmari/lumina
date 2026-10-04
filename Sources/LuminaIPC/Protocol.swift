@@ -133,6 +133,34 @@ public enum JSONValue: Equatable, Sendable, Codable {
         }
     }
 
+    /// JSON has no integer type, so a whole `.double` decodes back as `.int`.
+    /// Treat those cases as the same number instead of reporting a spurious
+    /// mismatch after a round-trip.
+    public static func == (lhs: JSONValue, rhs: JSONValue) -> Bool {
+        switch (lhs, rhs) {
+        case (.null, .null):
+            return true
+        case (.bool(let a), .bool(let b)):
+            return a == b
+        case (.int(let a), .int(let b)):
+            return a == b
+        case (.double(let a), .double(let b)):
+            return a == b
+        case (.int(let a), .double(let b)):
+            return Double(a) == b
+        case (.double(let a), .int(let b)):
+            return a == Double(b)
+        case (.string(let a), .string(let b)):
+            return a == b
+        case (.array(let a), .array(let b)):
+            return a == b
+        case (.object(let a), .object(let b)):
+            return a == b
+        default:
+            return false
+        }
+    }
+
     public var string: String? {
         if case .string(let s) = self { return s }
         return nil

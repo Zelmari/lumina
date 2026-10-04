@@ -85,6 +85,18 @@ struct CodecTests {
         }
         #expect(id == "d")
     }
+
+    @Test func jsonValueWholeDoubleRoundTrips() throws {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let whole = try decoder.decode(JSONValue.self, from: encoder.encode(JSONValue.double(3.0)))
+        #expect(whole == .double(3.0))
+        #expect(whole == .int(3))
+        #expect(JSONValue.int(3) == .double(3.0))
+        let fractional = try decoder.decode(JSONValue.self, from: encoder.encode(JSONValue.double(3.5)))
+        #expect(fractional == .double(3.5))
+        #expect(fractional != .int(3))
+    }
 }
 
 struct PathTests {
