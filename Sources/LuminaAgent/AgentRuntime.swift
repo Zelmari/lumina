@@ -583,7 +583,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         })
         func hasUnmanagedOnScreen(_ pid: pid_t) -> Bool {
             onScreenRows.contains { row in
-                cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
+                guard let rect = cgWindowRect(row), rect.w >= 50, rect.h >= 50 else { return false }
+                return cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
                     && cgWindowID(row).map { unmanagedLayeredIds.contains($0) } == true
             }
         }
