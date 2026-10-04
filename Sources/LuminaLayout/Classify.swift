@@ -188,8 +188,9 @@ public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyRes
         if !allowTiled { return .floating }
     }
 
+    let isStandardWindow = input.subrole == AXRoleName.standardWindow
     if !allowTiled && !isTerminal(input.bundleId) {
-        if !input.hasZoomButton { return .floating }
+        if !input.hasZoomButton && !isStandardWindow { return .floating }
         if input.width < 400 || input.height < 300 { return .floating }
     }
 

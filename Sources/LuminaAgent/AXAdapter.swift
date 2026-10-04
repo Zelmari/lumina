@@ -169,10 +169,15 @@ public final class AXAdapter {
     public func focusedWindow(of appOrWindow: AXUIElement) -> AXUIElement? {
         if role(of: appOrWindow) == "AXWindow" { return appOrWindow }
         var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(appOrWindow, kAXFocusedWindowAttribute as CFString, &ref) == .success,
-              let val = ref, CFGetTypeID(val) == AXUIElementGetTypeID()
-        else { return nil }
-        return (val as! AXUIElement)
+        if AXUIElementCopyAttributeValue(appOrWindow, kAXFocusedWindowAttribute as CFString, &ref) == .success,
+           let val = ref, CFGetTypeID(val) == AXUIElementGetTypeID() {
+            return (val as! AXUIElement)
+        }
+        if AXUIElementCopyAttributeValue(appOrWindow, kAXMainWindowAttribute as CFString, &ref) == .success,
+           let val = ref, CFGetTypeID(val) == AXUIElementGetTypeID() {
+            return (val as! AXUIElement)
+        }
+        return nil
     }
 
     private func elementKey(_ element: AXUIElement) -> UInt {
@@ -359,8 +364,20 @@ public final class AXAdapter {
 
     public func hasZoomButton(_ element: AXUIElement) -> Bool {
         var ref: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(element, kAXZoomButtonAttribute as CFString, &ref)
-        return err == .success && ref != nil && CFGetTypeID(ref!) == AXUIElementGetTypeID()
+        if AXUIElementCopyAttributeValue(element, kAXZoomButtonAttribute as CFString, &ref) == .success,
+           let btn = ref, CFGetTypeID(btn) == AXUIElementGetTypeID() {
+            return true
+        }
+        if AXUIElementCopyAttributeValue(element, "AXFullScreenButton" as CFString, &ref) == .success,
+           let btn = ref, CFGetTypeID(btn) == AXUIElementGetTypeID() {
+            return true
+        }
+        var settable: DarwinBoolean = false
+        if AXUIElementIsAttributeSettable(element, kAXSizeAttribute as CFString, &settable) == .success,
+           settable.boolValue {
+            return true
+        }
+        return false
     }
 
     public func role(of element: AXUIElement) -> String? {

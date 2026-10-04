@@ -32,6 +32,18 @@ struct ClassifyTests {
         #expect(classify(input, rules: []) == .tiled)
     }
 
+    @Test func standardWindowWithoutZoomButtonTiles() {
+        let input = ClassifyInput(
+            bundleId: "com.microsoft.VSCode",
+            role: "AXWindow",
+            subrole: AXRoleName.standardWindow,
+            hasZoomButton: false,
+            width: 1000,
+            height: 800
+        )
+        #expect(classify(input, rules: []) == .tiled)
+    }
+
     @Test func sizeFloor399Floats400Tiles() {
         let small = ClassifyInput(width: 399, height: 299)
         #expect(classify(small, rules: []) == .floating)
