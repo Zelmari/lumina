@@ -176,6 +176,22 @@ struct ConfigTests {
         #expect(session.spaces[SpaceId.require(7)] == nil)
     }
 
+    @Test func applySpaceCountUnstashesMovedFloaters() {
+        var session = Session.empty(spaceCount: 3)
+        var dropped = session[SpaceId.require(3)]!
+        dropped.floating.append(WindowRef(cgWindowId: 31, pid: 31, role: .floating))
+        session[SpaceId.require(3)] = dropped
+        // Leaving a space stashes its windows, floaters included.
+        session = session.markStashed(space: SpaceId.require(3), ids: [31])
+        #expect(session[SpaceId.require(3)]!.floating.first?.role == .stashed)
+
+        session = session.applySpaceCount(1)
+        let dest = session[SpaceId.require(1)]!
+        #expect(dest.floating.count == 1)
+        #expect(dest.floating.first?.cgWindowId == 31)
+        #expect(dest.floating.first?.role == .floating)
+    }
+
     @Test func resolveWorkspaceNilIfGreaterThanCount() {
         #expect(resolveWorkspace(id: 3, count: 5)?.raw == 3)
         #expect(resolveWorkspace(id: 99, count: 5) == nil)

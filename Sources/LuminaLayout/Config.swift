@@ -385,7 +385,13 @@ extension Session {
                 }
             }
             if var destSpace = session.spaces[dest] {
-                destSpace.floating.append(contentsOf: floaters)
+                for var floater in floaters {
+                    // A stashed floater (its old space was inactive) would
+                    // otherwise stay parked: applyFrames only moves floaters
+                    // with role == .floating.
+                    floater.role = .floating
+                    destSpace.floating.append(floater)
+                }
                 session.spaces[dest] = destSpace
             }
             session.spaces[dropped] = nil
