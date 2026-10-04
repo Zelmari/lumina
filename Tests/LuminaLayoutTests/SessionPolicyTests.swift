@@ -58,6 +58,120 @@ struct StashTests {
         #expect(!shouldCaptureOnscreenFrame(role: .tiled, frame: hang, display: display))
     }
 
+    @Test func tilingOpsPreserveOriginalFrame() {
+        var session = Session.empty(spaceCount: 1)
+        let first = Rect(x: 100, y: 100, w: 640, h: 480)
+        let second = Rect(x: 200, y: 200, w: 800, h: 600)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1, lastOnscreenFrame: first, originalFrame: first),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 2, pid: 2, lastOnscreenFrame: second, originalFrame: second),
+            usableIsWide: true
+        )
+        session = session.swap(space: SpaceId.require(1), a: 1, b: 2)
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 1)?.leaf?.originalFrame == first)
+        #expect(session[SpaceId.require(1)]!.leaf(containing: 2)?.leaf?.originalFrame == second)
+        let entries = session.collectStashEntries()
+        #expect(entries.first(where: { $0.cgWindowId == 1 })?.originalFrame == first)
+        #expect(entries.first(where: { $0.cgWindowId == 2 })?.originalFrame == second)
+    }
+
+    @Test func sessionFileRoundTripsOriginalFrame() throws {
+        let tile = Rect(x: 1, y: 2, w: 3, h: 4)
+        let original = Rect(x: 10, y: 20, w: 640, h: 480)
+        let file = SessionFile(
+            instanceId: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            bootSessionUUID: "boot",
+            focusedSpace: 1,
+            displayUUID: "disp",
+            stash: [StashEntry(cgWindowId: 10, pid: 20, bundleId: "com.apple.Terminal", lastOnscreenFrame: tile, originalFrame: original)]
+        )
+        let decoded = try SessionFile.decode(try SessionFile.encode(file))
+        #expect(decoded == file)
+        #expect(decoded.stash.first?.originalFrame == original)
+        // Files written before originalFrame existed still decode, with nil.
+        let legacy = """
+        {"instanceId":"00000000-0000-0000-0000-000000000001","bootSessionUUID":"boot","focusedSpace":1,"displayUUID":"disp","stash":[{"cgWindowId":10,"pid":20,"bundleId":"com.apple.Terminal","lastOnscreenFrame":{"x":1,"y":2,"w":3,"h":4}}]}
+        """
+        let legacyFile = try SessionFile.decode(Data(legacy.utf8))
+        #expect(legacyFile.stash.first?.originalFrame == nil)
+        #expect(legacyFile.stash.first?.lastOnscreenFrame == tile)
+    }
+
+    @Test func sessionFileRoundTripsOriginalsMap() throws {
+        let tile = Rect(x: 1, y: 2, w: 3, h: 4)
+        let first = Rect(x: 10, y: 20, w: 640, h: 480)
+        let second = Rect(x: 30, y: 40, w: 800, h: 600)
+        let file = SessionFile(
+            instanceId: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            bootSessionUUID: "boot",
+            focusedSpace: 1,
+            displayUUID: "disp",
+            stash: [StashEntry(cgWindowId: 10, pid: 20, bundleId: nil, lastOnscreenFrame: tile)],
+            originals: [10 as UInt32: first, 20 as UInt32: second]
+        )
+        let data = try SessionFile.encode(file)
+        let decoded = try SessionFile.decode(data)
+        #expect(decoded == file)
+        #expect(decoded.originals[10] == first)
+        #expect(decoded.originals[20] == second)
+        // The registry survives a JSON text round-trip (not just in-memory).
+        let text = String(data: data, encoding: .utf8)!
+        #expect(text.contains("\"originals\""))
+        let reparsed = try SessionFile.decode(Data(text.utf8))
+        #expect(reparsed == file)
+    }
+
+    @Test func legacySessionFileWithoutOriginalsDecodesToEmpty() throws {
+        let legacy = """
+        {"instanceId":"00000000-0000-0000-0000-000000000001","bootSessionUUID":"boot","focusedSpace":1,"displayUUID":"disp","stash":[]}
+        """
+        let decoded = try SessionFile.decode(Data(legacy.utf8))
+        #expect(decoded.originals == [:])
+    }
+
+    @Test func collectOriginalsGathersAcrossSpacesSkippingNil() {
+        var session = Session.empty(spaceCount: 2)
+        let first = Rect(x: 10, y: 20, w: 640, h: 480)
+        let third = Rect(x: 30, y: 40, w: 800, h: 600)
+        let floated = Rect(x: 50, y: 60, w: 320, h: 240)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1, lastOnscreenFrame: first, originalFrame: first),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 2, pid: 2, lastOnscreenFrame: first, originalFrame: nil),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 3, pid: 3, lastOnscreenFrame: third, originalFrame: third),
+            usableIsWide: true
+        )
+        var space1 = session[SpaceId.require(1)]!
+        space1.floating.append(WindowRef(cgWindowId: 4, pid: 4, role: .floating, lastOnscreenFrame: floated, originalFrame: floated))
+        space1.floating.append(WindowRef(cgWindowId: 5, pid: 5, role: .floating, lastOnscreenFrame: floated, originalFrame: nil))
+        session.spaces[SpaceId.require(1)] = space1
+        let got = session.collectOriginals()
+        #expect(got == [1 as UInt32: first, 3 as UInt32: third, 4 as UInt32: floated])
+        #expect(got[2] == nil)
+        #expect(got[5] == nil)
+    }
+
+    @Test func resolveOriginalPrefersKnownOverLive() {
+        let live = Rect(x: 0, y: 0, w: 700, h: 500)
+        let known = Rect(x: 100, y: 100, w: 640, h: 480)
+        #expect(resolveOriginal(cgWindowId: 7, liveFrame: live, knownOriginals: [7 as UInt32: known]) == known)
+        #expect(resolveOriginal(cgWindowId: 8, liveFrame: live, knownOriginals: [7 as UInt32: known]) == live)
+        #expect(resolveOriginal(cgWindowId: 7, liveFrame: live, knownOriginals: [:]) == live)
+    }
+
     @Test func cascadeRestoreStaysInsideUsableAndOffsets() {
         let usable = Rect(x: 8, y: 8, w: 1440, h: 860)
         let first = cascadeRestoreRect(usable: usable, index: 0)

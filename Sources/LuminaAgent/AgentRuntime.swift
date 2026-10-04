@@ -49,10 +49,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// When a window joined the session. Pruning never removes a window
     /// younger than the grace period; it may just not be visible to AX/CG yet.
     var bornAt: [UInt32: Date] = [:]
+    /// Pre-tiling geometry by CGWindowID, including windows since pruned.
+    /// Persisted via SessionFile so restarts and drop+re-adopt churn cannot
+    /// replace true originals with tile rects.
+    var knownOriginals: [UInt32: Rect] = [:]
     /// Consecutive-miss and failed-read bookkeeping for refresh removals.
     var removalGate = RemovalGate()
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
+    /// Cascade offset for quit restore when the saved original is really the
+    /// engine's tile. Reset per quit.
+    var restoreCascadeIndex = 0
     let preferredDisplayUUID: String?
 
     let log: LuminaLog
@@ -301,7 +308,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 adapter.rememberWindowId(id, for: el)
                 elements[id] = el
                 let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                let w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame)
+                let w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
+                knownOriginals[id] = w.originalFrame ?? frame
                 markBorn(id)
                 out.append(w)
             }
@@ -734,7 +742,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(id, for: element)
         elements[id] = element
         let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame)
+        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
+        knownOriginals[id] = window.originalFrame ?? frame
         let usable = bound.usableRect(gaps: config.gaps)
         let target = session.spaces[targetId] ?? session.current
         if target.luminaFullscreen != nil {
@@ -809,6 +818,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
         session = session.rebindWindowId(from: from, to: to)
+        if let original = knownOriginals[from] {
+            knownOriginals[to] = original
+            knownOriginals[from] = nil
+        }
         for sid in session.spaces.keys {
             if session.spaces[sid]?.focusedWindow == from {
                 session.spaces[sid]?.focusedWindow = to
@@ -861,6 +874,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         elements[id] = nil
         adapter.forgetWindowId(id)
         forgetBorn(id)
+        knownOriginals[id] = nil
     }
 
     func isOffEveryDisplay(_ rect: Rect) -> Bool {
@@ -946,8 +960,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if var space = session.spaces[session.focusedSpace],
                let idx = space.floating.firstIndex(where: { $0.cgWindowId == id })
             {
-                // A floater the user placed themselves.
+                // A floater the user placed themselves: quit restores this spot.
                 space.floating[idx].lastOnscreenFrame = frame
+                space.floating[idx].originalFrame = frame
                 session.spaces[session.focusedSpace] = space
             }
             return
@@ -1108,6 +1123,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 userPaused = false
                 if isCurrent { registerHotkeys() }
                 startOrStopFFM()
+                refreshOriginalsFromLive()
             }
             return .success(id: id)
         case .reload:
@@ -1378,12 +1394,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         stash(ids: ids)
     }
 
-    func unstashSpace(_ id: SpaceId) {
+    func unstashSpace(_ id: SpaceId, restoreOriginals: Bool = false) {
         guard let space = session.spaces[id] else { return }
         for node in space.tiledLeaves() {
-            if let w = node.leaf { restoreWindow(w) }
+            if let w = node.leaf {
+                if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
+            }
         }
-        for w in space.floating { restoreWindow(w) }
+        for w in space.floating {
+            if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
+        }
         pruneGhostLeaves(space: id)
     }
 
@@ -1392,6 +1412,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let windows = space.tiledLeaves().compactMap(\.leaf) + space.floating
         for w in windows where !hasAXElement(w) && !isYoung(w.cgWindowId) {
             log.info("prune ghost window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") space=\(spaceId)")
+            stashKnownOriginal(w.cgWindowId)
             session = session.removeWindow(space: spaceId, cgWindowId: w.cgWindowId)
             elements[w.cgWindowId] = nil
             adapter.forgetWindowId(w.cgWindowId)
@@ -1426,34 +1447,89 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         writeWindow(w)
     }
 
-    /// Quit path: place every managed window back in the visible area. Tiled
-    /// windows cascade to a sane size; floating windows keep their size. There
-    /// is no registry of "original" frames: the app's saved geometry is not
-    /// trusted to be pre-Lumina, so quit never reconstructs it.
-    func recenterAllWindows() {
+    /// Quit path: put the window back where the user had it before tiling.
+    /// A saved frame that is really the engine's tile (the app reopened at a
+    /// tile-shaped frame from an earlier Lumina session) cannot untile
+    /// anything, so it is rejected in favor of a cascade.
+    func restoreOriginal(_ window: WindowRef) {
+        var w = window
+        var hadOriginal = w.originalFrame != nil
+        if let original = w.originalFrame, isEngineTile(original, for: window) {
+            knownOriginals[w.cgWindowId] = nil
+            w.originalFrame = nil
+            hadOriginal = false
+        }
+        w.lastOnscreenFrame = w.originalFrame ?? fallbackRestoreRect()
+        let t = w.lastOnscreenFrame
+        log.info("quit restore window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") original=\(hadOriginal) target=\(Int(t.w))x\(Int(t.h)) @\(Int(t.x)),\(Int(t.y))")
+        restoreWindow(w)
+    }
+
+    /// True when a saved original is where the engine currently tiles this
+    /// window: the app handed back a frame Lumina itself produced.
+    func isEngineTile(_ rect: Rect, for window: WindowRef) -> Bool {
+        guard let bound, let sid = session.spaceContaining(cgWindowId: window.cgWindowId),
+              let space = session.spaces[sid],
+              let leaf = space.leaf(containing: window.cgWindowId)
+        else { return false }
+        let tiles = frames(space: space, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
+        guard let tile = tiles[leaf.id] else { return false }
+        return framesClose(rect, tile, slop: 2)
+    }
+
+    func fallbackRestoreRect() -> Rect {
+        let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 40, y: 48, w: 1200, h: 800)
+        defer { restoreCascadeIndex += 1 }
+        return cascadeRestoreRect(usable: usable, index: restoreCascadeIndex)
+    }
+
+    /// Remember a transiently-pruned window's original so a later re-adopt
+    /// reuses it instead of capturing the tile rect. Real closes prune the
+    /// map instead (see handleDestroy/dropPid).
+    func stashKnownOriginal(_ id: UInt32) {
+        if let w = windowAnywhere(id), let original = w.originalFrame {
+            knownOriginals[id] = original
+        }
+    }
+
+    /// Layout made while paused is the user's own: adopt it as the new
+    /// originals. Parked frames are never adopted.
+    func refreshOriginalsFromLive() {
         guard let bound else { return }
-        let usable = bound.usableRect(gaps: config.gaps)
-        var cascade = 0
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        for spaceId in session.spaces.keys {
+            guard var space = session.spaces[spaceId] else { continue }
+            for (nodeId, var node) in space.nodes {
+                guard var leaf = node.leaf, let el = elements[leaf.cgWindowId],
+                      let live = adapter.frame(of: el),
+                      !isFrameStashedAway(live, display: display)
+                else { continue }
+                leaf.originalFrame = live
+                node.leaf = leaf
+                space.nodes[nodeId] = node
+                knownOriginals[leaf.cgWindowId] = live
+            }
+            for i in space.floating.indices {
+                let w = space.floating[i]
+                guard let el = elements[w.cgWindowId], let live = adapter.frame(of: el),
+                      !isFrameStashedAway(live, display: display)
+                else { continue }
+                space.floating[i].originalFrame = live
+                knownOriginals[w.cgWindowId] = live
+            }
+            session.spaces[spaceId] = space
+        }
+    }
+
+    /// Quit path: put each managed window back where the user had it before
+    /// tiling, falling back to a cascade when no usable original exists.
+    func recenterAllWindows() {
+        restoreCascadeIndex = 0
         for space in session.spaces.values {
             for node in space.tiledLeaves() {
-                guard let window = node.leaf, let el = resolvedElement(for: window) else { continue }
-                var w = window
-                w.lastOnscreenFrame = cascadeRestoreRect(usable: usable, index: cascade)
-                cascade += 1
-                let t = w.lastOnscreenFrame
-                log.info("quit recenter window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") target=\(Int(t.w))x\(Int(t.h)) @\(Int(t.x)),\(Int(t.y))")
-                _ = adapter.setFrame(t, of: el, tag: &w)
-                writeWindow(w)
+                if let w = node.leaf { restoreOriginal(w) }
             }
-            for window in space.floating {
-                guard let el = resolvedElement(for: window) else { continue }
-                var w = window
-                w.lastOnscreenFrame = usableRestoreRect(w.lastOnscreenFrame)
-                let t = w.lastOnscreenFrame
-                log.info("quit recenter floating window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") target=\(Int(t.w))x\(Int(t.h)) @\(Int(t.x)),\(Int(t.y))")
-                _ = adapter.setFrame(t, of: el, tag: &w)
-                writeWindow(w)
-            }
+            for w in space.floating { restoreOriginal(w) }
         }
     }
 
@@ -1519,7 +1595,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         abs(a.x - b.x) <= slop && abs(a.y - b.y) <= slop && abs(a.w - b.w) <= slop && abs(a.h - b.h) <= slop
     }
 
-    func rescueOffscreenWindows() {
+    func rescueOffscreenWindows(restoreOriginals: Bool = false) {
         guard let bound else { return }
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
         let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
@@ -1532,7 +1608,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let w = lookup(id)
                 ?? WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: usableRestoreRect(rect))
             log.info("rescue offscreen window=\(id) pid=\(pid) \(Int(rect.w))x\(Int(rect.h))")
-            restoreWindow(w)
+            if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
         }
     }
 
@@ -1622,6 +1698,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                    let file = try? SessionFile.decode(data)
                 {
                     entries.append(contentsOf: file.stash)
+                    for (id, rect) in file.originals { knownOriginals[id] = rect }
                 }
                 try? FileManager.default.removeItem(atPath: path)
             }
@@ -1631,6 +1708,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
            let file = try? SessionFile.decode(data)
         {
             entries.append(contentsOf: file.stash.filter { !isSliver($0.lastOnscreenFrame) || $0.lastOnscreenFrame.h >= 8 })
+            for (id, rect) in file.originals { knownOriginals[id] = rect }
+            for e in file.stash {
+                if let original = e.originalFrame { knownOriginals[e.cgWindowId] = original }
+            }
         }
         let info = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID)
             as? [[String: Any]] ?? []
@@ -1641,12 +1722,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                   isOurStashSliver(rect)
             else { continue }
             let known = entries.first { $0.cgWindowId == id }
-            let restore = known.flatMap { isSliver($0.lastOnscreenFrame) ? nil : $0.lastOnscreenFrame }
+            let restore = known.flatMap { isSliver($0.lastOnscreenFrame) ? nil : ($0.originalFrame ?? $0.lastOnscreenFrame) }
                 ?? usableRestoreRect(rect)
-            entries.append(StashEntry(cgWindowId: id, pid: pid, bundleId: known?.bundleId, lastOnscreenFrame: restore))
+            entries.append(StashEntry(cgWindowId: id, pid: pid, bundleId: known?.bundleId, lastOnscreenFrame: restore, originalFrame: known?.originalFrame))
         }
         for e in entries {
-            let w = WindowRef(cgWindowId: e.cgWindowId, pid: e.pid, bundleId: e.bundleId, lastOnscreenFrame: usableRestoreRect(e.lastOnscreenFrame))
+            let frame = usableRestoreRect(e.originalFrame ?? e.lastOnscreenFrame)
+            let w = WindowRef(cgWindowId: e.cgWindowId, pid: e.pid, bundleId: e.bundleId, lastOnscreenFrame: frame, originalFrame: e.originalFrame ?? e.lastOnscreenFrame)
             restoreWindow(w)
         }
         rescueOffscreenWindows()
@@ -1667,7 +1749,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             bootSessionUUID: kernBootUUID() ?? "",
             focusedSpace: session.focusedSpace.raw,
             displayUUID: bound?.uuid ?? "",
-            stash: entries
+            stash: entries,
+            originals: session.collectOriginals().merging(knownOriginals) { current, _ in current }
         )
         let dir = (sessionPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -1843,6 +1926,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             elements[id] = nil
             adapter.forgetWindowId(id)
             forgetBorn(id)
+            knownOriginals[id] = nil
         }
         applyFrames()
     }
