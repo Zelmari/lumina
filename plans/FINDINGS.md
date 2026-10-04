@@ -327,12 +327,12 @@ from `.floating` (`AgentRuntime.swift:575-578`). Hidden-workspace floaters —
 where retention windows actually live — fall into the uncapped "defer while
 CG lists it" branch.
 
-### 4.5 One-out/one-in rebind assumes replacement — Medium (documented) **[reported]**
+### 4.5 One-out/one-in rebind assumes replacement — Medium **[reported]**
 
 `Reconcile.swift:54-56,79-83` treats a single removed + single added id in
 the same pid as a rebind, so a close followed by an unrelated open inherits
-the old slot, ratio, role, and native-FS bookmark. Documented in
-`plans/NOTES.md:47-53`, but the identity assumption is real and consequential.
+the old slot, ratio, role, and native-FS bookmark. The identity assumption is
+real and consequential.
 
 ### 4.6 Config parsing sharp edges — Medium **[reported]**
 
@@ -406,8 +406,7 @@ Option-F appears dead.
 `README.md:5` says quitting "leaves apps open and frames where they are".
 `stop()` calls `recenterAllWindows()` (`AgentRuntime.swift:153-155`), which
 restores every managed window to its pre-tiling frame or a cascade
-(`:1585-1601,1661-1669`). `plans/NOTES.md:119-120` describes the real
-behavior.
+(`:1585-1601,1661-1669`).
 
 ### 5.2 `docs/compat.md` references a Cursor rule that does not exist — Medium **[verified]**
 
@@ -436,7 +435,7 @@ of its delete-list remain:
 - `README.md:39` lists only `Tests/LuminaLayoutTests/`; `Tests/LuminaIPCTests/`
   exists.
 - The macOS requirement that `swift test` needs the Xcode toolchain
-  (`DEVELOPER_DIR`) lives only in `plans/NOTES.md:106-108`, not install docs.
+  (`DEVELOPER_DIR`) is not in install docs.
 - Source comments still cite a design/SPEC document that is gitignored and
   gone (`Config.swift:139`, `Spatial.swift:31`, `CurrentSpace.swift:11`,
   `AgentSpawner.swift:103`; `.gitignore:5-8`).
