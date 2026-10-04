@@ -15,7 +15,7 @@ swift test --filter LuminaLayoutTests
 swift test --filter LuminaIPCTests
 ```
 
-On an Apple silicon Mac, assemble a debug `.app`:
+On an Apple silicon Mac, assemble a local, ad-hoc-signed release `.app`:
 
 ```sh
 ./scripts/bundle.sh
