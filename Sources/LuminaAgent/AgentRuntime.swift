@@ -1501,15 +1501,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let width = current?.w ?? window.lastOnscreenFrame.w
             let inset: Double = window.bundleId == "us.zoom.xos" ? 0 : 1
             let parked = stashFrame(for: height, display: display, dockRight: dockRight, lastWidth: width, inset: inset)
-            if let live = adapter.frame(of: el), abs(live.x - parked.x) <= 8, abs(live.y - parked.y) <= 8 {
-                // Already parked. Re-writing the position on every refresh is
-                // pure AX churn for a window nobody can see.
+            if let live = adapter.frame(of: el), isFrameStashedAway(live, display: display) {
+                // Already hidden. macOS clamps a park so a sliver stays on screen;
+                // there is nothing to verify or retry. Re-park only when the window
+                // is back on screen.
             } else {
                 _ = adapter.setStashPosition(Point(x: parked.x, y: parked.y), of: el, tag: &window)
-                if let live = adapter.frame(of: el), abs(live.x - parked.x) > 8 || abs(live.y - parked.y) > 8 {
-                    log.info("stash retry window=\(id) live=\(Int(live.x)),\(Int(live.y)) target=\(Int(parked.x)),\(Int(parked.y))")
-                    _ = adapter.setStashPosition(Point(x: parked.x, y: parked.y), of: el, tag: &window)
-                }
             }
             if var space = session.spaces[spaceId] {
                 if var node = space.leaf(containing: id), let saved = node.leaf {
