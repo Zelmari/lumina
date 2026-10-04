@@ -128,8 +128,8 @@ than a few minutes.
 ## Second-pass audit — 2026-10-04 (new issues, not in FINDINGS.md)
 
 Seven read-only passes over `Sources/`, `Tests/`, `scripts/`, `docs/`, CI.
-Everything below is new relative to `FINDINGS.md`. Fixing in progress; keep
-this list current as items land.
+Everything below is new relative to `FINDINGS.md`. All items were fixed in
+the commits of 2026-10-04/05; the entries stay as a record of the traps.
 
 ### Medium
 
@@ -270,3 +270,8 @@ this list current as items land.
   pre-tiling frames, and the README lists both test targets.
 - FINDINGS §6 says `AXEnhancedUserInterface` wakes Chromium; only
   `AXManualAccessibility` is set (`AXAdapter.swift:147`).
+- Item 42 was narrowed, not fully removed: `lumina debug` now reports the
+  real `LUMINA_DEBUG` value, but the debug log level stays because the IPC
+  tests exercise it.
+- Item 19 relies on the extra yielding losing claimants on every status
+  poll; a crash-recovered agent is briefly `isCurrent` until the next poll.
