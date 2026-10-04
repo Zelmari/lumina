@@ -389,10 +389,6 @@ public final class AXAdapter {
         log.info("ax \(kind) write rejected err=\(err.rawValue) codes=[\(errors.map(\.rawValue).map(String.init).joined(separator: ","))]")
     }
 
-    private func framesClose(_ a: Rect, _ b: Rect) -> Bool {
-        abs(a.x - b.x) <= 2 && abs(a.y - b.y) <= 2 && abs(a.w - b.w) <= 2 && abs(a.h - b.h) <= 2
-    }
-
     public func pressClose(of element: AXUIElement) {
         var ref: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXCloseButtonAttribute as CFString, &ref) == .success,
