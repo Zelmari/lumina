@@ -414,6 +414,7 @@ struct NativeFSTests {
         #expect(!isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: false, spaceChangeRecently: true)))
         #expect(!isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: true)))
         #expect(isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: true, spaceChangeRecently: true)))
+        #expect(isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: true, skyLightIdChanged: true)))
         #expect(!isNativeFullscreen(NativeFSSignals(missingFromOnScreen: false, pidAlive: true, axFullscreen: true)))
         #expect(isNativeFullscreen(NativeFSSignals(missingFromOnScreen: true, pidAlive: true, axFullscreen: true)))
     }
