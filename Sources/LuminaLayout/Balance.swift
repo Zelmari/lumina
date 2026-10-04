@@ -133,7 +133,16 @@ extension Session {
         for _ in 0..<32 {
             guard let space = session.spaces[spaceId] else { break }
             var didFloat = false
-            let containers = space.nodes.values.filter { !$0.isLeaf && $0.children.count == 2 }
+            // Root-first: resolve shallow containers before their nested
+            // descendants, then by id, so which leaf floats is launch-stable.
+            let containers = space.nodes.values
+                .filter { !$0.isLeaf && $0.children.count == 2 }
+                .sorted { lhs, rhs in
+                    let lhsDepth = nodeDepth(lhs.id, in: space)
+                    let rhsDepth = nodeDepth(rhs.id, in: space)
+                    if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
+                    return lhs.id.raw < rhs.id.raw
+                }
             for container in containers {
                 let b = container.children[1]
                 guard let current = session.spaces[spaceId] else { break }
@@ -264,6 +273,13 @@ private func containsNode(_ root: Node, _ target: NodeId, space: Space) -> Bool 
         if let node = space.nodes[child], containsNode(node, target, space: space) { return true }
     }
     return false
+}
+
+/// Hops from the tree root (root = 0), following parent links. `clampOverflow`
+/// sorts by this so an ancestor is resolved before a nested container.
+private func nodeDepth(_ id: NodeId, in space: Space) -> Int {
+    guard let node = space.nodes[id], let parent = node.parent else { return 0 }
+    return 1 + nodeDepth(parent, in: space)
 }
 
 private func leafToFloat(in container: Node, space: Space, prefer: NodeId?) -> NodeId? {

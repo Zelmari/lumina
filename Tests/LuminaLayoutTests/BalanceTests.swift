@@ -164,6 +164,32 @@ struct BalanceResizeTests {
         }
     }
 
+    @Test func overflowResolvesRootBeforeNestedContainer() {
+        // root [win1 | (win2 / win3)]. Root cannot fit 150+150 wide and the
+        // nested vertical split cannot fit 300+300 tall. Root-first order
+        // floats the root's last leaf (win2) before the nested split's (win3).
+        let box = Rect(x: 0, y: 0, w: 200, h: 400)
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(2), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(3), usableIsWide: true)
+        let mins: [UInt32: Size] = [
+            1: Size(w: 150, h: 0),
+            2: Size(w: 150, h: 300),
+            3: Size(w: 150, h: 300),
+        ]
+        let (after, floated) = session.clampOverflow(
+            space: space1,
+            minSizes: mins,
+            usable: box,
+            gaps: gaps
+        )
+        #expect(floated.map(\.cgWindowId) == [2, 3])
+        let space = after[space1]!
+        #expect(space.floating.map(\.cgWindowId) == [2, 3])
+        #expect(space.nodes[space.root!]?.leaf?.cgWindowId == 1)
+    }
+
     @Test func resizeIgnoredForFloatingAndSingleLeaf() {
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
@@ -180,18 +206,27 @@ struct BalanceResizeTests {
         #expect(after[space1]!.nodes[root]!.leaf?.cgWindowId == 1)
 
         var floatingSession = Session.empty(spaceCount: 1)
+        floatingSession = floatingSession.insertSpiral(space: space1, newLeaf: win(8), usableIsWide: true)
+        floatingSession = floatingSession.insertSpiral(space: space1, newLeaf: win(9), usableIsWide: true)
         var space = floatingSession[space1]!
-        space.floating.append(win(9))
+        // Keep the floater in the tree next to a tiled sibling so `resize`
+        // reaches the role guard instead of bailing at the node lookup.
+        let floaterId = space.lastTiledLeaf!
+        var floater = space.nodes[floaterId]!.leaf!
+        floater.role = .floating
+        var floaterNode = space.nodes[floaterId]!
+        floaterNode.leaf = floater
+        space.setNode(floaterNode)
         floatingSession.spaces[space1] = space
         let (after2, floated2) = floatingSession.resize(
             space: space1,
-            focusedLeaf: NodeId(raw: 99),
+            focusedLeaf: floaterId,
             delta: .grow,
             minSizes: [:],
             usable: usable,
             gaps: gaps
         )
         #expect(floated2 == nil)
-        #expect(after2[space1]!.floating.count == 1)
+        #expect(after2 == floatingSession)
     }
 }
