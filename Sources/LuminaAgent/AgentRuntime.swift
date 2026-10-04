@@ -1235,6 +1235,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         switch cmd {
         case .workspace(let n):
+            guard resolveWorkspace(id: n, count: session.spaceCount) != nil else {
+                return .failure(id: id, error: "workspace \(n) out of range")
+            }
             handleBound(.workspace(n))
             return .success(id: id)
         case .workspacePrev:
@@ -1242,6 +1245,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         case .workspaceNext:
             handleBound(.workspaceNext); return .success(id: id)
         case .moveNodeToWorkspace(let n):
+            guard resolveWorkspace(id: n, count: session.spaceCount) != nil else {
+                return .failure(id: id, error: "workspace \(n) out of range")
+            }
             handleBound(.moveNodeToWorkspace(n)); return .success(id: id)
         case .focus(let d):
             handleBound(.focus(Direction(rawValue: d.rawValue) ?? .left)); return .success(id: id)
