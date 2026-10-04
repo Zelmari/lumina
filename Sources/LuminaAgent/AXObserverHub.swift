@@ -7,7 +7,19 @@ import LuminaIPC
 
 public final class AXObserverHub: @unchecked Sendable {
     private var observers: [pid_t: AXObserver] = [:]
+    /// Window elements with registered notifications, per pid, so they can be
+    /// unregistered when a window is destroyed or its app exits. Without this
+    /// the five notes added per window accumulate for the observer's lifetime.
+    private var watchedWindows: [pid_t: [AXUIElement]] = [:]
     public var onNotification: ((pid_t, String, AXUIElement) -> Void)?
+
+    private static let windowNotes = [
+        kAXUIElementDestroyedNotification,
+        kAXWindowMovedNotification,
+        kAXWindowResizedNotification,
+        kAXTitleChangedNotification,
+        kAXWindowMiniaturizedNotification,
+    ]
 
     public func watch(pid: pid_t) {
         if !Thread.isMainThread {
@@ -22,6 +34,9 @@ public final class AXObserverHub: @unchecked Sendable {
             let name = notification as String
             var owner: pid_t = 0
             AXUIElementGetPid(element, &owner)
+            if name == kAXUIElementDestroyedNotification {
+                hub.unwatchWindow(element, pid: owner)
+            }
             hub.onNotification?(owner, name, element)
         }, &observer)
         guard err == .success, let observer else { return }
@@ -51,17 +66,23 @@ public final class AXObserverHub: @unchecked Sendable {
         }
         watch(pid: pid)
         guard let observer = observers[pid] else { return }
+        guard watchedWindows[pid]?.contains(where: { CFEqual($0, element) }) != true else { return }
+        watchedWindows[pid, default: []].append(element)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
-        let windowNotes = [
-            kAXUIElementDestroyedNotification,
-            kAXWindowMovedNotification,
-            kAXWindowResizedNotification,
-            kAXTitleChangedNotification,
-            kAXWindowMiniaturizedNotification,
-        ]
-        for n in windowNotes {
+        for n in Self.windowNotes {
             AXObserverAddNotification(observer, element, n as CFString, refcon)
         }
+    }
+
+    /// Remove every window notification registered for `element` and stop
+    /// tracking it. Called when the element reports that it was destroyed.
+    private func unwatchWindow(_ element: AXUIElement, pid: pid_t) {
+        guard let observer = observers[pid] else { return }
+        for n in Self.windowNotes {
+            AXObserverRemoveNotification(observer, element, n as CFString)
+        }
+        watchedWindows[pid]?.removeAll { CFEqual($0, element) }
+        if watchedWindows[pid]?.isEmpty == true { watchedWindows[pid] = nil }
     }
 
     public func unwatch(pid: pid_t) {
@@ -69,6 +90,9 @@ public final class AXObserverHub: @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in self?.unwatch(pid: pid) }
             return
         }
+        // Releasing the observer drops its registrations; do not message a
+        // terminated app to remove each window note.
+        watchedWindows[pid] = nil
         guard let observer = observers.removeValue(forKey: pid) else { return }
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
     }
