@@ -40,6 +40,8 @@ final class ExtraController: NSObject, @unchecked Sendable {
     let uid: uid_t
     let tmpdir: String
     var pendingUnstash: String?
+    var spawnInFlight = false
+    private var startRetryAttempts = 0
     private let statusQueue = DispatchQueue(label: "com.zelmari.lumina.extra.status")
     private var statusTimer: DispatchSourceTimer?
 
@@ -116,17 +118,28 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func startOnThisSpace(runLaunchApps: Bool = false) {
+        guard !spawnInFlight else { return }
         let current = registry.load()
         let live = current.agents.filter { kill($0.pid, 0) == 0 }
+        var starting = false
         let presence: [AgentPresence] = live.map { rec in
             let status = fetchAgentStatus(socket: rec.socket)
+            if status == nil { starting = true }
             return AgentPresence(
                 instanceId: rec.instanceId,
                 isCurrent: status?.isCurrent ?? false,
                 hasOnScreenIncludingSlivers: status?.hasOnScreenIncludingSlivers ?? false
             )
         }
-        switch startAttachDecision(agents: presence, lastCurrent: current.lastCurrentInstanceId) {
+        let decision = startAttachDecision(agents: presence, lastCurrent: current.lastCurrentInstanceId)
+        if case .spawn = decision, starting {
+            // A live pid whose socket has not bound yet is starting, not absent.
+            retryStartOnThisSpace(runLaunchApps: runLaunchApps)
+            pollStatus()
+            return
+        }
+        startRetryAttempts = 0
+        switch decision {
         case .alreadyCurrent(let id):
             var next = current
             next.lastCurrentInstanceId = id
@@ -144,7 +157,17 @@ final class ExtraController: NSObject, @unchecked Sendable {
         }
     }
 
+    private func retryStartOnThisSpace(runLaunchApps: Bool) {
+        guard startRetryAttempts < 3 else { return }
+        startRetryAttempts += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.startOnThisSpace(runLaunchApps: runLaunchApps)
+        }
+    }
+
     func spawnAgent(runLaunchApps: Bool) {
+        guard !spawnInFlight else { return }
+        spawnInFlight = true
         let id = UUID()
         let socket = LuminaPaths.resolvedAgentSocketPath(
             uid: uid,
@@ -164,6 +187,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
             unstashFrom: unstashFrom
         ) { [weak self] pid in
             guard let self else { return }
+            self.spawnInFlight = false
             guard let pid else {
                 self.log.error("spawn failed")
                 return
