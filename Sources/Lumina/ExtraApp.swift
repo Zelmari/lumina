@@ -113,7 +113,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
                     self?.agentDied(agent)
                 }
             }
-            pollStatus()
+            startOnThisSpace()
         }
     }
 
