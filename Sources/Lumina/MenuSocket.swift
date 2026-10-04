@@ -19,7 +19,12 @@ final class MenuSocketServer {
     func start() throws {
         let dir = (path as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        // The fallback socket path sits directly in /tmp; chmodding that shared
+        // directory would lock out other users. Only private dirs (the runtime
+        // root) get tightened.
+        if dir != "/tmp" {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
+        }
         unlink(path)
         listenFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard listenFD >= 0 else { throw POSIXError(.EADDRINUSE) }
