@@ -219,7 +219,8 @@ struct SpaceSwitchTests {
     @Test func noOpIdGreaterThanCount() {
         let session = Session.empty(spaceCount: 5)
         #expect(resolveWorkspace(id: 99, count: 5) == nil)
-        let after = session.switchTo(SpaceId.require(1))
+        // Leave space 1 first so the switch below is not an early-return no-op.
+        let after = session.workspaceNext().switchTo(SpaceId.require(1))
         #expect(after.focusedSpace.raw == 1)
     }
 
