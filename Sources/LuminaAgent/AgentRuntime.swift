@@ -46,6 +46,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Bounded follow-up passes when a window was not resolvable yet.
     var unresolvedRefreshPasses = 0
     var refreshUnresolved = false
+    /// Bounded post-launch discovery polls. A freshly launched app can create
+    /// its window after the one refresh `appLaunched` schedules, and the
+    /// window-created notification is easily missed while the AX observer is
+    /// still installing, so keep re-reading for a few seconds.
+    var launchPollsRemaining = 0
     /// When a window joined the session. Pruning never removes a window
     /// younger than the grace period; it may just not be visible to AX/CG yet.
     var bornAt: [UInt32: Date] = [:]
@@ -350,7 +355,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let pid = app.processIdentifier
             DispatchQueue.main.async { self.observers.watch(pid: pid) }
             MutationQueue.shared.hop { [weak self] in
-                self?.scheduleRefresh(reason: "appLaunched")
+                guard let self else { return }
+                self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
+                self.scheduleRefresh(reason: "appLaunched")
             }
         }
     }
@@ -378,6 +385,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
                 self.scheduleRefresh(reason: "appActivated")
+                if self.ownedWindows(pid: app.processIdentifier).isEmpty {
+                    self.launchPollsRemaining = max(self.launchPollsRemaining, 3)
+                }
                 // A model window may already be dead (Electron AX churn). A
                 // space full of ghosts must not count as occupied, or macOS
                 // promoting the next app after a close drags the user away.
@@ -601,6 +611,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             scheduleRefresh(reason: "unresolved", delay: 1.0)
         } else if !refreshUnresolved {
             unresolvedRefreshPasses = 0
+        }
+        if launchPollsRemaining > 0 {
+            launchPollsRemaining -= 1
+            scheduleRefresh(reason: "launchPoll", delay: 0.75)
         }
     }
 
