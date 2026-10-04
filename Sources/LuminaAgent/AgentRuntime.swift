@@ -650,13 +650,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             refreshUnresolved = true
         }
         let delta = reconcile(model: session.allWindowIds, modelPids: modelPids, live: live)
-        let removals = removalGate.classify(
-            removed: delta.removed,
-            cgLive: cgWindowIds(),
-            pidOf: modelPids,
-            axFailedPids: failedManaged,
-            floatingIds: floatingIds
-        )
+        var removals: (real: [UInt32], deferred: [UInt32]) = (real: [], deferred: [])
         defer {
             recordRefreshSummary(
                 reason: reason,
@@ -667,6 +661,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 started: started
             )
         }
+        // Check suspension before the gate classifies: a pass the lock-screen
+        // guard is about to discard must not advance the miss counters.
         if shouldSuspendMassRemoval(
             modelCount: session.allWindowIds.count,
             removedCount: delta.removed.count,
@@ -676,6 +672,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             scheduleRefresh(reason: "massLossSuspended", delay: 2.0)
             return
         }
+        removals = removalGate.classify(
+            removed: delta.removed,
+            cgLive: cgWindowIds(),
+            pidOf: modelPids,
+            axFailedPids: failedManaged,
+            floatingIds: floatingIds
+        )
         if !removals.deferred.isEmpty {
             log.info("refresh deferring removal ids=\(removals.deferred) (cg still lists them)")
             refreshUnresolved = true
