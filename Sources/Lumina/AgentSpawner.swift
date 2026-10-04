@@ -12,6 +12,10 @@ final class AgentSpawner: @unchecked Sendable {
     var quitPids: Set<pid_t> = []
     private let log = LuminaLog(category: .extra, fileURL: LuminaLog.defaultFileURL())
     private var loggedMissingDisclaim = false
+    /// Strong references to live process sources, keyed by pid. The handler
+    /// clears the entry on exit; without this the source's strong capture of
+    /// its own handler leaked one source per watched pid.
+    private var watchers: [pid_t: DispatchSourceProcess] = [:]
     private lazy var disclaim: DisclaimResponsibility? = {
         guard let dlDefault, let sym = dlsym(dlDefault, "responsibility_spawnattrs_setdisclaim") else { return nil }
         return unsafeBitCast(sym, to: DisclaimResponsibility.self)
@@ -63,8 +67,9 @@ final class AgentSpawner: @unchecked Sendable {
 
     func watch(pid: pid_t, onExit: @escaping () -> Void) {
         let src = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
-        src.setEventHandler {
-            src.cancel()
+        watchers[pid] = src
+        src.setEventHandler { [weak self] in
+            self?.watchers.removeValue(forKey: pid)?.cancel()
             onExit()
         }
         src.resume()
