@@ -856,7 +856,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             space.floating.append(window)
             session.spaces[targetId] = space
         } else {
-            pruneGhostLeaves(space: targetId)
             session = session.insertSpiral(space: targetId, newLeaf: window, usableIsWide: usableIsWide(usable))
             let mins = minSizes()
             let (clamped, floated) = session.clampOverflow(space: targetId, minSizes: mins, usable: usable, gaps: config.gaps, preferFloat: (session.spaces[targetId] ?? target).lastTiledLeaf)
@@ -1542,20 +1541,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         for w in space.floating {
             if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
-        }
-        pruneGhostLeaves(space: id)
-    }
-
-    func pruneGhostLeaves(space spaceId: SpaceId) {
-        guard let space = session.spaces[spaceId] else { return }
-        let windows = space.tiledLeaves().compactMap(\.leaf) + space.floating
-        for w in windows where !hasAXElement(w) && !isYoung(w.cgWindowId) {
-            log.info("prune ghost window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") space=\(spaceId)")
-            stashKnownOriginal(w.cgWindowId)
-            session = session.removeWindow(space: spaceId, cgWindowId: w.cgWindowId)
-            elements[w.cgWindowId] = nil
-            adapter.forgetWindowId(w.cgWindowId)
-            forgetBorn(w.cgWindowId)
         }
     }
 
