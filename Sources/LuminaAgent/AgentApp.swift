@@ -18,8 +18,14 @@ struct AgentApp {
             argv.removeSubrange(i...i + 1)
             return value
         }
+        func positionalArg() -> String? {
+            // Never accept a leftover flag (e.g. --crash-recover) as a socket
+            // path: bind would fail and the agent would run headless.
+            guard let first = argv.first, !first.hasPrefix("-") else { return nil }
+            return first
+        }
         let instance = UUID(uuidString: env["LUMINA_INSTANCE_ID"] ?? takeFlag("--instance-id") ?? "") ?? UUID()
-        let socket = env["LUMINA_SOCKET"] ?? takeFlag("--socket") ?? argv.first
+        let socket = env["LUMINA_SOCKET"] ?? takeFlag("--socket") ?? positionalArg()
             ?? LuminaPaths.resolvedAgentSocketPath(
                 uid: getuid(),
                 tmpdir: FileManager.default.temporaryDirectory.path,
