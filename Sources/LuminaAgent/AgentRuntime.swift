@@ -1193,6 +1193,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     log.info("move-node-to-workspace \(n) skipped: no focused window")
                     return
                 }
+                captureSpaceSwitch(from: session.focusedSpace)
                 rememberFocus(focused)
                 let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)
                 let from = session.focusedSpace.raw
@@ -1480,13 +1481,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         session.spaces[spaceId] = space
     }
 
-    func switchSpace(_ id: SpaceId) {
-        guard id != session.focusedSpace else { return }
+    /// Bookkeeping shared by every path that changes the focused space: stamp
+    /// the switch, remember the outgoing space's focus and live frames, and
+    /// drop the native-focus sync guard.
+    func captureSpaceSwitch(from source: SpaceId) {
         lastLuminaSpaceChange = Date()
-        let source = session.focusedSpace
         captureFocusForSpaceSwitch()
         captureOnscreenFrames(for: source)
         lastSyncedNativeFocusedId = nil
+    }
+
+    func switchSpace(_ id: SpaceId) {
+        guard id != session.focusedSpace else { return }
+        let source = session.focusedSpace
+        captureSpaceSwitch(from: source)
         // Unhide the destination first, then hide the source: fewer frames
         // cross on screen at once and there is no hole to see.
         session = session.switchTo(id)
@@ -1502,11 +1510,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func switchSpaceBy(_ transform: (Session) -> Session) {
-        lastLuminaSpaceChange = Date()
         let source = session.focusedSpace
-        captureFocusForSpaceSwitch()
-        captureOnscreenFrames(for: source)
-        lastSyncedNativeFocusedId = nil
+        captureSpaceSwitch(from: source)
         session = transform(session)
         unstashSpace(session.focusedSpace)
         applyFrames()
