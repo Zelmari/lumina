@@ -51,6 +51,7 @@ private let axGetWindow: AXGetWindow? = {
 }()
 
 public final class AXAdapter {
+    private let lock = NSLock()
     private var inFlight: [UInt32: UInt64] = [:]
     private var idCache: [UInt: UInt32] = [:]
     private var minSizeCache: [UInt: Size] = [:]
@@ -95,6 +96,8 @@ public final class AXAdapter {
 
     public func cachedWindowId(for element: AXUIElement) -> UInt32? {
         let key = elementKey(element)
+        lock.lock()
+        defer { lock.unlock() }
         if let cached = idCache[key] { return cached }
         for (id, el) in tracked where CFEqual(el, element) {
             idCache[key] = id
@@ -104,6 +107,8 @@ public final class AXAdapter {
     }
 
     public func rememberWindowId(_ id: UInt32, for element: AXUIElement) {
+        lock.lock()
+        defer { lock.unlock() }
         if let old = tracked.first(where: { CFEqual($0.value, element) && $0.key != id })?.key {
             tracked[old] = nil
             idCache = idCache.filter { $0.value != old }
@@ -128,6 +133,8 @@ public final class AXAdapter {
     }
 
     public func forgetWindowId(_ id: UInt32) {
+        lock.lock()
+        defer { lock.unlock() }
         if let el = tracked[id] {
             minSizeCache[elementKey(el)] = nil
         }
@@ -144,31 +151,47 @@ public final class AXAdapter {
     /// building the tree keeps tearing it down, so AXWindows stays empty and
     /// the app's windows are never adopted.
     public func wakeAccessibility(pid: pid_t) {
-        if accessibilityHealthy.contains(pid) || accessibilityDelivered.contains(pid) { return }
         let now = Date()
-        if let last = accessibilityWakeAt[pid], now.timeIntervalSince(last) < accessibilityWakeRetry { return }
+        lock.lock()
+        if accessibilityHealthy.contains(pid) || accessibilityDelivered.contains(pid) {
+            lock.unlock()
+            return
+        }
+        if let last = accessibilityWakeAt[pid], now.timeIntervalSince(last) < accessibilityWakeRetry {
+            lock.unlock()
+            return
+        }
         accessibilityWakeAt[pid] = now
+        lock.unlock()
         let app = AXUIElementCreateApplication(pid)
         let err = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         if err == .success {
+            lock.lock()
             accessibilityDelivered.insert(pid)
+            lock.unlock()
             log.info("ax wake pid=\(pid) bundle=\(bundleId(pid: pid) ?? "?")")
         } else if err == .attributeUnsupported {
             // Not a Chromium-family app; the flag will never take. Do not retry.
+            lock.lock()
             accessibilityDelivered.insert(pid)
+            lock.unlock()
         }
     }
 
     /// Once a window id resolves for the pid the tree is up; stop asking.
     public func markAccessibilityHealthy(pid: pid_t) {
+        lock.lock()
         accessibilityHealthy.insert(pid)
+        lock.unlock()
     }
 
     /// A terminated app must forget its wake state: a relaunch is a new pid.
     public func forgetAccessibility(pid: pid_t) {
+        lock.lock()
         accessibilityWakeAt[pid] = nil
         accessibilityHealthy.remove(pid)
         accessibilityDelivered.remove(pid)
+        lock.unlock()
     }
 
     public func focusedWindow(of appOrWindow: AXUIElement) -> AXUIElement? {
@@ -228,7 +251,9 @@ public final class AXAdapter {
         window.generation += 1
         let id = window.cgWindowId
         let gen = window.generation
+        lock.lock()
         inFlight[id] = gen
+        lock.unlock()
         let result = applyFrame(rect, of: element)
         scheduleInFlightClear(id: id, gen: gen)
         return result
@@ -237,20 +262,30 @@ public final class AXAdapter {
     private func scheduleInFlightClear(id: UInt32, gen: UInt64) {
         // AXMoved/AXResized arrive after we return; keep the tag until they can be ignored.
         MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            if self?.inFlight[id] == gen { self?.inFlight[id] = nil }
+            guard let self else { return }
+            self.lock.lock()
+            if self.inFlight[id] == gen { self.inFlight[id] = nil }
+            self.lock.unlock()
         }
     }
 
     public func shouldIgnoreAXGeometry(window: LuminaLayout.Window) -> Bool {
-        ignoreAXGeometry(windowGeneration: window.generation, inFlight: inFlight[window.cgWindowId])
+        lock.lock()
+        let inFlightGen = inFlight[window.cgWindowId]
+        lock.unlock()
+        return ignoreAXGeometry(windowGeneration: window.generation, inFlight: inFlightGen)
     }
 
     public func clearInFlight(id: UInt32, generation: UInt64) {
+        lock.lock()
         if inFlight[id] == generation { inFlight[id] = nil }
+        lock.unlock()
     }
 
     public func generationInFlight(for id: UInt32) -> Bool {
-        inFlight[id] != nil
+        lock.lock()
+        defer { lock.unlock() }
+        return inFlight[id] != nil
     }
 
     /// Hide a window on an inactive space: move it only. Size is left alone so
@@ -260,7 +295,9 @@ public final class AXAdapter {
         window.generation += 1
         let id = window.cgWindowId
         let gen = window.generation
+        lock.lock()
         inFlight[id] = gen
+        lock.unlock()
         let result = applyStashPosition(origin, of: element)
         scheduleInFlightClear(id: id, gen: gen)
         return result
@@ -436,7 +473,10 @@ public final class AXAdapter {
 
     public func minSize(of element: AXUIElement) -> Size {
         let key = elementKey(element)
-        if let cached = minSizeCache[key] { return cached }
+        lock.lock()
+        let cached = minSizeCache[key]
+        lock.unlock()
+        if let cached { return cached }
         var ref: CFTypeRef?
         let attr = "AXMinSize" as CFString
         guard AXUIElementCopyAttributeValue(element, attr, &ref) == .success,
@@ -445,7 +485,11 @@ public final class AXAdapter {
         var size = CGSize.zero
         AXValueGetValue(val as! AXValue, .cgSize, &size)
         let measured = Size(w: Double(size.width), h: Double(size.height))
-        if measured != .unknown { minSizeCache[key] = measured }
+        if measured != .unknown {
+            lock.lock()
+            minSizeCache[key] = measured
+            lock.unlock()
+        }
         return measured
     }
 
