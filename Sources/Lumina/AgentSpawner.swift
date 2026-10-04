@@ -107,7 +107,11 @@ final class AgentSpawner: @unchecked Sendable {
 
         // Detach so extra quit does not kill the agent (DESIGN §3 / BP-31).
         let setsid: Int16 = 0x0400
-        posix_spawnattr_setflags(&attr, setsid)
+        // Close every inherited fd in the child before exec (0x4000 is
+        // POSIX_SPAWN_CLOEXEC_DEFAULT); the extra's cached log fd in
+        // particular must not leak into the agent (M43).
+        let cloexecDefault: Int16 = 0x4000
+        posix_spawnattr_setflags(&attr, setsid | cloexecDefault)
         // Child must own TCC, otherwise AXIsProcessTrusted follows the extra.
         if let disclaim {
             _ = disclaim(&attr, 1)

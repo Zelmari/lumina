@@ -18,6 +18,9 @@ public final class LuminaLog: @unchecked Sendable {
     private let fileURL: URL?
     private let lock = NSLock()
     private var appendFD: Int32 = -1
+    private var appendInode: UInt64 = 0
+    /// Rotate to `<name>.1` once the log passes this size.
+    private let maxLogBytes: off_t = 10 * 1024 * 1024
     private let stamp: DateFormatter
     #if os(macOS)
     private let oslog: Logger
@@ -88,12 +91,32 @@ public final class LuminaLog: @unchecked Sendable {
     }
 
     private func openedAppendFD(_ fileURL: URL) -> Int32 {
-        if appendFD >= 0 { return appendFD }
+        if appendFD >= 0 {
+            var st = stat()
+            if stat(fileURL.path, &st) == 0, UInt64(st.st_ino) == appendInode, st.st_size <= maxLogBytes {
+                return appendFD
+            }
+            // Missing, replaced (external rotation/truncation), or past the
+            // size cap: drop the cached fd and reopen.
+            close(appendFD)
+            appendFD = -1
+        }
+        rotateLogIfNeeded(fileURL)
         let dir = fileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let fd = open(fileURL.path, O_WRONLY | O_CREAT | O_APPEND, mode_t(0o644))
+        let fd = open(fileURL.path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, mode_t(0o644))
         appendFD = fd
+        if fd >= 0 {
+            var st = stat()
+            appendInode = stat(fileURL.path, &st) == 0 ? UInt64(st.st_ino) : 0
+        }
         return fd
+    }
+
+    private func rotateLogIfNeeded(_ fileURL: URL) {
+        var st = stat()
+        guard stat(fileURL.path, &st) == 0, st.st_size > maxLogBytes else { return }
+        rename(fileURL.path, fileURL.path + ".1")
     }
 }
 
