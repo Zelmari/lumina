@@ -344,15 +344,17 @@ public final class AXAdapter {
     private func disableAnimations(_ element: AXUIElement) -> () -> Void {
         guard let pid = pid(of: element) else { return {} }
         let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, axWriteTimeout)
         let attr = "AXEnhancedUserInterface" as CFString
         var ref: CFTypeRef?
-        var prior: Bool?
-        if AXUIElementCopyAttributeValue(app, attr, &ref) == .success {
-            prior = ref as? Bool
+        guard AXUIElementCopyAttributeValue(app, attr, &ref) == .success else {
+            // Restoring needs the prior value; without it, never disable the flag.
+            return {}
         }
+        let prior = ref as? Bool
         AXUIElementSetAttributeValue(app, attr, kCFBooleanFalse)
         return {
-            if let prior, prior == true {
+            if prior == true {
                 AXUIElementSetAttributeValue(app, attr, kCFBooleanTrue)
             }
         }
