@@ -63,23 +63,34 @@ final class MenuSocketServer {
     private func serve(_ fd: Int32) {
         var buffer = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
-        let n = read(fd, &tmp, tmp.count)
-        if n > 0 {
+        while true {
+            let n = read(fd, &tmp, tmp.count)
+            if n <= 0 { break }
             buffer.append(contentsOf: tmp.prefix(n))
-            if buffer.count > ipcMaxLineBytes { close(fd); return }
-            let line = String(data: buffer, encoding: .utf8) ?? ""
-            let parsed = parseLine(line.trimmingCharacters(in: .newlines), as: .extra)
-            let response: IPCResponse
-            switch parsed {
-            case .extra(let cmd, let id):
-                response = onCommand?(cmd, id) ?? .failure(id: id, error: "no handler")
-            case .error(let e):
-                response = e
-            default:
-                response = .failure(id: "", error: "unknown cmd")
+            if buffer.count > ipcMaxLineBytes {
+                close(fd)
+                return
             }
-            if let data = try? encode(response).data(using: .utf8) {
-                _ = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
+            while let range = buffer.firstIndex(of: 0x0A) {
+                let lineData = buffer.subdata(in: buffer.startIndex..<range)
+                buffer.removeSubrange(buffer.startIndex...range)
+                let line = String(data: lineData, encoding: .utf8) ?? ""
+                let parsed = parseLine(line, as: .extra)
+                let response: IPCResponse
+                switch parsed {
+                case .lineTooLong:
+                    close(fd)
+                    return
+                case .error(let e):
+                    response = e
+                case .extra(let cmd, let id):
+                    response = onCommand?(cmd, id) ?? .failure(id: id, error: "no handler")
+                default:
+                    response = .failure(id: "", error: "unknown cmd")
+                }
+                if let data = try? encode(response).data(using: .utf8) {
+                    _ = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
+                }
             }
         }
         close(fd)
