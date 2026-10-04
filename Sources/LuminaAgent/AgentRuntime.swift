@@ -1987,9 +1987,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         applyFrames()
     }
 
-    /// Adopt the frontmost app's own idea of its focused window: if it is
-    /// managed, make its space visible and focus it. Unknown windows are left
-    /// to the next refresh session.
+    /// Adopt the frontmost app's own idea of its focused window. A window on
+    /// another Lumina space is remembered there but never pulled on screen:
+    /// activation fires for many reasons (Dock, cmd-tab, our own focus
+    /// restoration), and following it teleported between workspaces and
+    /// re-raised windows on every app switch.
     func syncFocusToFrontmostApp(pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
         guard let focused = adapter.focusedWindow(of: app).flatMap({ adapter.windowId(for: $0) }),
@@ -1997,13 +1999,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
               let window = windowAnywhere(focused),
               hasAXElement(window)
         else { return }
-        if let spaceId = session.spaceContaining(cgWindowId: focused), spaceId != session.focusedSpace {
+        let spaceId = session.spaceContaining(cgWindowId: focused) ?? session.focusedSpace
+        guard spaceId == session.focusedSpace else {
             var s = session
             s.spaces[spaceId]?.focusedWindow = focused
+            if let leaf = s.spaces[spaceId]?.leaf(containing: focused) {
+                s.spaces[spaceId]?.lastTiledLeaf = leaf.id
+            }
             session = s
-            switchSpace(spaceId)
+            return
         }
-        nativeFocus(focused)
+        rememberFocus(focused)
     }
 
     func recomputeCurrentToken(reason: CurrentReason) {
