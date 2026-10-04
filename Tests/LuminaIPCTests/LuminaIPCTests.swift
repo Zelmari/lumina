@@ -109,6 +109,18 @@ struct CodecTests {
         #expect(id == "d")
     }
 
+    @Test func requestWithoutArgsDecodes() throws {
+        let line = #"{"v":1,"id":"x","cmd":"status"}"#
+        let parsed = parseLine(line)
+        guard case .request(.status, let id) = parsed else {
+            Issue.record("expected status, got \(parsed)")
+            return
+        }
+        #expect(id == "x")
+        let direct = try JSONDecoder().decode(IPCRequest.self, from: Data(line.utf8))
+        #expect(direct.args.isEmpty)
+    }
+
     @Test func jsonValueWholeDoubleRoundTrips() throws {
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()

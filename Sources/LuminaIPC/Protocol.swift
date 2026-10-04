@@ -15,6 +15,14 @@ public struct IPCRequest: Equatable, Sendable, Codable {
         self.cmd = cmd
         self.args = args
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.v = try c.decode(Int.self, forKey: .v)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.cmd = try c.decode(String.self, forKey: .cmd)
+        self.args = try c.decodeIfPresent([String: JSONValue].self, forKey: .args) ?? [:]
+    }
 }
 
 public struct IPCResponse: Equatable, Sendable, Codable {
