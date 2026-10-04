@@ -190,6 +190,8 @@ final class ExtraController: NSObject, @unchecked Sendable {
             self.spawnInFlight = false
             guard let pid else {
                 self.log.error("spawn failed")
+                // Keep the moved session files so a later spawn can still restore frames.
+                if self.pendingUnstash == nil { self.pendingUnstash = unstashFrom }
                 return
             }
             var next = self.registry.load()
@@ -442,20 +444,24 @@ final class ExtraController: NSObject, @unchecked Sendable {
     func unstashAllSessions() -> String? {
         let root = supportRoot + "/spaces"
         let pending = supportRoot + "/pending-unstash"
-        guard let dirs = try? FileManager.default.contentsOfDirectory(atPath: root) else {
-            try? FileManager.default.removeItem(atPath: registry.path)
-            return nil
-        }
         try? FileManager.default.createDirectory(atPath: pending, withIntermediateDirectories: true)
         var moved = false
-        for dir in dirs {
-            let path = root + "/" + dir + "/session.json"
-            guard FileManager.default.fileExists(atPath: path) else { continue }
-            let dest = pending + "/" + dir + ".json"
-            try? FileManager.default.removeItem(atPath: dest)
-            if (try? FileManager.default.moveItem(atPath: path, toPath: dest)) != nil {
-                moved = true
+        if let dirs = try? FileManager.default.contentsOfDirectory(atPath: root) {
+            for dir in dirs {
+                let path = root + "/" + dir + "/session.json"
+                guard FileManager.default.fileExists(atPath: path) else { continue }
+                let dest = pending + "/" + dir + ".json"
+                try? FileManager.default.removeItem(atPath: dest)
+                if (try? FileManager.default.moveItem(atPath: path, toPath: dest)) != nil {
+                    moved = true
+                }
             }
+        }
+        // A failed spawn may have left moved files behind; pick them up too.
+        if let leftovers = try? FileManager.default.contentsOfDirectory(atPath: pending),
+           leftovers.contains(where: { $0.hasSuffix(".json") })
+        {
+            moved = true
         }
         try? FileManager.default.removeItem(atPath: registry.path)
         return moved ? pending : nil
