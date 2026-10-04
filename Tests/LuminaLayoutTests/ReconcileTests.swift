@@ -97,4 +97,87 @@ struct ReconcileTests {
         #expect(!shouldSuspendMassRemoval(modelCount: 2, removedCount: 2, screenLocked: true))
         #expect(!shouldSuspendMassRemoval(modelCount: 6, removedCount: 0, screenLocked: true))
     }
+
+    @Test func removalGoneFromCGIsImmediate() {
+        var gate = RemovalGate()
+        let result = gate.classify(
+            removed: [7], cgLive: [], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.real == [7])
+        #expect(result.deferred.isEmpty)
+    }
+
+    @Test func tiledRemovalDeferredUnboundedWhileCGLive() {
+        var gate = RemovalGate()
+        for _ in 0..<10 {
+            let result = gate.classify(
+                removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: []
+            )
+            #expect(result.real.isEmpty)
+            #expect(result.deferred == [7])
+        }
+    }
+
+    @Test func removalDeferredWhileAxReadFails() {
+        var gate = RemovalGate()
+        for _ in 0..<10 {
+            let result = gate.classify(
+                removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [10], floatingIds: [7]
+            )
+            #expect(result.real.isEmpty)
+            #expect(result.deferred == [7])
+        }
+    }
+
+    @Test func floatingRemovalAfterGraceMisses() {
+        var gate = RemovalGate()
+        var result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.real.isEmpty)
+        #expect(result.deferred == [7])
+        result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.real.isEmpty)
+        #expect(result.deferred == [7])
+        result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.real == [7])
+        #expect(result.deferred.isEmpty)
+    }
+
+    @Test func seenWindowResetsMisses() {
+        var gate = RemovalGate()
+        _ = gate.classify(removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7])
+        _ = gate.classify(removed: [], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7])
+        var result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.deferred == [7])
+        _ = gate.classify(removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7])
+        result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.real == [7])
+    }
+
+    @Test func successfulMissesAfterFailedReadsStartFresh() {
+        var gate = RemovalGate()
+        for _ in 0..<5 {
+            _ = gate.classify(
+                removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [10], floatingIds: [7]
+            )
+        }
+        var result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.deferred == [7])
+        _ = gate.classify(removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7])
+        result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7]
+        )
+        #expect(result.real == [7])
+    }
 }

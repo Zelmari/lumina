@@ -91,6 +91,65 @@ public func reconcile(
     )
 }
 
+/// Decides which model windows a refresh is allowed to destroy.
+///
+/// CG's window list is the aliveness truth for tiled and stashed windows: a
+/// "successful" AX read that omits one is not evidence of death (Ghostty
+/// intermittently drops live windows from `AXWindows`), so those are deferred
+/// for as long as WindowServer still lists them. There is no miss cap.
+///
+/// A window missing from a *failed* AX read tells us nothing at all: busy apps
+/// time out `AXWindows`, so the window is deferred without counting a miss.
+/// `removed` ids CG has also dropped are destroyed immediately.
+///
+/// Floating entries are the only capped class. Hidden retention windows
+/// (Spotlight keeps a CG window alive while its UI is dismissed) must not pin
+/// model entries forever, so they are removed after a few consecutive misses.
+public struct RemovalGate: Equatable, Sendable {
+    private var misses: [UInt32: Int]
+    private let grace: Int
+
+    public init(grace: Int = 2) {
+        self.misses = [:]
+        self.grace = grace
+    }
+
+    public mutating func classify(
+        removed: [UInt32],
+        cgLive: Set<UInt32>,
+        pidOf: [UInt32: Int32],
+        axFailedPids: Set<Int32>,
+        floatingIds: Set<UInt32>
+    ) -> (real: [UInt32], deferred: [UInt32]) {
+        var real: [UInt32] = []
+        var deferred: [UInt32] = []
+        var next: [UInt32: Int] = [:]
+        for id in removed {
+            guard cgLive.contains(id) else {
+                real.append(id)
+                continue
+            }
+            if let pid = pidOf[id], axFailedPids.contains(pid) {
+                deferred.append(id)
+                continue
+            }
+            guard floatingIds.contains(id) else {
+                deferred.append(id)
+                continue
+            }
+            let miss = (misses[id] ?? 0) + 1
+            if miss > grace {
+                real.append(id)
+            } else {
+                deferred.append(id)
+                next[id] = miss
+            }
+        }
+        misses = next
+        return (real, deferred)
+    }
+}
+
 /// A refresh that would drop most of the model is suspicious while the screen
 /// is locked or asleep: AX goes dark and every window looks closed. Keep the
 /// model for this pass; the next session after unlock retries. When the screen

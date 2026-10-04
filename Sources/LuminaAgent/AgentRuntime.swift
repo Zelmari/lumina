@@ -49,6 +49,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// When a window joined the session. Pruning never removes a window
     /// younger than the grace period; it may just not be visible to AX/CG yet.
     var bornAt: [UInt32: Date] = [:]
+    /// Consecutive-miss and failed-read bookkeeping for refresh removals.
+    var removalGate = RemovalGate()
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
     let preferredDisplayUUID: String?
@@ -481,34 +483,67 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         defer { LuminaSignposts.pointsOfInterest.endInterval("refresh-session", refreshInterval) }
         let started = Date()
         refreshUnresolved = false
-        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
+        let onScreenRows = onScreenCGWindows(intersecting: bound.axFrame)
+        let onScreen = Set(onScreenRows.compactMap(cgWindowID))
         var elementsById: [UInt32: AXUIElement] = [:]
         var live: [LiveWindow] = []
-        for pid in refreshPids() {
-            for el in adapter.windows(pid: pid) {
-                guard let id = adapter.windowId(for: el) else { continue }
-                let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                live.append(LiveWindow(
-                    cgWindowId: id,
-                    pid: pid,
-                    bundleId: adapter.bundleId(pid: pid),
-                    frame: frame,
-                    onScreen: onScreen.contains(id)
-                ))
-                elementsById[id] = el
-            }
-        }
         var modelPids: [UInt32: Int32] = [:]
+        var floatingIds: Set<UInt32> = []
         for space in session.spaces.values {
             for node in space.tiledLeaves() { if let w = node.leaf { modelPids[w.cgWindowId] = w.pid } }
-            for w in space.floating { modelPids[w.cgWindowId] = w.pid }
+            for w in space.floating {
+                modelPids[w.cgWindowId] = w.pid
+                if w.role == .floating { floatingIds.insert(w.cgWindowId) }
+            }
+        }
+        /// Pids whose AX window list did not answer this pass. Their absence
+        /// from `live` is not evidence of death; removals are deferred and
+        /// the unresolved retry covers newly created windows.
+        var axFailedPids: Set<pid_t> = []
+        for pid in refreshPids() {
+            switch adapter.enumerateWindows(pid: pid) {
+            case .failed:
+                axFailedPids.insert(pid)
+            case .list(let elements):
+                for el in elements {
+                    guard let id = adapter.windowId(for: el) else { continue }
+                    let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
+                    live.append(LiveWindow(
+                        cgWindowId: id,
+                        pid: pid,
+                        bundleId: adapter.bundleId(pid: pid),
+                        frame: frame,
+                        onScreen: onScreen.contains(id)
+                    ))
+                    elementsById[id] = el
+                }
+            }
+        }
+        let failedManaged = axFailedPids.intersection(Set(modelPids.values))
+        let unmanagedFailed = onScreenRows.contains { row in
+            guard let pid = cgOwnerPID(row), axFailedPids.contains(pid), !isOurProcess(pid),
+                  cgWindowLayer(row) == 0, let id = cgWindowID(row) else { return false }
+            return !session.allWindowIds.contains(id)
+        }
+        if !failedManaged.isEmpty {
+            log.info("refresh ax read failed managed pids=\(failedManaged.sorted())")
+        }
+        if !failedManaged.isEmpty || unmanagedFailed {
+            refreshUnresolved = true
         }
         let delta = reconcile(model: session.allWindowIds, modelPids: modelPids, live: live)
+        let removals = removalGate.classify(
+            removed: delta.removed,
+            cgLive: cgWindowIds(),
+            pidOf: modelPids,
+            axFailedPids: failedManaged,
+            floatingIds: floatingIds
+        )
         defer {
             recordRefreshSummary(
                 reason: reason,
                 added: delta.added.count,
-                removed: delta.removed.count,
+                removed: removals.real.count,
                 rebinds: delta.rebinds.count,
                 unresolved: refreshUnresolved,
                 started: started
@@ -523,8 +558,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             scheduleRefresh(reason: "massLossSuspended", delay: 2.0)
             return
         }
+        if !removals.deferred.isEmpty {
+            log.info("refresh deferring removal ids=\(removals.deferred) (cg still lists them)")
+            refreshUnresolved = true
+        }
         let focusedBefore = session.current.focusedWindow
-        for id in delta.removed { removeDestroyedWindow(id) }
+        for id in removals.real { removeDestroyedWindow(id) }
         if !delta.removed.isEmpty, session.current.focusedWindow != focusedBefore,
            let winner = session.current.focusedWindow
         {
@@ -544,9 +583,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         applyFrames()
         restashOffspace()
-        if !delta.isEmpty || refreshUnresolved {
+        if !delta.isEmpty || refreshUnresolved || !removals.deferred.isEmpty {
             let ms = Int(Date().timeIntervalSince(started) * 1000)
-            log.info("refresh reason=\(reason) added=\(delta.added.count) removed=\(delta.removed.count) rebinds=\(delta.rebinds.count) unresolved=\(refreshUnresolved) \(ms)ms")
+            log.info("refresh reason=\(reason) added=\(delta.added.count) removed=\(removals.real.count) deferred=\(removals.deferred.count) rebinds=\(delta.rebinds.count) unresolved=\(refreshUnresolved) \(ms)ms")
         }
         if refreshUnresolved, unresolvedRefreshPasses < 2 {
             unresolvedRefreshPasses += 1
