@@ -181,6 +181,49 @@ struct SpiralTests {
         #expect(session[space2]!.focusedWindow == 99)
     }
 
+    @Test func tileFloaterSplitsIntoTree() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
+        var space = session[space1]!
+        var floater = win(2)
+        floater.role = .floating
+        space.floating = [floater]
+        session.spaces[space1] = space
+        session = session.tileFloater(space: space1, cgWindowId: 2, usableIsWide: true)
+        let after = session[space1]!
+        #expect(!after.floating.contains(where: { $0.cgWindowId == 2 }))
+        #expect(after.tiledLeaves().contains(where: { $0.leaf?.cgWindowId == 2 }))
+        #expect(after.leaf(containing: 2)?.leaf?.role == .tiled)
+        let root = after.nodes[after.root!]!
+        #expect(!root.isLeaf)
+        #expect(root.children.count == 2)
+    }
+
+    @Test func tileFloaterIgnoresUnknownId() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
+        let before = session
+        session = session.tileFloater(space: space1, cgWindowId: 99, usableIsWide: true)
+        #expect(session == before)
+    }
+
+    @Test func tileFloaterOnEmptySpaceBecomesRootLeaf() {
+        var session = Session.empty(spaceCount: 1)
+        var space = session[space1]!
+        var floater = win(5)
+        floater.role = .floating
+        space.floating = [floater]
+        session.spaces[space1] = space
+        session = session.tileFloater(space: space1, cgWindowId: 5, usableIsWide: true)
+        let after = session[space1]!
+        #expect(after.floating.isEmpty)
+        let root = after.nodes[after.root!]!
+        #expect(root.isLeaf)
+        #expect(root.leaf?.cgWindowId == 5)
+        #expect(root.leaf?.role == .tiled)
+        #expect(after.focusedWindow == 5)
+    }
+
     @Test func spaceContainingFindsOtherWorkspace() {
         let space2 = SpaceId.require(2)
         var session = Session.empty(spaceCount: 2)

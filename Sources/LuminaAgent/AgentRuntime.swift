@@ -575,6 +575,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard let el = elementsById[pair.to], let w = windowAnywhere(pair.from) else { continue }
             log.info("refresh rebind \(pair.from) -> \(pair.to) bundle=\(w.bundleId ?? "?")")
             rebindOwned(from: pair.from, to: pair.to, element: el, pid: w.pid)
+            reclassifyRebound(id: pair.to, pid: w.pid, element: el, onScreen: onScreen)
         }
         var claimed = session.allWindowIds.union(elements.keys)
         for id in delta.added {
@@ -818,6 +819,30 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(to, for: element)
         elements[to] = element
         observers.watchWindow(element, pid: pid)
+    }
+
+    /// A rebind can swap a placeholder window for the app's real one (or the
+    /// reverse). Re-run classification so a splash's floating role does not
+    /// stick to the real window.
+    func reclassifyRebound(id: UInt32, pid: pid_t, element: AXUIElement, onScreen: Set<UInt32>) {
+        guard let bound, let window = windowAnywhere(id) else { return }
+        let result: ClassifyResult
+        if window.role == .luminaFS { return }
+        if let (input, _, _) = classifyInput(from: element, adapter: adapter, bound: bound, onScreenIds: onScreen) {
+            result = classify(input, rules: config.windowRules)
+        } else {
+            return
+        }
+        let sid = session.spaceContaining(cgWindowId: id) ?? session.focusedSpace
+        guard let space = session.spaces[sid] else { return }
+        let usable = bound.usableRect(gaps: config.gaps)
+        if result == .tiled, space.floating.contains(where: { $0.cgWindowId == id }) {
+            log.info("rebind retile window=\(id) pid=\(pid)")
+            session = session.tileFloater(space: sid, cgWindowId: id, usableIsWide: usableIsWide(usable))
+        } else if result == .floating, let leaf = space.leaf(containing: id) {
+            log.info("rebind refloat window=\(id) pid=\(pid)")
+            session = session.floatLeaf(space: sid, nodeId: leaf.id).0
+        }
     }
 
     /// Drop a window that is really gone: close it on the focused space, remove

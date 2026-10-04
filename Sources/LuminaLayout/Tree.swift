@@ -216,6 +216,20 @@ extension Session {
         }
         return session
     }
+
+    /// Promote a floating window into the spiral tree. Used when an app's
+    /// placeholder (Electron splash) was classified floating and its real
+    /// window replaced the id.
+    public func tileFloater(space spaceId: SpaceId, cgWindowId: UInt32, usableIsWide: Bool) -> Session {
+        var session = self
+        guard var space = session.spaces[spaceId],
+              let idx = space.floating.firstIndex(where: { $0.cgWindowId == cgWindowId })
+        else { return session }
+        var window = space.floating.remove(at: idx)
+        window.role = .tiled
+        session.spaces[spaceId] = space
+        return session.insertSpiral(space: spaceId, newLeaf: window, usableIsWide: usableIsWide)
+    }
 }
 
 extension Space {
