@@ -161,7 +161,7 @@ enum LuminaCLI {
         var buf = [UInt8](repeating: 0, count: 1 << 16)
         let n = read(fd, &buf, buf.count)
         guard n > 0 else { return nil }
-        return try? JSONDecoder().decode(IPCResponse.self, from: Data(buf.prefix(n)))
+        return try? decodeResponse(Data(buf.prefix(n)))
     }
 
     static func printResponse(_ resp: IPCResponse, log: LuminaLog) {

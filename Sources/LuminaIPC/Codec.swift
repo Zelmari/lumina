@@ -66,8 +66,29 @@ public func encode(_ request: IPCRequest) throws -> String {
     return line
 }
 
+/// Decode a response and reject one whose protocol version is not ours.
+public func decodeResponse(_ data: Data) throws -> IPCResponse {
+    let response = try JSONDecoder().decode(IPCResponse.self, from: data)
+    guard response.v == ipcProtocolVersion else {
+        throw IPCCodecError.unsupportedVersion(response.v)
+    }
+    return response
+}
+
 public enum IPCCodecError: Error {
     case encodeFailed
+    case unsupportedVersion(Int)
+}
+
+extension IPCCodecError: CustomStringConvertible {
+    public var description: String {
+        switch self {
+        case .encodeFailed:
+            return "failed to encode IPC message"
+        case .unsupportedVersion(let v):
+            return "unsupported IPC protocol version \(v) (expected \(ipcProtocolVersion))"
+        }
+    }
 }
 
 private enum CmdParse<T> {

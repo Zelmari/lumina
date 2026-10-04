@@ -126,9 +126,8 @@ enum Client {
         _ = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
         var buf = [UInt8](repeating: 0, count: 1 << 16)
         let n = read(fd, &buf, buf.count)
-        guard n > 0, let text = String(bytes: buf.prefix(n), encoding: .utf8) else { return nil }
-        let decoder = JSONDecoder()
-        return try? decoder.decode(IPCResponse.self, from: Data(text.utf8))
+        guard n > 0 else { return nil }
+        return try? decodeResponse(Data(buf.prefix(n)))
     }
 }
 #endif
