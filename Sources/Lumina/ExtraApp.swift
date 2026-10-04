@@ -250,7 +250,16 @@ final class ExtraController: NSObject, @unchecked Sendable {
                 crashRecover: true,
                 runLaunchApps: false
             ) { [weak self] pid in
-                guard let self, let pid else { return }
+                guard let self else { return }
+                guard let pid else {
+                    self.log.error("crash respawn failed")
+                    var reg = self.registry.load()
+                    reg.agents.removeAll { $0.instanceId == record.instanceId }
+                    if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
+                    self.registry.save(reg)
+                    self.pollStatus()
+                    return
+                }
                 var reg = self.registry.load()
                 if let idx = reg.agents.firstIndex(where: { $0.instanceId == record.instanceId }) {
                     reg.agents[idx].pid = pid
