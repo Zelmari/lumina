@@ -320,6 +320,12 @@ final class ExtraController: NSObject, @unchecked Sendable {
             }
         }
         let winnerId = pickCurrentAgent(claimants: claimants.map(\.0.instanceId), lastCurrent: reg.lastCurrentInstanceId)
+        if let winnerId {
+            for pair in claimants where pair.0.instanceId != winnerId {
+                // Only one agent may hold current; losers must drop hotkeys/frames.
+                sendTo(instance: pair.0.instanceId, socket: pair.0.socket, .yield)
+            }
+        }
         if let winnerId, let pair = claimants.first(where: { $0.0.instanceId == winnerId }) {
             let rec = pair.0
             let st = pair.1
