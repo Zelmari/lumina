@@ -190,6 +190,21 @@ struct BalanceResizeTests {
         #expect(space.nodes[space.root!]?.leaf?.cgWindowId == 1)
     }
 
+    @Test func floatingLuminaFSLeafUnstashesSiblings() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
+        session = session.insertSpiral(space: space1, newLeaf: win(2), usableIsWide: true)
+        let fsLeaf = session[space1]!.leaf(containing: 1)!.id
+        session = session.enterLuminaFS(space: space1, leaf: fsLeaf)
+        #expect(session[space1]!.leaf(containing: 2)?.leaf?.role == .stashed)
+        let (after, floated) = session.floatLeaf(space: space1, nodeId: fsLeaf)
+        #expect(floated?.cgWindowId == 1)
+        let space = after[space1]!
+        #expect(space.luminaFullscreen == nil)
+        #expect(space.leaf(containing: 2)?.leaf?.role == .tiled)
+        #expect(space.floating.contains(where: { $0.cgWindowId == 1 }))
+    }
+
     @Test func resizeIgnoredForFloatingAndSingleLeaf() {
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
