@@ -1118,6 +1118,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                       var window = leaf.leaf
             {
                 _ = adapter.setFrame(rect, of: element, tag: &window)
+                writeWindow(window)
             }
             applyFrames()
             moveStart = nil
@@ -1360,6 +1361,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if let live = adapter.frame(of: el), abs(live.x - rect.x) > 24 || abs(live.y - rect.y) > 24 {
                 log.info("layout retry window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?") live=\(Int(live.x)),\(Int(live.y)) target=\(Int(rect.x)),\(Int(rect.y))")
                 _ = adapter.setFrame(rect, of: el, tag: &window)
+                writeWindow(window)
             }
         }
         if let fs, let node = space.nodes[fs], var window = node.leaf, let el = resolvedElement(for: window) {
@@ -1370,6 +1372,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 {
                     _ = adapter.setFrame(usable, of: el, tag: &window)
                 }
+                writeWindow(window)
             }
         }
         if var s = session.spaces[session.focusedSpace] {
@@ -1441,6 +1444,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if let live = adapter.frame(of: el), abs(live.x - rect.x) > 24 || abs(live.y - rect.y) > 24 {
                 log.info("continuation retry window=\(window.cgWindowId) live=\(Int(live.x)),\(Int(live.y)) target=\(Int(rect.x)),\(Int(rect.y))")
                 _ = adapter.setFrame(rect, of: el, tag: &window)
+                writeWindow(window)
             }
         }
     }
