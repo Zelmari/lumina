@@ -216,6 +216,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         applyFrames()
         watchRunningApps()
         startOrStopFFM()
+        // Apps can drop or delay the first frame write; one cheap settle pass
+        // converges the layout without waiting for the user to click.
+        scheduleRefresh(reason: "bootSettle", delay: 0.6)
         log.info("bootLayout tiled=\(tileable.count) floating=\(floaters.count) usable=\(usable.w)x\(usable.h)")
     }
 
@@ -1352,6 +1355,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         restashOffspace()
         focusRestoredWindow(on: id)
         writeSession()
+        // A dropped park or tile write settles on the next pass instead of
+        // staying visible until the user clicks something.
+        scheduleRefresh(reason: "switchSettle", delay: 0.4)
     }
 
     func switchSpaceBy(_ transform: (Session) -> Session) {
@@ -1367,6 +1373,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         restashOffspace()
         focusRestoredWindow(on: session.focusedSpace)
         writeSession()
+        scheduleRefresh(reason: "switchSettle", delay: 0.4)
     }
 
     /// Remember the currently focused window on the outgoing space so a later
