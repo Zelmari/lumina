@@ -171,10 +171,19 @@ public final class AXAdapter {
             lock.unlock()
             log.info("ax wake pid=\(pid) bundle=\(bundleId(pid: pid) ?? "?")")
         } else if err == .attributeUnsupported {
-            // Not a Chromium-family app; the flag will never take. Do not retry.
-            lock.lock()
-            accessibilityDelivered.insert(pid)
-            lock.unlock()
+            // Legacy builds expose only the private AXEnhancedUserInterface flag.
+            let legacyErr = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+            if legacyErr == .success {
+                lock.lock()
+                accessibilityDelivered.insert(pid)
+                lock.unlock()
+                log.info("ax wake legacy pid=\(pid) bundle=\(bundleId(pid: pid) ?? "?")")
+            } else if legacyErr == .attributeUnsupported {
+                // Neither attribute exists; the flag will never take. Do not retry.
+                lock.lock()
+                accessibilityDelivered.insert(pid)
+                lock.unlock()
+            }
         }
     }
 
