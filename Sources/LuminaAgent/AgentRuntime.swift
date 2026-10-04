@@ -117,6 +117,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             boundSkyLightId = skyLight.currentSpaceId(displayUUID: uuid)
             observedSkyLightId = boundSkyLightId
         }
+        do {
+            let server = AgentSocketServer(path: socketPath, log: log)
+            server.onCommand = { [weak self] cmd, id in
+                self?.handleAgent(cmd, id: id) ?? IPCResponse.failure(id: id, error: "gone")
+            }
+            try server.start()
+            self.server = server
+        } catch {
+            log.error("socket failed path=\(socketPath) \(error); exiting")
+            exit(1)
+        }
         hotkeys.isPaused = { [weak self] in
             guard let self else { return true }
             return self.userPaused || self.displayGone || !self.isCurrent
@@ -126,16 +137,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         if shouldRegisterHotkeys(isCurrent: isCurrent, paused: userPaused || displayGone) {
             registerHotkeys()
-        }
-        do {
-            let server = AgentSocketServer(path: socketPath, log: log)
-            server.onCommand = { [weak self] cmd, id in
-                self?.handleAgent(cmd, id: id) ?? IPCResponse.failure(id: id, error: "gone")
-            }
-            try server.start()
-            self.server = server
-        } catch {
-            log.error("socket failed path=\(socketPath) \(error)")
         }
         installWorkspaceObservers()
         watchConfig()
