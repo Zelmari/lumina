@@ -58,6 +58,7 @@ public final class AXAdapter {
     private var loggedMissingPrivateAPI = false
     private var accessibilityWakeAt: [pid_t: Date] = [:]
     private var accessibilityHealthy: Set<pid_t> = []
+    private var accessibilityDelivered: Set<pid_t> = []
     private let accessibilityWakeRetry: TimeInterval = 2
     private let log: LuminaLog
     public var menuBarScreenMaxY: Double = 0
@@ -133,10 +134,12 @@ public final class AXAdapter {
     /// Chromium/Electron keep their accessibility tree off until an assistive
     /// client asks. Set AXManualAccessibility (legacy builds: the private
     /// AXEnhancedUserInterface) to wake it. Asking before the app has a window
-    /// is sometimes a silent no-op, so retry every couple of seconds until an
-    /// element in the enumeration resolves a window id.
+    /// can be a silent no-op, so the set is retried until the app accepts it;
+    /// once accepted, never repeat it. Re-setting the flag while Chromium is
+    /// building the tree keeps tearing it down, so AXWindows stays empty and
+    /// the app's windows are never adopted.
     public func wakeAccessibility(pid: pid_t) {
-        if accessibilityHealthy.contains(pid) { return }
+        if accessibilityHealthy.contains(pid) || accessibilityDelivered.contains(pid) { return }
         let now = Date()
         if let last = accessibilityWakeAt[pid], now.timeIntervalSince(last) < accessibilityWakeRetry { return }
         accessibilityWakeAt[pid] = now
@@ -147,7 +150,11 @@ public final class AXAdapter {
             err = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
         }
         if err == .success {
+            accessibilityDelivered.insert(pid)
             log.info("ax wake pid=\(pid) bundle=\(bundleId(pid: pid) ?? "?")")
+        } else if err == .attributeUnsupported {
+            // Not a Chromium-family app; the flag will never take. Do not retry.
+            accessibilityDelivered.insert(pid)
         }
     }
 
@@ -160,6 +167,7 @@ public final class AXAdapter {
     public func forgetAccessibility(pid: pid_t) {
         accessibilityWakeAt[pid] = nil
         accessibilityHealthy.remove(pid)
+        accessibilityDelivered.remove(pid)
     }
 
     public func focusedWindow(of appOrWindow: AXUIElement) -> AXUIElement? {

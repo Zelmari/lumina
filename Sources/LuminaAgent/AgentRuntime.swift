@@ -295,7 +295,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let pid = app.processIdentifier
             if isOurProcess(pid) || !ownerPids.contains(pid) { continue }
             observers.watch(pid: pid)
-            adapter.wakeAccessibility(pid: pid)
             for el in adapter.windows(pid: pid) {
                 let used = Set(out.map(\.cgWindowId))
                 guard let (input, id, _) = classifyInput(
@@ -521,12 +520,29 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         /// from `live` is not evidence of death; removals are deferred and
         /// the unresolved retry covers newly created windows.
         var axFailedPids: Set<pid_t> = []
+        let unmanagedLayeredIds: Set<UInt32> = Set(onScreenRows.compactMap { row -> UInt32? in
+            guard cgWindowLayer(row) == 0, let id = cgWindowID(row), !session.allWindowIds.contains(id) else { return nil }
+            return id
+        })
+        func hasUnmanagedOnScreen(_ pid: pid_t) -> Bool {
+            onScreenRows.contains { row in
+                cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
+                    && cgWindowID(row).map { unmanagedLayeredIds.contains($0) } == true
+            }
+        }
         for pid in refreshPids() {
-            adapter.wakeAccessibility(pid: pid)
             switch adapter.enumerateWindows(pid: pid) {
             case .failed:
                 axFailedPids.insert(pid)
+                if hasUnmanagedOnScreen(pid) {
+                    log.info("refresh ax read failed unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
+                    refreshUnresolved = true
+                }
             case .list(let elements):
+                if elements.isEmpty, hasUnmanagedOnScreen(pid) {
+                    log.info("refresh ax empty unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
+                    refreshUnresolved = true
+                }
                 for el in elements {
                     guard let id = adapter.windowId(for: el) else {
                         log.info("refresh unresolved window id pid=\(pid) role=\(adapter.role(of: el) ?? "?")")
@@ -1651,6 +1667,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             elements[window.cgWindowId] = el
             return el
         }
+        // Chromium/Electron keep the accessibility tree off; an owned window
+        // whose element cannot be resolved is exactly when the wake matters.
+        adapter.wakeAccessibility(pid: window.pid)
         log.info("no AX element for window=\(window.cgWindowId) pid=\(window.pid) bundle=\(window.bundleId ?? "?")")
         return nil
     }
