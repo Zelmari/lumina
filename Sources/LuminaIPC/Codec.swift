@@ -28,7 +28,7 @@ public func parseLine(_ line: String, as role: IPCRole = .agent) -> ParseResult 
         switch parseExtraCmd(cmd: request.cmd, args: request.args) {
         case .ok(let cmd):
             return .extra(cmd, id: request.id)
-        case .missing(let msg):
+        case .failure(let msg):
             return .error(IPCResponse.failure(id: request.id, error: msg))
         case .unknown:
             return .error(IPCResponse.failure(id: request.id, error: "unknown cmd"))
@@ -37,7 +37,7 @@ public func parseLine(_ line: String, as role: IPCRole = .agent) -> ParseResult 
     switch parseAgentCmd(cmd: request.cmd, args: request.args) {
     case .ok(let cmd):
         return .request(cmd, id: request.id)
-    case .missing(let msg):
+    case .failure(let msg):
         return .error(IPCResponse.failure(id: request.id, error: msg))
     case .unknown:
         return .error(IPCResponse.failure(id: request.id, error: "unknown cmd"))
@@ -72,42 +72,65 @@ public enum IPCCodecError: Error {
 
 private enum CmdParse<T> {
     case ok(T)
-    case missing(String)
+    case failure(String)
     case unknown
+}
+
+/// Human-readable rendering of an argument value for error messages.
+private func argValueDescription(_ value: JSONValue) -> String {
+    switch value {
+    case .null: return "null"
+    case .bool(let b): return b ? "true" : "false"
+    case .int(let i): return String(i)
+    case .double(let d): return String(d)
+    case .string(let s): return s
+    case .array: return "array"
+    case .object: return "object"
+    }
 }
 
 private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<AgentCmd> {
     switch cmd {
     case "workspace":
-        if let s = args["id"]?.string {
+        guard let raw = args["id"] else { return .failure("missing args: id") }
+        if let s = raw.string {
             if s == "prev" { return .ok(.workspacePrev) }
             if s == "next" { return .ok(.workspaceNext) }
         }
-        guard let id = args["id"]?.int else { return .missing("missing args: id") }
+        guard let id = raw.int else {
+            return .failure("invalid args: id=\(argValueDescription(raw))")
+        }
         return .ok(.workspace(id: normalizeWorkspaceId(id)))
     case "move-node-to-workspace":
-        guard let id = args["id"]?.int else { return .missing("missing args: id") }
+        guard let raw = args["id"] else { return .failure("missing args: id") }
+        guard let id = raw.int else {
+            return .failure("invalid args: id=\(argValueDescription(raw))")
+        }
         return .ok(.moveNodeToWorkspace(id: normalizeWorkspaceId(id)))
     case "focus":
-        guard let dir = args["dir"]?.string, let d = DirectionArg(rawValue: dir) else {
-            return .missing("missing args: dir")
+        guard let raw = args["dir"] else { return .failure("missing args: dir") }
+        guard let dir = raw.string, let d = DirectionArg(rawValue: dir) else {
+            return .failure("invalid args: dir=\(argValueDescription(raw))")
         }
         return .ok(.focus(dir: d))
     case "swap":
-        guard let dir = args["dir"]?.string, let d = DirectionArg(rawValue: dir) else {
-            return .missing("missing args: dir")
+        guard let raw = args["dir"] else { return .failure("missing args: dir") }
+        guard let dir = raw.string, let d = DirectionArg(rawValue: dir) else {
+            return .failure("invalid args: dir=\(argValueDescription(raw))")
         }
         return .ok(.swap(dir: d))
     case "resize":
-        guard let delta = args["delta"]?.string, let d = ResizeArg(rawValue: delta) else {
-            return .missing("missing args: delta")
+        guard let raw = args["delta"] else { return .failure("missing args: delta") }
+        guard let delta = raw.string, let d = ResizeArg(rawValue: delta) else {
+            return .failure("invalid args: delta=\(argValueDescription(raw))")
         }
         return .ok(.resize(delta: d))
     case "balance": return .ok(.balance)
     case "float-toggle": return .ok(.floatToggle)
     case "fullscreen":
-        guard let mode = args["mode"]?.string, let m = FullscreenMode(rawValue: mode) else {
-            return .missing("missing args: mode")
+        guard let raw = args["mode"] else { return .failure("missing args: mode") }
+        guard let mode = raw.string, let m = FullscreenMode(rawValue: mode) else {
+            return .failure("invalid args: mode=\(argValueDescription(raw))")
         }
         return .ok(.fullscreen(mode: m))
     case "close": return .ok(.close)

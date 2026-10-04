@@ -41,6 +41,29 @@ struct CodecTests {
         #expect(resp.error == "missing args: dir")
     }
 
+    @Test func invalidArgValuesAreNotReportedAsMissing() {
+        let focus = parseLine(#"{"v":1,"id":"1","cmd":"focus","args":{"dir":"sideways"}}"#)
+        guard case .error(let focusErr) = focus else {
+            Issue.record("expected error, got \(focus)")
+            return
+        }
+        #expect(focusErr.error == "invalid args: dir=sideways")
+
+        let workspace = parseLine(#"{"v":1,"id":"2","cmd":"workspace","args":{"id":"zero"}}"#)
+        guard case .error(let workspaceErr) = workspace else {
+            Issue.record("expected error, got \(workspace)")
+            return
+        }
+        #expect(workspaceErr.error == "invalid args: id=zero")
+
+        let fullscreen = parseLine(#"{"v":1,"id":"3","cmd":"fullscreen","args":{"mode":true}}"#)
+        guard case .error(let fullscreenErr) = fullscreen else {
+            Issue.record("expected error, got \(fullscreen)")
+            return
+        }
+        #expect(fullscreenErr.error == "invalid args: mode=true")
+    }
+
     @Test func versionRejected() {
         let line = #"{"v":2,"id":"1","cmd":"workspace","args":{"id":3}}"#
         let parsed = parseLine(line)
