@@ -138,6 +138,49 @@ struct SpiralTests {
         #expect(session == before)
     }
 
+    @Test func sessionWideRebindUpdatesWindowOnNonFocusedSpace() {
+        let space2 = SpaceId.require(2)
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(space: space1, newLeaf: win(10), usableIsWide: true)
+        session = session.insertSpiral(space: space2, newLeaf: win(20), usableIsWide: true)
+        session = session.rebindWindowId(from: 20, to: 99)
+        #expect(session.focusedSpace == space1)
+        #expect(session[space1]!.leaf(containing: 10)?.leaf?.cgWindowId == 10)
+        #expect(session[space1]!.focusedWindow == 10)
+        #expect(session[space2]!.leaf(containing: 20) == nil)
+        #expect(session[space2]!.leaf(containing: 99)?.leaf?.cgWindowId == 99)
+    }
+
+    @Test func sessionWideRebindUpdatesFloatingOnNonFocusedSpace() {
+        let space2 = SpaceId.require(2)
+        var session = Session.empty(spaceCount: 2)
+        var space = session[space2]!
+        space.floating = [win(30)]
+        space.focusedWindow = 30
+        session.spaces[space2] = space
+        session = session.rebindWindowId(from: 30, to: 99)
+        #expect(!session[space2]!.floating.contains(where: { $0.cgWindowId == 30 }))
+        #expect(session[space2]!.floating.first?.cgWindowId == 99)
+        #expect(session[space2]!.focusedWindow == 99)
+    }
+
+    @Test func sessionWideRebindUpdatesNativeFSWindow() {
+        var session = Session.empty(spaceCount: 1)
+        session.nativeFSWindows = [win(40)]
+        session = session.rebindWindowId(from: 40, to: 99)
+        #expect(session.nativeFSWindows.first?.cgWindowId == 99)
+    }
+
+    @Test func sessionWideRebindRewritesFocusedWindowOnOwningSpace() {
+        let space2 = SpaceId.require(2)
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(space: space2, newLeaf: win(10), usableIsWide: true)
+        session = session.insertSpiral(space: space2, newLeaf: win(20), usableIsWide: true)
+        #expect(session[space2]!.focusedWindow == 20)
+        session = session.rebindWindowId(from: 20, to: 99)
+        #expect(session[space2]!.focusedWindow == 99)
+    }
+
     @Test func spaceContainingFindsOtherWorkspace() {
         let space2 = SpaceId.require(2)
         var session = Session.empty(spaceCount: 2)

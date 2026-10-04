@@ -795,24 +795,29 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             (CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [])
                 .compactMap(cgWindowID)
         )
-        let ownedForPid = session.current.tiledLeaves().compactMap(\.leaf).filter { $0.pid == pid }
-            + session.current.floating.filter { $0.pid == pid }
+        var ownedForPid: [WindowRef] = []
+        for space in session.spaces.values {
+            ownedForPid.append(contentsOf: space.tiledLeaves().compactMap(\.leaf).filter { $0.pid == pid })
+            ownedForPid.append(contentsOf: space.floating.filter { $0.pid == pid })
+        }
         let stale = ownedForPid.filter { !live.contains($0.cgWindowId) && $0.cgWindowId != liveId }
         let unmatched = ownedForPid.filter { !live.contains($0.cgWindowId) }
-        guard stale.count == 1, unmatched.count == 1, !owned(liveId) else { return nil }
+        guard stale.count == 1, unmatched.count == 1, !ownedAnywhere(liveId) else { return nil }
         return stale[0].cgWindowId
     }
 
     func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
-        session = session.rebindWindowId(space: session.focusedSpace, from: from, to: to)
+        session = session.rebindWindowId(from: from, to: to)
+        for sid in session.spaces.keys {
+            if session.spaces[sid]?.focusedWindow == from {
+                session.spaces[sid]?.focusedWindow = to
+            }
+        }
         elements[from] = nil
         adapter.forgetWindowId(from)
         adapter.rememberWindowId(to, for: element)
         elements[to] = element
         observers.watchWindow(element, pid: pid)
-        if session.current.focusedWindow == from {
-            rememberFocus(to)
-        }
     }
 
     /// Drop a window that is really gone: close it on the focused space, remove

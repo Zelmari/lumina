@@ -205,6 +205,17 @@ extension Session {
         }
         return session
     }
+
+    /// A CGWindowID swap is a property of the window, not of whichever space
+    /// happened to be focused. Rebind every space and the native-FS list.
+    public func rebindWindowId(from: UInt32, to: UInt32) -> Session {
+        guard from != to else { return self }
+        var session = self
+        for spaceId in spaces.keys {
+            session = session.rebindWindowId(space: spaceId, from: from, to: to)
+        }
+        return session
+    }
 }
 
 extension Space {
