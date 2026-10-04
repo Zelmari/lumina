@@ -303,6 +303,44 @@ struct SpaceSwitchTests {
         #expect(session[SpaceId.require(1)]?.root == nil)
     }
 
+    @Test func moveToWorkspaceInsertFailureKeepsWindow() {
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1),
+            usableIsWide: true
+        )
+        // Destination root points at a missing node, so `insertSpiral` no-ops.
+        var dest = session[SpaceId.require(2)]!
+        dest.root = NodeId(raw: 999)
+        session.spaces[SpaceId.require(2)] = dest
+        session = session.moveNodeToWorkspace(SpaceId.require(2), usableIsWide: true)
+        #expect(session.focusedSpace.raw == 1)
+        #expect(session[SpaceId.require(1)]?.leaf(containing: 1) != nil)
+        #expect(session[SpaceId.require(2)]?.nodes.isEmpty == true)
+    }
+
+    @Test func moveToWorkspaceStashesArrivalWhenDestLuminaFS() {
+        var session = Session.empty(spaceCount: 2)
+        session = session.insertSpiral(
+            space: SpaceId.require(2),
+            newLeaf: WindowRef(cgWindowId: 2, pid: 2),
+            usableIsWide: true
+        )
+        let destLeaf = session[SpaceId.require(2)]!.root!
+        session = session.enterLuminaFS(space: SpaceId.require(2), leaf: destLeaf)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 1, pid: 1),
+            usableIsWide: true
+        )
+        session = session.moveNodeToWorkspace(SpaceId.require(2), usableIsWide: true)
+        #expect(session.focusedSpace.raw == 2)
+        #expect(session[SpaceId.require(2)]?.luminaFullscreen == destLeaf)
+        #expect(session[SpaceId.require(2)]?.leaf(containing: 1)?.leaf?.role == .stashed)
+        #expect(session[SpaceId.require(1)]?.leaf(containing: 1) == nil)
+    }
+
     @Test func luminaFSDropOnMove() {
         var session = Session.empty(spaceCount: 5)
         session = session.insertSpiral(

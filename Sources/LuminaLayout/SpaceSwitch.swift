@@ -29,26 +29,43 @@ extension Session {
         if destId == focusedSpace { return self }
         guard let space = spaces[focusedSpace], let focused = space.focusedWindow else { return self }
 
-        var session = self
+        let window: WindowRef?
+        if let leaf = space.leaf(containing: focused), let w = leaf.leaf {
+            window = w
+        } else if let idx = space.floating.firstIndex(where: { $0.cgWindowId == focused }) {
+            window = space.floating[idx]
+        } else {
+            window = nil
+        }
+        guard var moving = window else { return self }
+        moving.role = .tiled
+
+        // Insert into the destination first, on this copy. `insertSpiral` no-ops
+        // on a corrupt tree; removing from the source first would lose the window.
+        var session = insertSpiral(space: destId, newLeaf: moving, usableIsWide: usableIsWide)
+        guard session.visibleIds(on: destId).contains(moving.cgWindowId) else {
+            return self
+        }
+
         if space.luminaFullscreen != nil {
             session = session.exitLuminaFS(space: focusedSpace)
         }
         guard let src = session.spaces[session.focusedSpace] else { return session }
-        let window: WindowRef?
-        if let leaf = src.leaf(containing: focused), let w = leaf.leaf {
-            window = w
+        if let leaf = src.leaf(containing: focused) {
             session = session.remove(space: session.focusedSpace, node: leaf.id)
         } else if let idx = src.floating.firstIndex(where: { $0.cgWindowId == focused }) {
             var s = session.spaces[session.focusedSpace]!
-            window = s.floating.remove(at: idx)
+            s.floating.remove(at: idx)
             session.spaces[session.focusedSpace] = s
-        } else {
-            window = nil
         }
-        guard var moving = window else { return session }
-        moving.role = .tiled
-        session = session.insertSpiral(space: destId, newLeaf: moving, usableIsWide: usableIsWide)
-        return session.switchTo(destId)
+
+        session = session.switchTo(destId)
+        // `switchTo` unstashes the destination; a window arriving on a space
+        // with active luminaFS must stay parked like any other new tiled leaf.
+        if session.spaces[destId]?.luminaFullscreen != nil {
+            session = session.markStashed(space: destId, ids: [moving.cgWindowId])
+        }
+        return session
     }
 
     public func floatToggle(space spaceId: SpaceId, usableIsWide: Bool) -> Session {
