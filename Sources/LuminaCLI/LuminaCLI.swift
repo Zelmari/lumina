@@ -166,7 +166,9 @@ enum LuminaCLI {
 
     static func printResponse(_ resp: IPCResponse, log: LuminaLog) {
         if resp.ok {
-            if let data = resp.data, let encoded = try? JSONEncoder().encode(data),
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            if let data = resp.data, let encoded = try? encoder.encode(data),
                let s = String(data: encoded, encoding: .utf8)
             {
                 writeOut(s)
