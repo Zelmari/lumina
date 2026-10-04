@@ -112,4 +112,20 @@ struct ClassifyTests {
         let rules = [WindowRule(appId: "com.example.app", action: .ignore)]
         #expect(classify(ClassifyInput(bundleId: "com.example.app"), rules: rules) == .ignored)
     }
+
+    @Test func laterIgnoreRuleOverridesTileRule() {
+        let rules = [
+            WindowRule(appId: "com.example.app", action: .tile),
+            WindowRule(appId: "com.example.app", action: .ignore),
+        ]
+        #expect(classify(ClassifyInput(bundleId: "com.example.app"), rules: rules) == .ignored)
+    }
+
+    @Test func laterFloatRuleOverridesTileRule() {
+        let rules = [
+            WindowRule(appId: "com.example.app", action: .tile),
+            WindowRule(appId: "com.example.app", action: .float),
+        ]
+        #expect(classify(ClassifyInput(bundleId: "com.example.app"), rules: rules) == .floating)
+    }
 }

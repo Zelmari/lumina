@@ -175,7 +175,6 @@ public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyRes
         case .tile:
             allowTiled = true
         }
-        break
     }
 
     if isHardFloat(input) {
