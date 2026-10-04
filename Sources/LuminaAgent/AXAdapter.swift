@@ -385,14 +385,26 @@ public final class AXAdapter {
         return measured
     }
 
-    public func windows(pid: pid_t) -> [AXUIElement] {
+    /// One app-wide window list. `.failed` means the read did not complete
+    /// (timeout, cannotComplete, API disabled): the list is unknown, not
+    /// empty. Callers deciding whether windows died must not treat it as `[]`.
+    public enum WindowEnumeration {
+        case list([AXUIElement])
+        case failed
+    }
+
+    public func enumerateWindows(pid: pid_t) -> WindowEnumeration {
         let app = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(app, 0.05)
         var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &ref) == .success,
-              let array = ref as? [AXUIElement]
-        else { return [] }
-        return array
+        let err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &ref)
+        guard err == .success, let array = ref as? [AXUIElement] else { return .failed }
+        return .list(array)
+    }
+
+    public func windows(pid: pid_t) -> [AXUIElement] {
+        if case .list(let array) = enumerateWindows(pid: pid) { return array }
+        return []
     }
 
     public func axWindow(pid: pid_t, cgWindowId: UInt32) -> AXUIElement? {
