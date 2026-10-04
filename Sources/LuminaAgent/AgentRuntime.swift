@@ -32,6 +32,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var configError: String?
     public var lastSpaceChange = Date.distantPast
     public var lastLuminaSpaceChange = Date.distantPast
+    /// Last native focused window synced from an app activation. AeroSpace
+    /// only follows focus when this id changes; re-processing the same
+    /// window caused focus ping-pong.
+    var lastSyncedNativeFocusedId: UInt32?
     public var pasteboardCount: Int = 0
     public var moveStart: (UInt32, Point, Int)?
     /// A coalesced refresh session. Events only carry a reason; the session
@@ -2056,11 +2060,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         applyFrames()
     }
 
-    /// Adopt the frontmost app's own idea of its focused window. A window on
-    /// another Lumina space is remembered there but never pulled on screen:
-    /// activation fires for many reasons (Dock, cmd-tab, our own focus
-    /// restoration), and following it teleported between workspaces and
-    /// re-raised windows on every app switch.
+    /// Adopt the frontmost app's own idea of its focused window: switch to the
+    /// space containing it, or focus it if it is already here. Follow only when
+    /// the native focused window id changed since the last sync; re-processing
+    /// the same window caused focus ping-pong on every activation.
     func syncFocusToFrontmostApp(pid: pid_t) {
         let app = AXUIElementCreateApplication(pid)
         guard let focused = adapter.focusedWindow(of: app).flatMap({ adapter.windowId(for: $0) }),
@@ -2068,17 +2071,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
               let window = windowAnywhere(focused),
               hasAXElement(window)
         else { return }
-        let spaceId = session.spaceContaining(cgWindowId: focused) ?? session.focusedSpace
-        guard spaceId == session.focusedSpace else {
+        guard focused != lastSyncedNativeFocusedId else { return }
+        lastSyncedNativeFocusedId = focused
+        if let spaceId = session.spaceContaining(cgWindowId: focused), spaceId != session.focusedSpace {
             var s = session
             s.spaces[spaceId]?.focusedWindow = focused
             if let leaf = s.spaces[spaceId]?.leaf(containing: focused) {
                 s.spaces[spaceId]?.lastTiledLeaf = leaf.id
             }
             session = s
+            switchSpace(spaceId)
             return
         }
-        rememberFocus(focused)
+        nativeFocus(focused)
     }
 
     func recomputeCurrentToken(reason: CurrentReason) {
