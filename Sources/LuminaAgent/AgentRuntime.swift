@@ -2063,9 +2063,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func frontmostOwnedWindow() -> UInt32? {
         guard let bound else { return nil }
+        let fs = session.current.luminaFullscreen
         for row in onScreenCGWindows(intersecting: bound.axFrame) {
             guard let id = cgWindowID(row), owned(id) else { continue }
+            // Parked tiled siblings are not focus candidates while the
+            // lumina-fullscreen window owns the display.
+            if let fs, let leaf = session.current.leaf(containing: id), leaf.id != fs { continue }
             return id
+        }
+        if let fs {
+            return session.current.nodes[fs]?.leaf?.cgWindowId
+                ?? session.current.floating.first?.cgWindowId
         }
         return session.current.tiledLeaves().first?.leaf?.cgWindowId
             ?? session.current.floating.first?.cgWindowId
@@ -2118,6 +2126,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let rects = frames(space: session.current, usable: usable, gaps: config.gaps)
         var windows: [SpatialWindow] = []
         for node in session.current.tiledLeaves() {
+            if session.current.luminaFullscreen != nil, session.current.luminaFullscreen != node.id { continue }
             if let w = node.leaf, let frame = rects[node.id] {
                 windows.append(SpatialWindow(id: node.id, role: .tiled, frame: frame, cgWindowId: w.cgWindowId))
             }
