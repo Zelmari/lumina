@@ -1896,30 +1896,48 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func unstashLeftovers() -> [StashEntry] {
         // CGWindowIDs are only meaningful within one boot. Session files from
-        // an earlier boot must not seed frames onto recycled ids.
+        // an earlier boot must not seed frames onto recycled ids. A pending
+        // directory can hold every display's session, so only claim files for
+        // this agent's display, preferring this instance's own file.
         let boot = kernBootUUID() ?? ""
+        let myDisplay = bound?.uuid ?? preferredDisplayUUID ?? ""
         var entries: [StashEntry] = []
         if let dir = ProcessInfo.processInfo.environment["LUMINA_UNSTASH_FROM"] {
             let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            var files: [(path: String, file: SessionFile)] = []
             for name in names where name.hasSuffix(".json") {
                 let path = dir + "/" + name
-                if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                   let file = try? SessionFile.decode(data),
-                   file.bootSessionUUID == boot
-                {
-                    entries.append(contentsOf: file.stash)
-                    for (id, rect) in file.originals { knownOriginals[id] = rect }
-                    for e in file.stash {
-                        if let original = e.originalFrame { knownOriginals[e.cgWindowId] = original }
-                    }
+                guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                      let file = try? SessionFile.decode(data),
+                      file.bootSessionUUID == boot
+                else {
+                    // Unreadable or from an earlier boot: never restorable.
+                    try? FileManager.default.removeItem(atPath: path)
+                    continue
+                }
+                files.append((path, file))
+            }
+            let own = files.filter { $0.file.instanceId == instanceId }
+            let ordered = own.isEmpty ? files : own + files.filter { $0.file.instanceId != instanceId }
+            for (path, file) in ordered {
+                // Another display's agent owns this file; leave it in place.
+                if !file.displayUUID.isEmpty, !myDisplay.isEmpty, file.displayUUID != myDisplay { continue }
+                entries.append(contentsOf: file.stash)
+                for (id, rect) in file.originals { knownOriginals[id] = rect }
+                for e in file.stash {
+                    if let original = e.originalFrame { knownOriginals[e.cgWindowId] = original }
                 }
                 try? FileManager.default.removeItem(atPath: path)
             }
-            try? FileManager.default.removeItem(atPath: dir)
+            let remaining = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            if remaining.isEmpty {
+                try? FileManager.default.removeItem(atPath: dir)
+            }
         }
         if let data = try? Data(contentsOf: URL(fileURLWithPath: sessionPath)),
            let file = try? SessionFile.decode(data),
-           file.bootSessionUUID == boot
+           file.bootSessionUUID == boot,
+           file.displayUUID.isEmpty || myDisplay.isEmpty || file.displayUUID == myDisplay
         {
             entries.append(contentsOf: file.stash.filter { !isSliver($0.lastOnscreenFrame) || $0.lastOnscreenFrame.h >= 8 })
             for (id, rect) in file.originals { knownOriginals[id] = rect }
