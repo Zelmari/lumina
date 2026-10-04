@@ -2,7 +2,7 @@
 
 Window / tiling manager for macOS. Spiral tiling (Hyprland dwindle with permanent splits) and emulated spaces, without disabling SIP.
 
-Lumina is a guest on macOS. Quitting it leaves apps open and frames where they are (they may overlap).
+Lumina is a guest on macOS. Quitting it restores managed windows to their pre-tiling frames (they may overlap) and leaves apps open.
 
 ## Requirements
 
@@ -24,9 +24,11 @@ v1 manages **one display**. Config lives at `~/.config/lumina/lumina.toml`. `lau
 
 ## Status
 
-Layout and IPC are unit-tested with SwiftPM (Linux toolchain is fine). The signed two-process `.app` is assembled with `scripts/bundle.sh` on Apple silicon. SwiftPM does not emit that bundle layout by itself.
+Layout and IPC are unit-tested with SwiftPM (155 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
 
-See [docs/install.md](docs/install.md) and [docs/compat.md](docs/compat.md).
+On macOS, `swift test` needs the Xcode toolchain (`export DEVELOPER_DIR=/Applications/Xcode.app`); Command Line Tools lack the `Testing` module.
+
+See [docs/install.md](docs/install.md) and [docs/compat.md](docs/compat.md). Known issues from a full-repo audit are tracked in [plans/FINDINGS.md](plans/FINDINGS.md).
 
 ## Layout
 
@@ -36,8 +38,10 @@ Sources/LuminaAgent/     agent
 Sources/LuminaCLI/       socket client (`lumina`)
 Sources/LuminaLayout/    pure tree (no AppKit)
 Sources/LuminaIPC/       JSON-lines protocol
-Tests/LuminaLayoutTests/
-docs/
+Tests/LuminaLayoutTests/ pure tree tests
+Tests/LuminaIPCTests/    protocol tests
+docs/                    install and compatibility notes
+plans/                   engineering notes and audit findings
 ```
 
 ## License
