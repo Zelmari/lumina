@@ -1462,6 +1462,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             _ = adapter.setFrame(bump, of: el, tag: &w)
         }
         _ = adapter.setFrame(target, of: el, tag: &w)
+        // A busy app can drop the move; re-issue once when it did not land.
+        if let live = adapter.frame(of: el), !framesClose(live, target, slop: 2) {
+            log.info(
+                "restore retry window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") live=\(Int(live.w))x\(Int(live.h)) target=\(Int(target.w))x\(Int(target.h))"
+            )
+            _ = adapter.setFrame(target, of: el, tag: &w)
+        }
         if let cur = cgWindowRect(id: w.cgWindowId), isSliver(cur), let el2 = resolvedElement(for: w) {
             log.info("unstash still sliver window=\(w.cgWindowId); retry usable")
             _ = adapter.setFrame(usableRestoreRect(Rect(x: 0, y: 0, w: 1, h: 1)), of: el2, tag: &w)
