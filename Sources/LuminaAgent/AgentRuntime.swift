@@ -36,6 +36,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// only follows focus when this id changes; re-processing the same
     /// window caused focus ping-pong.
     var lastSyncedNativeFocusedId: UInt32?
+    var lastWindowClosedAt = Date.distantPast
     public var pasteboardCount: Int = 0
     public var moveStart: (UInt32, Point, Int)?
     /// A coalesced refresh session. Events only carry a reason; the session
@@ -434,10 +435,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 // Drop superseded activations (the notification can arrive
                 // after another app already took focus).
                 guard NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return }
-                guard shouldFollowAppActivation(
+                let elapsedSinceClose = Date().timeIntervalSince(self.lastWindowClosedAt)
+                let elapsedSinceSpaceChange = Date().timeIntervalSince(self.lastLuminaSpaceChange)
+                let isWindowCloseCascade = elapsedSinceClose < 0.4
+                let shouldFollow = !isWindowCloseCascade && (shouldFollowAppActivation(
                     spaceHasWindows: hasWindows,
-                    elapsedSinceSpaceChange: Date().timeIntervalSince(self.lastLuminaSpaceChange)
-                ) else { return }
+                    elapsedSinceSpaceChange: elapsedSinceSpaceChange
+                ) || (!hasWindows && elapsedSinceSpaceChange > 0.4))
+                guard shouldFollow else {
+                    self.restashOffspace()
+                    return
+                }
                 self.syncFocusToFrontmostApp(pid: app.processIdentifier)
             }
         }
@@ -465,6 +473,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if userPaused || displayGone || !isCurrent { return }
         switch name {
         case kAXWindowCreatedNotification, kAXUIElementDestroyedNotification:
+            if name == kAXUIElementDestroyedNotification {
+                lastWindowClosedAt = Date()
+            }
             scheduleRefresh(reason: name)
         case kAXFocusedWindowChangedNotification:
             let win = adapter.focusedWindow(of: element)
@@ -963,6 +974,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Drop a window that is really gone: close it on the focused space, remove
     /// it elsewhere, and forget every per-window map entry.
     func removeDestroyedWindow(_ id: UInt32) {
+        lastWindowClosedAt = Date()
+        if lastSyncedNativeFocusedId == id {
+            lastSyncedNativeFocusedId = nil
+        }
         let wasFS = session.current.luminaFullscreen != nil
             && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
         for spaceId in Array(session.spaces.keys) {
@@ -2115,7 +2130,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
               ownedAnywhere(focused),
               let window = windowAnywhere(focused),
               hasAXElement(window)
-        else { return }
+        else {
+            restashOffspace()
+            return
+        }
         guard focused != lastSyncedNativeFocusedId else { return }
         lastSyncedNativeFocusedId = focused
         if let spaceId = session.spaceContaining(cgWindowId: focused), spaceId != session.focusedSpace {
