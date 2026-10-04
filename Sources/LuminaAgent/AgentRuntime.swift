@@ -1718,23 +1718,31 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func unstashLeftovers() -> [StashEntry] {
+        // CGWindowIDs are only meaningful within one boot. Session files from
+        // an earlier boot must not seed frames onto recycled ids.
+        let boot = kernBootUUID() ?? ""
         var entries: [StashEntry] = []
         if let dir = ProcessInfo.processInfo.environment["LUMINA_UNSTASH_FROM"] {
             let names = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
             for name in names where name.hasSuffix(".json") {
                 let path = dir + "/" + name
                 if let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-                   let file = try? SessionFile.decode(data)
+                   let file = try? SessionFile.decode(data),
+                   file.bootSessionUUID == boot
                 {
                     entries.append(contentsOf: file.stash)
                     for (id, rect) in file.originals { knownOriginals[id] = rect }
+                    for e in file.stash {
+                        if let original = e.originalFrame { knownOriginals[e.cgWindowId] = original }
+                    }
                 }
                 try? FileManager.default.removeItem(atPath: path)
             }
             try? FileManager.default.removeItem(atPath: dir)
         }
         if let data = try? Data(contentsOf: URL(fileURLWithPath: sessionPath)),
-           let file = try? SessionFile.decode(data)
+           let file = try? SessionFile.decode(data),
+           file.bootSessionUUID == boot
         {
             entries.append(contentsOf: file.stash.filter { !isSliver($0.lastOnscreenFrame) || $0.lastOnscreenFrame.h >= 8 })
             for (id, rect) in file.originals { knownOriginals[id] = rect }
