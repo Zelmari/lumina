@@ -1309,20 +1309,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     log.info("setFrame timeout window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); will retry next pass")
                 }
             }
-            // A busy app can accept the write and still not move. Verify and
-            // re-issue once before leaving a stale tile behind.
-            if let live = adapter.frame(of: el), frameFar(live, rect, slop: 24) {
-                log.info("layout retry window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?") live=\(rectText(live)) target=\(rectText(rect))")
-                _ = adapter.setFrame(rect, of: el, tag: &window)
-            }
         }
         if let fs, let node = space.nodes[fs], var window = node.leaf, let el = resolvedElement(for: window) {
             if let live = adapter.frame(of: el), !framesClose(live, usable, slop: 2) {
                 _ = adapter.setFrame(usable, of: el, tag: &window)
-                if let retryLive = adapter.frame(of: el), frameFar(retryLive, usable, slop: 24) {
-                    log.info("layout retry fullscreen window=\(window.cgWindowId) live=\(rectText(retryLive)) target=\(rectText(usable))")
-                    _ = adapter.setFrame(usable, of: el, tag: &window)
-                }
             }
         }
         if var s = session.spaces[session.focusedSpace] {
@@ -1390,10 +1380,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 } else if result == .unknown {
                     log.info("continuation setFrame timeout window=\(window.cgWindowId)")
                 }
-            }
-            if let live = adapter.frame(of: el), frameFar(live, rect, slop: 24) {
-                log.info("continuation retry window=\(window.cgWindowId) live=\(rectText(live)) target=\(rectText(rect))")
-                _ = adapter.setFrame(rect, of: el, tag: &window)
             }
         }
     }
@@ -1721,14 +1707,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func framesClose(_ a: Rect, _ b: Rect, slop: Double) -> Bool {
         abs(a.x - b.x) <= slop && abs(a.y - b.y) <= slop && abs(a.w - b.w) <= slop && abs(a.h - b.h) <= slop
-    }
-
-    func frameFar(_ a: Rect, _ b: Rect, slop: Double) -> Bool {
-        abs(a.x - b.x) > slop || abs(a.y - b.y) > slop || abs(a.w - b.w) > slop || abs(a.h - b.h) > slop
-    }
-
-    func rectText(_ r: Rect) -> String {
-        "\(Int(r.x)),\(Int(r.y)) \(Int(r.w))x\(Int(r.h))"
     }
 
     func rescueOffscreenWindows(restoreOriginals: Bool = false) {
