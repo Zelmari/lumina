@@ -189,9 +189,16 @@ managed_count() {
     python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("windows", [])))' 2>/dev/null || echo 0
 }
 
+# Tab apps are excluded: their backing window id legitimately changes on a
+# tab switch (the tab section asserts their tile count separately).
 window_ids() {
   "$LUMINA" list-windows 2>/dev/null |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(str(w["cgWindowId"]) for w in d.get("windows", [])))' 2>/dev/null || true
+    python3 -c '
+import json, sys
+skip = {"com.apple.Terminal", "com.mitchellh.ghostty"}
+d = json.load(sys.stdin)
+print(" ".join(str(w["cgWindowId"]) for w in d.get("windows", []) if w.get("bundleId") not in skip))
+' 2>/dev/null || true
 }
 
 count_on_space() {
@@ -211,17 +218,42 @@ print(" ".join(str(i) for i in sorted(expected - current)))
 ' "$1" 2>/dev/null || true
 }
 
+new_textedit_id() {
+  "$LUMINA" list-windows 2>/dev/null |
+    python3 -c '
+import json, sys
+before = {int(x) for x in sys.argv[1].split()}
+for w in json.load(sys.stdin).get("windows", []):
+    if w["cgWindowId"] not in before and w.get("bundleId") == "com.apple.TextEdit":
+        print(w["cgWindowId"])
+        break
+' "$1" 2>/dev/null || true
+}
+
 # `make new document` gives a default-size window that classifies as tiled.
 # `open -n` is the permission-free fallback, but TextEdit may restore a saved
-# (possibly parked) frame, so prefer the scripted path when allowed.
+# (possibly parked) frame, so prefer the scripted path when allowed. Wait for
+# each window to be adopted: rapid document churn makes TextEdit's AX tree
+# flaky, and a fixed sleep loses windows.
 open_windows() {
   local n="$1"
   for ((i = 0; i < n; i++)); do
+    local before id deadline
+    before="$(window_ids)"
     if ! osascript -e 'tell application "TextEdit" to make new document' >/dev/null 2>&1; then
       open -n -a TextEdit >/dev/null 2>&1 ||
         { fail "could not launch TextEdit window $((i + 1))"; return 1; }
     fi
-    sleep 0.4
+    deadline=$((SECONDS + 8))
+    id=""
+    while ((SECONDS < deadline)); do
+      id="$(new_textedit_id "$before")"
+      [[ -n "$id" ]] && break
+      sleep 0.3
+    done
+    if [[ -z "$id" ]]; then
+      fail "TextEdit window $((i + 1)) was not adopted"
+    fi
   done
 }
 
@@ -255,6 +287,63 @@ wait_for_space_count() {
     sleep 0.4
   done
   return 1
+}
+
+bundle_count() {
+  "$LUMINA" list-windows 2>/dev/null |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for w in d.get("windows", []) if w.get("bundleId") == sys.argv[1]))' "$1" 2>/dev/null || echo 0
+}
+
+wait_for_bundle_count() {
+  local bundle="$1" want="$2" deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    if [[ "$(bundle_count "$bundle")" -ge "$want" ]]; then return 0; fi
+    sleep 0.4
+  done
+  return 1
+}
+
+# Terminal.app exposes its tab bar as an AXTabGroup; tabs are created via
+# Shell > New Tab > profile and switched by clicking the tab buttons.
+terminal_front_id() {
+  osascript -e 'tell application "Terminal" to id of front window' 2>/dev/null || true
+}
+
+# Terminal's AppleScript tab count is stale; the AXTabGroup is the truth.
+terminal_tab_count() {
+  local pid json
+  pid="$(ps -axo pid,comm | rg 'Terminal.app/Contents/MacOS/Terminal' | awk '{print $1}' | head -1)"
+  [[ -z "$pid" ]] && { echo 0; return; }
+  json="$("$LUMINA" debug-ax "$pid" 2>/dev/null)"
+  printf '%s' "$json" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+count = 0
+def walk(n):
+    global count
+    if n.get("role") == "AXRadioButton" and n.get("subrole") == "AXTabButton":
+        count += 1
+    for c in n.get("children", []):
+        walk(c)
+for w in d.get("windows", []):
+    walk(w)
+print(count)
+' 2>/dev/null || echo 0
+}
+
+terminal_new_tab() {
+  osascript -e 'tell application "Terminal" to activate' \
+    -e 'tell application "System Events" to tell process "Terminal" to click menu item "New Tab" of menu "Shell" of menu bar 1' \
+    -e 'delay 0.4' \
+    -e 'tell application "System Events" to tell process "Terminal" to click menu item 1 of menu of menu item "New Tab" of menu "Shell" of menu bar 1' 2>&1
+}
+
+terminal_switch_tab() {
+  osascript -e "tell application \"System Events\" to tell process \"Terminal\" to click radio button $1 of tab group 1 of window 1" 2>&1
+}
+
+terminal_close_window() {
+  osascript -e "tell application \"Terminal\" to close window id $1 saving no" 2>&1
 }
 
 say "Lumina at $LUMINA"
@@ -378,6 +467,64 @@ verify "back on workspace 1"
 say "reload config"
 run reload >/dev/null
 verify "after reload"
+
+# Native tabs: Terminal implements each tab as a separate NSWindow. Lumina
+# must keep exactly one tile for the app window and swap the backing window
+# on a tab switch, never add or lose a tile.
+if [[ "${TABS_TEST:-1}" != "0" ]]; then
+  say "native tabs: one Terminal tile across tab switches"
+  saved_tracked="${TRACKED_IDS:-}"
+  TRACKED_IDS=""
+  terminal_before="$(bundle_count com.apple.Terminal)"
+  created_terminal=0
+  if [[ "$terminal_before" -eq 0 ]]; then
+    open -n -a Terminal >/dev/null 2>&1
+    if wait_for_bundle_count com.apple.Terminal 1; then
+      pass "Terminal window adopted"
+      created_terminal=1
+    else
+      fail "Terminal window was not adopted"
+    fi
+  fi
+  expected_terminal="$terminal_before"
+  [[ "$expected_terminal" -eq 0 ]] && expected_terminal=1
+
+  terminal_new_tab >/dev/null 2>&1
+  sleep 1
+  terminal_new_tab >/dev/null 2>&1
+  sleep 1
+  tabs_created="$(terminal_tab_count)"
+  if [[ "$tabs_created" -ge 3 ]]; then
+    pass "created $tabs_created Terminal tabs"
+  else
+    fail "could not create Terminal tabs (count=$tabs_created)"
+  fi
+
+  for tab in 2 3 1 2 1; do
+    terminal_switch_tab "$tab" >/dev/null 2>&1
+    sleep 0.8
+    verify "after Terminal tab $tab"
+    managed="$(bundle_count com.apple.Terminal)"
+    if [[ "$managed" -eq "$expected_terminal" ]]; then
+      pass "tab $tab: Terminal still has $managed tile(s)"
+    else
+      fail "tab $tab: Terminal has $managed managed windows (want $expected_terminal)"
+      geometry_table | sed 's/^/      /'
+    fi
+  done
+
+  if [[ "$created_terminal" -eq 1 ]]; then
+    terminal_close_window "$(terminal_front_id)" >/dev/null 2>&1
+    sleep 1
+    if wait_for_bundle_count com.apple.Terminal 0; then
+      pass "Terminal window closed cleanly"
+    else
+      fail "Terminal window did not close: $(bundle_count com.apple.Terminal) still managed"
+    fi
+  fi
+  TRACKED_IDS="$saved_tracked"
+  verify "after native tabs"
+fi
 
 if [[ "${QUIT_TEST:-0}" == "1" ]]; then
   # Quit restore is the other reported failure: windows left parked
