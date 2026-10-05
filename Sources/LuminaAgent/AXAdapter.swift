@@ -789,18 +789,21 @@ public func classifyInput(
     adapter: AXAdapter,
     bound: BoundDisplay,
     onScreenIds: Set<UInt32>,
+    onScreenRows: [[String: Any]]? = nil,
     excludingWindowIds: Set<UInt32> = []
 ) -> (ClassifyInput, UInt32, pid_t)? {
     guard let pid = adapter.pid(of: element) else { return nil }
     let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
     guard let id = adapter.windowId(for: element, excluding: excludingWindowIds), id != 0 else { return nil }
-    let onScreenRows = onScreenCGWindows(intersecting: bound.axFrame)
-    let pidOnScreenFrames: [Rect] = onScreenRows.compactMap { row in
+    // Callers that already enumerated the on-screen list for this pass pass it
+    // in; re-enumerating is a WindowServer round trip per window.
+    let rows = onScreenRows ?? onScreenCGWindows(intersecting: bound.axFrame)
+    let pidOnScreenFrames: [Rect] = rows.compactMap { row in
         guard cgOwnerPID(row) == pid, let rect = cgWindowRect(row), rect.w >= 8, rect.h >= 8 else { return nil }
         return rect
     }
     let idOnScreen = onScreenIds.contains(id)
-    let layer = cgWindowLayer(onScreenRows.first { cgWindowID($0) == id } ?? [:])
+    let layer = cgWindowLayer(rows.first { cgWindowID($0) == id } ?? [:])
     let screens = NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: adapter.menuBarScreenMaxY)?.axFrame }
     let bundle = adapter.bundleId(pid: pid)
     let input = ClassifyInput(
