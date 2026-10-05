@@ -679,7 +679,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     /// Coalesce every discovery event into one session. Mutation queue only.
-    func scheduleRefresh(reason: String, delay: TimeInterval = 0.04) {
+    /// The default delay is a compromise: long enough to merge the
+    /// created/moved/resized/title burst a single window emits, short enough
+    /// that the frame lands before the user notices. AeroSpace fires without
+    /// a debounce but pays several full refreshes per window; ours runs once.
+    func scheduleRefresh(reason: String, delay: TimeInterval = 0.015) {
         guard !isStopping() else { return }
         // New windows land on the space focused when their event arrives.
         // Keeping an older request's space let a launch poll scheduled before
