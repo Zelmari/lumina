@@ -15,7 +15,7 @@ final class StatusItemController {
     var onQuitAll: (() -> Void)?
     private var current = false
     private var paused = false
-    private var spaceCount = 5
+    private var spaceCount = 10
     private var focused = 1
     private var warning: ExtraWarning = .none
     private var loginEnabled = false

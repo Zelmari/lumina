@@ -82,6 +82,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     var secureTimer: DispatchSourceTimer?
     var axPollTimer: DispatchSourceTimer?
     var configWatcher: DispatchSourceFileSystemObject?
+    var configFileWatcher: DispatchSourceFileSystemObject?
     var didBootLayout = false
     let supportRoot: String
     let sessionPath: String
@@ -187,6 +188,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         secureTimer?.cancel()
         axPollTimer?.cancel()
         configWatcher?.cancel()
+        configFileWatcher?.cancel()
     }
 
     /// Carbon hotkeys are main-thread only. Never sync to main from the mutation queue.
@@ -886,12 +888,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             return
         }
-        if result == .floating, !forceRegisterPlaceholder,
+        if result == .floating, !forceRegisterPlaceholder, isPlaceholderFloat(input),
            input.width < 50 || input.height < 50 || !input.isOnScreen
         {
-            // A tiny or not-yet-on-screen frame is not a real float decision.
-            // Reclassify once the app has drawn; register as a floater only if
-            // it never settles.
+            // A tiny or not-yet-on-screen frame with no explicit float signal
+            // is a placeholder; reclassify once the app has drawn. A rule or
+            // hard float is a real decision even when small, so dialogs and
+            // panels are adopted instead of floating unseen forever.
             refreshUnresolved = true
             return
         }
@@ -928,6 +931,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             stash(ids: [id], space: targetId)
         }
         if apply { applyFrames() }
+    }
+
+    /// True when `.floating` was inferred from a placeholder-sized frame
+    /// rather than an explicit rule or hard-float role. Those wait for the
+    /// app to draw; explicit floats are adopted immediately.
+    func isPlaceholderFloat(_ input: ClassifyInput) -> Bool {
+        if let role = input.role, Classify.hardRoles.contains(role) { return false }
+        if let sub = input.subrole, Classify.hardSubroles.contains(sub) { return false }
+        if let bundle = input.bundleId, Classify.hardFloatBundleIds.contains(bundle) { return false }
+        if input.isPiP || input.layerOrIsHUD || input.isVisualIntelligenceOrSiriHUD { return false }
+        let ruleSaysFloat = config.windowRules.contains {
+            $0.action == .float && $0.matches(bundleId: input.bundleId, title: input.title)
+        }
+        return !ruleSaysFloat
     }
 
     func trackedId(matching element: AXUIElement) -> UInt32? {
@@ -2463,19 +2480,54 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func watchConfig() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let dir = (LuminaPaths.configPath(home: home) as NSString).deletingLastPathComponent
+        let path = LuminaPaths.configPath(home: home)
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        watchConfigDirectory(dir)
+        watchConfigFile(path)
+    }
+
+    /// Atomic replaces change the directory; in-place writes (`echo > file`)
+    /// only touch the file vnode, so both are watched.
+    private func watchConfigDirectory(_ dir: String) {
         let fd = open(dir, O_EVTONLY)
         guard fd >= 0 else { return }
-        let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: MutationQueue.shared.queue)
-        src.setEventHandler { [weak self] in
-            self?.configDebounce?.cancel()
-            let item = DispatchWorkItem { self?.reloadConfig() }
-            self?.configDebounce = item
-            MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.05, execute: item)
-        }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .rename, .delete],
+            queue: MutationQueue.shared.queue
+        )
+        src.setEventHandler { [weak self] in self?.scheduleConfigReload() }
         src.setCancelHandler { close(fd) }
         src.resume()
         configWatcher = src
+    }
+
+    private func watchConfigFile(_ path: String) {
+        configFileWatcher?.cancel()
+        configFileWatcher = nil
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else { return }
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd,
+            eventMask: [.write, .delete, .rename, .extend, .attrib],
+            queue: MutationQueue.shared.queue
+        )
+        src.setEventHandler { [weak self] in
+            self?.scheduleConfigReload()
+            // The vnode is stale after a replace/delete; watch the new file.
+            self?.watchConfigFile(path)
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        configFileWatcher = src
+    }
+
+    private func scheduleConfigReload() {
+        configDebounce?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.reloadConfig() }
+        configDebounce = item
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + 0.05, execute: item)
     }
 
     func startOrStopFFM() {

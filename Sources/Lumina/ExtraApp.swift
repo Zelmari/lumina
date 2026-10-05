@@ -98,13 +98,10 @@ final class ExtraController: NSObject, @unchecked Sendable {
             let dir = (path as NSString).deletingLastPathComponent
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
-            if let url = Bundle.module.url(forResource: "lumina", withExtension: "toml"),
-               let data = try? Data(contentsOf: url)
-            {
-                try? data.write(to: URL(fileURLWithPath: path))
-            } else {
-                try? Config.bundledDefaultTOML.write(toFile: path, atomically: true, encoding: .utf8)
-            }
+            // Do not touch Bundle.module here: the assembled app never
+            // contains SwiftPM's resource bundle, and the generated accessor
+            // fatalErrors, killing the extra on a fresh install.
+            try? Config.bundledDefaultTOML.write(toFile: path, atomically: true, encoding: .utf8)
         }
     }
 
@@ -133,9 +130,13 @@ final class ExtraController: NSObject, @unchecked Sendable {
         let current = registry.load()
         let live = current.agents.filter { kill($0.pid, 0) == 0 }
         var starting = false
+        var unresponsive: [InstanceRecord] = []
         let presence: [AgentPresence] = live.map { rec in
             let status = fetchAgentStatus(socket: rec.socket)
-            if status == nil { starting = true }
+            if status == nil {
+                starting = true
+                unresponsive.append(rec)
+            }
             return AgentPresence(
                 instanceId: rec.instanceId,
                 isCurrent: status?.isCurrent ?? false,
@@ -144,8 +145,26 @@ final class ExtraController: NSObject, @unchecked Sendable {
         }
         let decision = startAttachDecision(agents: presence, lastCurrent: current.lastCurrentInstanceId)
         if case .spawn = decision, starting {
-            // A live pid whose socket has not bound yet is starting, not absent.
-            retryStartOnThisSpace(runLaunchApps: runLaunchApps)
+            if startRetryAttempts < 3 {
+                // A live pid whose socket has not bound yet is starting, not absent.
+                retryStartOnThisSpace(runLaunchApps: runLaunchApps)
+                pollStatus()
+                return
+            }
+            // Still no answer after the retry budget: the pid is wedged, and
+            // refusing to spawn left Start permanently dead. Replace it.
+            startRetryAttempts = 0
+            log.error("agents did not answer status; replacing \(unresponsive.map(\.pid))")
+            var next = current
+            for rec in unresponsive {
+                spawner.quitPids.insert(rec.pid)
+                kill(rec.pid, SIGTERM)
+                next.agents.removeAll { $0.instanceId == rec.instanceId }
+            }
+            registry.save(next)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.spawnAgent(runLaunchApps: runLaunchApps)
+            }
             pollStatus()
             return
         }
