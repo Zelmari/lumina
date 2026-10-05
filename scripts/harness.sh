@@ -31,7 +31,9 @@
 #   BENCH_WARMUP warmup pings (default 5)
 #   BENCH_MAX_P95_MS  fail when IPC round-trip p95 exceeds this (default 25)
 #   BENCH_STRICT set to 1 to also fail when the agent's refresh-to-frame p95
-#                exceeds BENCH_FRAME_MAX_MS (default 50)
+#                exceeds BENCH_FRAME_MAX_MS (default 50), a launch takes
+#                longer than BENCH_LAUNCH_MAX_MS (default 500), or the menu
+#                push takes longer than BENCH_MENU_MAX_MS (default 250)
 
 set -uo pipefail
 
@@ -699,6 +701,77 @@ else:
   if [[ -n "$ARTIFACTS" ]]; then
     "$LUMINA" status > "$ARTIFACTS/bench-status.json" 2>/dev/null
   fi
+
+  say "latency: launch adoption"
+  # A fresh document in the already-running TextEdit exercises the created
+  # path end to end; status carries the agent's event-to-frame time for it.
+  launch_before="$(managed_count)"
+  if osascript -e 'tell application "TextEdit" to make new document' >/dev/null 2>&1; then
+    deadline=$((SECONDS + 5))
+    while ((SECONDS < deadline)) && [[ "$(managed_count)" -le "$launch_before" ]]; do sleep 0.1; done
+    sleep 0.3
+    launch_ms="$("$LUMINA" status 2>/dev/null | python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+v = s.get("refreshLatencyMs")
+if v is not None:
+    print("%.1f" % v)
+' 2>/dev/null || true)"
+    if [[ -n "$launch_ms" ]]; then
+      printf '   refreshLatency last=%sms (created path)\n' "$launch_ms"
+      if [[ -n "$ARTIFACTS" ]]; then
+        printf '%s\n' "$launch_ms" > "$ARTIFACTS/bench-launch-ms.txt"
+      fi
+      if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
+        launch_max="${BENCH_LAUNCH_MAX_MS:-500}"
+        if python3 -c "import sys; sys.exit(0 if float('${launch_ms}') <= float('${launch_max}') else 1)"; then
+          pass "launch-to-frame ${launch_ms}ms within ${launch_max}ms"
+        else
+          fail "launch-to-frame ${launch_ms}ms exceeds ${launch_max}ms"
+        fi
+      fi
+    else
+      printf '   no launch latency sample\n'
+    fi
+    osascript -e 'tell application "TextEdit" to close front document saving no' >/dev/null 2>&1
+  else
+    printf '   TextEdit unavailable; launch latency skipped\n'
+  fi
+
+  say "latency: menu push"
+  # The extra logs a timestamped line for every pushed snapshot; compare it
+  # with the moment the switch command was issued.
+  "$LUMINA" workspace 2 >/dev/null 2>&1
+  push_before="$(python3 -c 'import time; print(int(time.time() * 1000))')"
+  "$LUMINA" workspace 1 >/dev/null 2>&1
+  sleep 0.3
+  push_line="$(grep 'push space=1 at=' "$LUMINA_LOG" 2>/dev/null | tail -1 || true)"
+  push_at="${push_line##*at=}"
+  if [[ -n "$push_at" && "$push_at" =~ ^[0-9]+$ ]]; then
+    push_delta=$((push_at - push_before))
+    if ((push_delta >= 0 && push_delta < 5000)); then
+      printf '   menu push=%dms\n' "$push_delta"
+      if [[ -n "$ARTIFACTS" ]]; then
+        printf '%s\n' "$push_delta" > "$ARTIFACTS/bench-menu-push-ms.txt"
+      fi
+      if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
+        menu_max="${BENCH_MENU_MAX_MS:-250}"
+        if ((push_delta <= menu_max)); then
+          pass "menu push ${push_delta}ms within ${menu_max}ms"
+        else
+          fail "menu push ${push_delta}ms exceeds ${menu_max}ms"
+        fi
+      fi
+    else
+      printf '   no fresh menu push observed\n'
+    fi
+  else
+    printf '   no menu push line in the agent log\n'
+  fi
+
   if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
     frame_max="${BENCH_FRAME_MAX_MS:-50}"
     if "$LUMINA" status 2>/dev/null | python3 -c "

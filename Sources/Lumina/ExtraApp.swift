@@ -510,6 +510,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
 
     func receivePushedStatus(_ id: UUID, _ status: AgentStatus) {
         pushedStatus[id] = status
+        // Timestamped for the harness: proves the strip received the switch
+        // and how long after the command it arrived.
+        log.info("push space=\(status.space ?? -1) at=\(Int(Date().timeIntervalSince1970 * 1000))")
         let reg = registry.load()
         let live = reg.agents.filter { kill($0.pid, 0) == 0 }
         let statuses: [(InstanceRecord, AgentStatus)] = live.compactMap { rec in
