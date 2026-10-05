@@ -7,11 +7,16 @@ import LuminaLayout
 @main
 enum LuminaCLI {
     static func main() {
+        // Ctrl-C on a hung request closes the client fd; the server must not
+        // die from the resulting SIGPIPE.
+        signal(SIGPIPE, SIG_IGN)
         let argv = CommandLine.arguments
         if let early = CLIArgs.earlyExit(argv) {
             switch early {
             case .version:
                 writeOut("lumina 0.1.0")
+            case .help:
+                writeOut(CLIArgs.usage)
             case .debug:
                 writeOut("LUMINA_DEBUG=\(ProcessInfo.processInfo.environment["LUMINA_DEBUG"] ?? "0")")
             }
@@ -19,7 +24,10 @@ enum LuminaCLI {
         }
         let log = LuminaLog(category: .cli, fileURL: LuminaLog.defaultFileURL())
         guard let request = CLIArgs.parse(argv) else {
-            log.error("usage: lumina <cmd> [args]")
+            if argv.count > 1 {
+                log.error("unknown command: \(argv[1])")
+            }
+            writeOut(CLIArgs.usage)
             exit(1)
         }
         let uid = getuid()
@@ -139,29 +147,16 @@ enum LuminaCLI {
     }
 
     static func unixRequest(path: String, request: IPCRequest) -> IPCResponse? {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
+        guard let fd = LuminaSocket.connect(path: path) else { return nil }
         defer { close(fd) }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(path.utf8)
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: UInt8.self, capacity: 104) { buf in
-                for (i, b) in pathBytes.enumerated() where i < 103 { buf[i] = b }
-            }
-        }
-        let ok = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
-            }
-        }
-        guard ok else { return nil }
         guard let line = try? encode(request), let data = line.data(using: .utf8) else { return nil }
-        _ = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
-        var buf = [UInt8](repeating: 0, count: 1 << 16)
-        let n = read(fd, &buf, buf.count)
-        guard n > 0 else { return nil }
-        return try? decodeResponse(Data(buf.prefix(n)))
+        // Read until the newline: a large `debug-windows`/`list-windows`
+        // response can arrive in several reads, and one `read` used to fail
+        // the decode and report "agent not running".
+        guard LuminaSocket.writeAll(fd, data), let payload = LuminaSocket.readLine(fd, deadline: 2.0) else {
+            return nil
+        }
+        return try? decodeResponse(payload)
     }
 
     static func printResponse(_ resp: IPCResponse, log: LuminaLog) {

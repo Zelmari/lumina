@@ -8,6 +8,8 @@ import LuminaLayout
 @main
 struct ExtraApp {
     static func main() {
+        // A client that hangs up mid-response must not kill the supervisor.
+        signal(SIGPIPE, SIG_IGN)
         var uts = utsname()
         uname(&uts)
         let machine = withUnsafePointer(to: &uts.machine) { ptr in
@@ -69,7 +71,13 @@ final class ExtraController: NSObject, @unchecked Sendable {
         let menuPath = LuminaPaths.resolvedMenuSocketPath(uid: uid, tmpdir: tmpdir)
         let server = MenuSocketServer(path: menuPath, log: log)
         server.onCommand = { [weak self] cmd, id in self?.handleExtra(cmd, id: id) ?? .failure(id: id, error: "gone") }
-        try? server.start()
+        do {
+            try server.start()
+        } catch {
+            // Without this socket every CLI command claims "menu extra not
+            // running"; at least leave a trail in the log.
+            log.error("menu socket bind failed path=\(menuPath) \(error)")
+        }
         menuServer = server
         bootRegistry()
         maybeFirstRun()
@@ -417,17 +425,19 @@ final class ExtraController: NSObject, @unchecked Sendable {
     func openConfig() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let path = LuminaPaths.configPath(home: home)
+        // Never wait on `open` from the main thread: a cold TextEdit launch
+        // would beachball the whole menu extra.
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         proc.arguments = ["-t", path]
-        try? proc.run()
-        proc.waitUntilExit()
-        if proc.terminationStatus != 0 {
+        proc.terminationHandler = { finished in
+            guard finished.terminationStatus != 0 else { return }
             let p2 = Process()
             p2.executableURL = URL(fileURLWithPath: "/usr/bin/open")
             p2.arguments = ["-a", "TextEdit", path]
             try? p2.run()
         }
+        try? proc.run()
     }
 
     func toggleLogin() {

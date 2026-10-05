@@ -176,9 +176,15 @@ public enum JSONValue: Equatable, Sendable, Codable {
 
     public var int: Int? {
         switch self {
-        case .int(let i): return i
-        case .double(let d) where d == d.rounded(): return Int(d)
-        default: return nil
+        case .int(let i):
+            return i
+        case .double(let d):
+            // `Int(exactly:)` is nil for NaN/infinity and for values outside
+            // Int's range; `Int(d)` traps on `1e30` and could kill the agent
+            // from one malformed IPC line.
+            return Int(exactly: d)
+        default:
+            return nil
         }
     }
 

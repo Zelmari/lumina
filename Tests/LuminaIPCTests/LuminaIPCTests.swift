@@ -132,6 +132,22 @@ struct CodecTests {
         #expect(fractional == .double(3.5))
         #expect(fractional != .int(3))
     }
+
+    @Test func jsonValueIntDoesNotTrapOnHugeOrNonFiniteDoubles() throws {
+        // `Int(1e30)` and `Int(.infinity)` used to trap, so one malformed IPC
+        // line could kill the agent.
+        #expect(JSONValue.double(1e30).int == nil)
+        #expect(JSONValue.double(-1e30).int == nil)
+        #expect(JSONValue.double(.infinity).int == nil)
+        #expect(JSONValue.double(.nan).int == nil)
+        #expect(JSONValue.double(42.0).int == 42)
+        let line = #"{"v":1,"id":"1","cmd":"workspace","args":{"id":1e30}}"#
+        guard case .error(let response) = parseLine(line) else {
+            Issue.record("expected an error response")
+            return
+        }
+        #expect(response.error?.contains("id") == true)
+    }
 }
 
 struct PathTests {

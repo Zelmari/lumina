@@ -94,7 +94,7 @@ final class MenuSocketServer {
                     response = .failure(id: "", error: "unknown cmd")
                 }
                 if let data = try? encode(response).data(using: .utf8) {
-                    _ = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
+                    LuminaSocket.writeAll(fd, data)
                 }
             }
         }
@@ -104,30 +104,17 @@ final class MenuSocketServer {
 
 enum Client {
     static func request(socketPath: String, cmd: String, args: [String: JSONValue], role: IPCRole) -> IPCResponse? {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return nil }
+        _ = role
+        guard let fd = LuminaSocket.connect(path: socketPath) else { return nil }
         defer { close(fd) }
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathBytes = Array(socketPath.utf8)
-        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
-            ptr.withMemoryRebound(to: UInt8.self, capacity: 104) { buf in
-                for (i, b) in pathBytes.enumerated() where i < 103 { buf[i] = b }
-            }
-        }
-        let ok = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
-            }
-        }
-        guard ok else { return nil }
         let req = IPCRequest(id: UUID().uuidString, cmd: cmd, args: args)
         guard let line = try? encode(req), let data = line.data(using: .utf8) else { return nil }
-        _ = data.withUnsafeBytes { write(fd, $0.baseAddress, data.count) }
-        var buf = [UInt8](repeating: 0, count: 1 << 16)
-        let n = read(fd, &buf, buf.count)
-        guard n > 0 else { return nil }
-        return try? decodeResponse(Data(buf.prefix(n)))
+        // A dead or busy agent must not hang the caller forever; the extra's
+        // main thread blocks on this.
+        guard LuminaSocket.writeAll(fd, data), let payload = LuminaSocket.readLine(fd, deadline: 2.0) else {
+            return nil
+        }
+        return try? decodeResponse(payload)
     }
 }
 #endif

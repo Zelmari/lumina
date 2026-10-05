@@ -2,17 +2,43 @@ import Foundation
 
 public enum CLIEarlyExit: Equatable, Sendable {
     case version
+    case help
     case debug
 }
 
 public enum CLIArgs {
+    public static let usage = """
+    usage: lumina <command> [args]
+
+    focus left|down|up|right     focus the neighbouring window
+    swap left|down|up|right      swap the focused window with a neighbour
+    resize grow|shrink           resize the focused tile
+    float-toggle                 retile a floater / float a tile
+    balance                      equalize the split weights
+    fullscreen lumina|native     enter/exit fullscreen
+    close                        close the focused window
+    workspace 1..10|prev|next    switch workspace
+    move-node-to-workspace 1..10 move the focused window and follow
+    list-windows                 print managed windows as JSON
+    list-workspaces              print workspaces as JSON
+    status                       print agent status as JSON
+    debug-windows                write a debug dump
+    reload                       reload ~/.config/lumina/lumina.toml
+    pause | resume               stop / resume managing windows
+    start                        start Lumina on this Space
+    quit                         quit Lumina and untile every window
+    open-config                  open the config file
+    version                      print the version
+    """
+
     /// `version`, `-h`, and `--help` only when they are the command, so
     /// `lumina focus version` still reaches the agent. `debug` prints the
     /// env flag and exits; it is not an agent command.
     public static func earlyExit(_ argv: [String]) -> CLIEarlyExit? {
         guard let head = argv.dropFirst().first else { return nil }
         switch head {
-        case "-h", "--help", "version": return .version
+        case "-h", "--help": return .help
+        case "version": return .version
         case "debug": return .debug
         default: return nil
         }
@@ -51,16 +77,20 @@ public enum CLIArgs {
                 return IPCRequest(id: id, cmd: "fullscreen", args: ["mode": .string(args[1])])
             }
             return IPCRequest(id: id, cmd: "fullscreen")
-        case "float-toggle", "balance", "close", "pause", "resume", "reload", "quit",
+        case "float-toggle", "balance", "close", "pause", "resume", "reload",
              "list-windows", "list-workspaces", "status", "debug-windows",
              "start", "quit-all", "open-config", "current-token":
             return IPCRequest(id: id, cmd: head)
+        case "quit", "exit":
+            // `quit` exits Lumina entirely, like Hyprland's `exit`. Quitting
+            // only the agent used to be respawned as a crash.
+            return IPCRequest(id: id, cmd: "quit-all")
         default:
-            return IPCRequest(id: id, cmd: head)
+            return nil
         }
     }
 
     public static func isExtraCommand(_ cmd: String) -> Bool {
-        ["start", "quit-all", "open-config", "current-token"].contains(cmd)
+        ["start", "quit", "exit", "quit-all", "open-config", "current-token"].contains(cmd)
     }
 }
