@@ -163,6 +163,7 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
     case "list-workspaces": return .ok(.listWorkspaces)
     case "verify": return .ok(.verify)
     case "status": return .ok(.status)
+    case "ping": return .ok(.ping)
     case "mark-current": return .ok(.markCurrent)
     case "yield": return .ok(.yield)
     case "accessibility-prompt": return .ok(.accessibilityPrompt)

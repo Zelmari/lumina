@@ -23,6 +23,12 @@ enum LuminaCLI {
             exit(0)
         }
         let log = LuminaLog(category: .cli, fileURL: LuminaLog.defaultFileURL())
+        let uid = getuid()
+        let tmp = FileManager.default.temporaryDirectory.path
+        let menu = LuminaPaths.resolvedMenuSocketPath(uid: uid, tmpdir: tmp)
+        if argv.count > 1, argv[1] == "bench" {
+            exit(runBench(argv: argv, menu: menu, log: log))
+        }
         guard let request = CLIArgs.parse(argv) else {
             if argv.count > 1 {
                 log.error("unknown command: \(argv[1])")
@@ -30,9 +36,6 @@ enum LuminaCLI {
             writeOut(CLIArgs.usage)
             exit(1)
         }
-        let uid = getuid()
-        let tmp = FileManager.default.temporaryDirectory.path
-        let menu = LuminaPaths.resolvedMenuSocketPath(uid: uid, tmpdir: tmp)
         if CLIArgs.isExtraCommand(request.cmd) || request.cmd == "start" {
             if let resp = unixRequest(path: menu, request: request) {
                 printResponse(resp, log: log)
@@ -55,15 +58,7 @@ enum LuminaCLI {
             log.error("menu extra not running")
             exit(1)
         }
-        let path = preferredSocket() ?? {
-            guard let token = currentToken(menu: menu) else { return nil }
-            return LuminaPaths.resolvedAgentSocketPath(
-                uid: uid,
-                tmpdir: tmp,
-                instanceId: token,
-                supportFallback: FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Application Support/Lumina"
-            )
-        }()
+        let path = agentSocket(menu: menu)
         guard let path else {
             log.error("agent not running on this Space")
             exit(2)
@@ -117,6 +112,80 @@ enum LuminaCLI {
             return 1
         }
         writeOut(path)
+        return 0
+    }
+
+    static func agentSocket(menu: String) -> String? {
+        let uid = getuid()
+        let tmp = FileManager.default.temporaryDirectory.path
+        return preferredSocket() ?? {
+            guard let token = currentToken(menu: menu) else { return nil }
+            return LuminaPaths.resolvedAgentSocketPath(
+                uid: uid,
+                tmpdir: tmp,
+                instanceId: token,
+                supportFallback: FileManager.default.homeDirectoryForCurrentUser.path + "/Library/Application Support/Lumina"
+            )
+        }()
+    }
+
+    /// `lumina bench`: one connection, N sequential pings, RTT percentiles.
+    /// Exit 1 when the p95 exceeds `--max-p95-ms` or a ping times out, so the
+    /// harness can gate on latency. Exit 2 when there is no agent.
+    static func runBench(argv: [String], menu: String, log: LuminaLog) -> Int32 {
+        guard let options = CLIArgs.parseBench(argv) else {
+            log.error("invalid bench flags")
+            writeOut(CLIArgs.usage)
+            return 1
+        }
+        guard let path = agentSocket(menu: menu), let fd = LuminaSocket.connect(path: path) else {
+            log.error("agent not running on this Space")
+            return 2
+        }
+        defer { close(fd) }
+        var stats = LatencyStats(capacity: Swift.max(options.count, 1))
+        var timeouts = 0
+        let clock = ContinuousClock()
+        for index in 0..<(options.warmup + options.count) {
+            let request = IPCRequest(id: UUID().uuidString, cmd: "ping")
+            guard let line = try? encode(request), let data = line.data(using: .utf8),
+                  LuminaSocket.writeAll(fd, data)
+            else {
+                log.error("bench: write failed")
+                return 2
+            }
+            let start = clock.now
+            guard let payload = LuminaSocket.readLine(fd, deadline: 2.0),
+                  let response = try? decodeResponse(payload), response.ok
+            else {
+                timeouts += 1
+                break
+            }
+            if index >= options.warmup {
+                stats.record(milliseconds: (clock.now - start) / .milliseconds(1))
+            }
+        }
+        func number(_ value: Double?) -> JSONValue {
+            value.map { .double($0) } ?? .null
+        }
+        let data = JSONValue.object([
+            "count": .int(stats.count),
+            "warmup": .int(options.warmup),
+            "timeouts": .int(timeouts),
+            "rttMs": .object([
+                "min": number(stats.min),
+                "p50": number(stats.p50),
+                "p95": number(stats.p95),
+                "max": number(stats.max),
+                "mean": number(stats.mean),
+            ]),
+        ])
+        printResponse(IPCResponse.success(id: "bench", data: data), log: log)
+        if timeouts > 0 { return 1 }
+        if let maxP95 = options.maxP95Ms, let p95 = stats.p95, p95 > maxP95 {
+            log.error("bench: p95 \(String(format: "%.2f", p95))ms exceeds \(maxP95)ms")
+            return 1
+        }
         return 0
     }
 

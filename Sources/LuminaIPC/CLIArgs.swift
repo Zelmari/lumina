@@ -23,6 +23,9 @@ public enum CLIArgs {
     list-workspaces              print workspaces as JSON
     verify                       check tiling invariants; exit 1 on issues
     status                       print agent status as JSON
+    ping                         one IPC round trip; prints pong JSON
+    bench [--count N] [--warmup W] [--max-p95-ms X]
+                                 measure IPC round-trip latency
     debug-windows                write a debug dump
     debug-ax <pid>               dump an app's AX attributes as JSON
     reload                       reload ~/.config/lumina/lumina.toml
@@ -88,7 +91,7 @@ public enum CLIArgs {
             return IPCRequest(id: id, cmd: "debug-ax", args: ["pid": .int(pid)])
         case "float-toggle", "balance", "close", "pause", "resume", "reload",
              "list-windows", "list-workspaces", "verify", "status", "debug-windows",
-             "start", "quit-all", "open-config", "current-token", "grant-accessibility":
+             "ping", "start", "quit-all", "open-config", "current-token", "grant-accessibility":
             return IPCRequest(id: id, cmd: head)
         case "quit", "exit":
             // `quit` exits Lumina entirely, like Hyprland's `exit`. Quitting
@@ -101,5 +104,45 @@ public enum CLIArgs {
 
     public static func isExtraCommand(_ cmd: String) -> Bool {
         ["start", "quit", "exit", "quit-all", "open-config", "current-token", "grant-accessibility"].contains(cmd)
+    }
+
+    /// Options for `lumina bench`. Kept in LuminaIPC so the parsing rules are
+    /// covered by `swift test` on Linux even though the CLI itself is macOS-only.
+    public struct BenchOptions: Equatable, Sendable {
+        public var count: Int
+        public var warmup: Int
+        public var maxP95Ms: Double?
+
+        public init(count: Int = 50, warmup: Int = 5, maxP95Ms: Double? = nil) {
+            self.count = count
+            self.warmup = warmup
+            self.maxP95Ms = maxP95Ms
+        }
+    }
+
+    /// Parse `lumina bench [--count N] [--warmup W] [--max-p95-ms X]`.
+    /// Returns nil for a malformed or unknown flag so the caller can print usage.
+    public static func parseBench(_ argv: [String]) -> BenchOptions? {
+        var options = BenchOptions()
+        var i = 2
+        while i < argv.count {
+            switch argv[i] {
+            case "--count":
+                guard i + 1 < argv.count, let n = Int(argv[i + 1]), n > 0, n <= 100_000 else { return nil }
+                options.count = n
+                i += 2
+            case "--warmup":
+                guard i + 1 < argv.count, let n = Int(argv[i + 1]), n >= 0, n <= 10_000 else { return nil }
+                options.warmup = n
+                i += 2
+            case "--max-p95-ms":
+                guard i + 1 < argv.count, let v = Double(argv[i + 1]), v.isFinite, v > 0 else { return nil }
+                options.maxP95Ms = v
+                i += 2
+            default:
+                return nil
+            }
+        }
+        return options
     }
 }
