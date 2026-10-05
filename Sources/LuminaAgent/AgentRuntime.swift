@@ -263,10 +263,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // One enumeration for the whole batch, one classification per
             // window. The old double filter classified every window twice and
             // each call enumerated all CG windows.
-            let onScreen = bound.map { Set(onScreenCGWindows(intersecting: $0.axFrame).compactMap(cgWindowID)) } ?? []
+            let onScreenRows = bound.map { onScreenCGWindows(intersecting: $0.axFrame) } ?? []
+            let onScreen = Set(onScreenRows.compactMap(cgWindowID))
             var classified: [UInt32: ClassifyResult] = [:]
             for window in windows {
-                classified[window.cgWindowId] = classifyWindow(window, onScreenIds: onScreen)
+                classified[window.cgWindowId] = classifyWindow(
+                    window,
+                    onScreenIds: onScreen,
+                    onScreenRows: onScreenRows
+                )
             }
             tileable = windows.filter { classified[$0.cgWindowId] == .tiled }
             floaters = windows.filter { classified[$0.cgWindowId] == .floating }
@@ -345,9 +350,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     /// Same classification with the on-screen set supplied by the caller, so a
     /// batch does one WindowServer enumeration instead of one per window.
-    func classifyWindow(_ window: WindowRef, onScreenIds: Set<UInt32>) -> ClassifyResult {
+    func classifyWindow(
+        _ window: WindowRef,
+        onScreenIds: Set<UInt32>,
+        onScreenRows: [[String: Any]]? = nil
+    ) -> ClassifyResult {
         guard let el = elements[window.cgWindowId], let bound else { return .tiled }
-        guard let (input, _, _) = classifyInput(from: el, adapter: adapter, bound: bound, onScreenIds: onScreenIds) else {
+        guard let (input, _, _) = classifyInput(
+            from: el,
+            adapter: adapter,
+            bound: bound,
+            onScreenIds: onScreenIds,
+            onScreenRows: onScreenRows
+        ) else {
             return .tiled
         }
         return classify(input, rules: config.windowRules)
@@ -402,6 +417,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     adapter: adapter,
                     bound: bound,
                     onScreenIds: onScreenIds,
+                    onScreenRows: cg,
                     excludingWindowIds: used
                 ) else { continue }
                 adapter.markAccessibilityHealthy(pid: pid)
@@ -446,6 +462,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                adapter: adapter,
                bound: bound,
                onScreenIds: onScreenIds,
+               onScreenRows: cg,
                excludingWindowIds: used
            ),
            !out.contains(where: { $0.cgWindowId == id })
@@ -940,7 +957,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var claimed = session.allWindowIds.union(elements.keys)
         for id in delta.added + delta.recycled {
             guard let el = elementsById[id] else { continue }
-            onCreate(el, claimed: &claimed, apply: false, space: space)
+            onCreate(el, claimed: &claimed, apply: false, space: space, cgRows: onScreenRows)
         }
         // Nothing entered or left the model: skip the hidden-space park sweep
         // (an AX read per parked window) and only re-apply frames. The next
@@ -1019,7 +1036,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         _ element: AXUIElement,
         claimed: inout Set<UInt32>,
         apply: Bool = true,
-        space preferredSpace: SpaceId? = nil
+        space preferredSpace: SpaceId? = nil,
+        cgRows: [[String: Any]]? = nil
     ) {
         guard let bound else { return }
         let targetId = preferredSpace.flatMap { session.spaces[$0] != nil ? $0 : nil } ?? session.focusedSpace
@@ -1035,7 +1053,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             return
         }
-        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
+        // Reuse the refresh pass's on-screen list when supplied; the fallback
+        // is for direct callers.
+        let rows = cgRows ?? onScreenCGWindows(intersecting: bound.axFrame)
+        let onScreen = Set(rows.compactMap(cgWindowID))
         if let frame = adapter.frame(of: element), isStashedAway(frame) {
             // A fresh window's first AX read can be an empty frame while it
             // animates in; that is not our park. Our parks always keep height.
@@ -1067,6 +1088,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             adapter: adapter,
             bound: bound,
             onScreenIds: onScreen,
+            onScreenRows: rows,
             excludingWindowIds: claimed
         ) else {
             log.info("onCreate skip (no window id) role=\(adapter.role(of: element) ?? "?")")
