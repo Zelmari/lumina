@@ -51,11 +51,15 @@ final class ExtraController: NSObject, @unchecked Sendable {
     private var openProcesses: [Process] = []
     private let statusQueue = DispatchQueue(label: "com.zelmari.lumina.extra.status")
     private var statusTimer: DispatchSourceTimer?
+    private var statusTimerInterval: TimeInterval?
     /// `LoginService.enabled` is an SMAppService XPC query. It used to run on
     /// the main thread on every status tick; a short TTL still notices an
     /// external System Settings change.
     private var cachedLoginEnabled: Bool?
     private var cachedLoginEnabledAt = Date.distantPast
+    /// True when at least one agent is pushing status over a subscription;
+    /// the timer then only reconciles.
+    var hasHealthySubscriptions = false
 
     override init() {
         uid = getuid()
@@ -102,10 +106,23 @@ final class ExtraController: NSObject, @unchecked Sendable {
         }
         bootRegistry()
         maybeFirstRun()
+        // The interval is adaptive: short while an agent is current, long when
+        // there is nothing to show.
+        scheduleStatusTimer(interval: 0.25, leeway: 0.1)
+    }
+
+    /// (Re)arm the status poll. Status queue only; a no-op when the interval is
+    /// unchanged so every poll does not rebuild the timer.
+    func scheduleStatusTimer(interval: TimeInterval, leeway: TimeInterval) {
+        guard statusTimerInterval != interval else { return }
+        statusTimerInterval = interval
+        statusTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: statusQueue)
-        // Leeway lets the OS coalesce the wakeup with other timers instead of
-        // forcing an exact 0.8s cadence forever.
-        timer.schedule(deadline: .now() + 0.8, repeating: 0.8, leeway: .milliseconds(400))
+        timer.schedule(
+            deadline: .now() + interval,
+            repeating: interval,
+            leeway: .milliseconds(Int(leeway * 1000))
+        )
         timer.setEventHandler { [weak self] in self?.pollStatusBody() }
         timer.resume()
         statusTimer = timer
@@ -503,6 +520,14 @@ final class ExtraController: NSObject, @unchecked Sendable {
             DispatchQueue.main.async { [weak self] in
                 self?.status.updateEmpty(loginEnabled: self?.loginEnabled() ?? false)
             }
+        }
+        // With push subscriptions a slow safety-net poll is enough; without
+        // them the strip is only as fresh as this timer.
+        if winnerId != nil {
+            let interval: TimeInterval = hasHealthySubscriptions ? 3.0 : 0.25
+            scheduleStatusTimer(interval: interval, leeway: interval * 0.4)
+        } else {
+            scheduleStatusTimer(interval: 1.5, leeway: 0.5)
         }
     }
 
