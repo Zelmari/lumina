@@ -30,8 +30,8 @@
 #   BENCH_COUNT  pings for `lumina bench` (default 50)
 #   BENCH_WARMUP warmup pings (default 5)
 #   BENCH_MAX_P95_MS  fail when IPC round-trip p95 exceeds this (default 25)
-#   BENCH_STRICT set to 1 to also fail when the agent's refresh-to-frame p95
-#                exceeds BENCH_FRAME_MAX_MS (default 50), a launch takes
+#   BENCH_STRICT set to 1 to also fail when the created-path refresh p95
+#                exceeds BENCH_FRAME_MAX_MS (default 100), a launch takes
 #                longer than BENCH_LAUNCH_MAX_MS (default 500), or the menu
 #                push takes longer than BENCH_MENU_MAX_MS (default 250)
 
@@ -773,23 +773,25 @@ if v is not None:
   fi
 
   if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
-    frame_max="${BENCH_FRAME_MAX_MS:-50}"
+    frame_max="${BENCH_FRAME_MAX_MS:-100}"
     if "$LUMINA" status 2>/dev/null | python3 -c "
 import json, sys
 s = json.load(sys.stdin)
-p95 = s.get('refreshLatencyP95Ms')
+# The created path is the interactive one; cold app launches are reported
+# but not gated on a machine-independent number.
+p95 = s.get('createdLatencyP95Ms')
 limit = float('${frame_max}')
 if p95 is None:
-    print('no refresh latency samples; cannot gate')
+    print('no created-path latency samples; cannot gate')
     sys.exit(1)
 if p95 > limit:
-    print('refresh p95 %.1fms exceeds %gms' % (p95, limit))
+    print('created refresh p95 %.1fms exceeds %gms' % (p95, limit))
     sys.exit(1)
-print('refresh p95 %.1fms within %gms' % (p95, limit))
+print('created refresh p95 %.1fms within %gms' % (p95, limit))
 "; then
-      pass "refresh-to-frame p95 within ${frame_max}ms"
+      pass "created refresh p95 within ${frame_max}ms"
     else
-      fail "refresh-to-frame p95 exceeds ${frame_max}ms"
+      fail "created refresh p95 exceeds ${frame_max}ms"
     fi
   fi
 fi

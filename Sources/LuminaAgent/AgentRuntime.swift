@@ -3544,6 +3544,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "lastRefreshMs": lastRefreshSummary.map { .int($0.durationMs) } ?? .null,
             "refreshLatencyMs": refreshLatency.last.map { .double($0) } ?? .null,
             "refreshLatencyP95Ms": refreshLatency.p95.map { .double($0) } ?? .null,
+            "createdLatencyP95Ms": createdLatency.p95.map { .double($0) } ?? .null,
+            "launchedLatencyP95Ms": launchedLatency.p95.map { .double($0) } ?? .null,
             "hotkeyError": hotkeys.hotkeyError.map { .string($0) } ?? .null,
             "skylightSpaceId": boundSkyLightId.map { .int(Int($0)) } ?? .null,
         ]
