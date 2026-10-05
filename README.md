@@ -39,11 +39,15 @@ A partial file **merges onto the shipped defaults**: omit a key and its default 
 | `launch-tiling` | `z-order`, `float-existing`, `new-only` | `z-order` | What happens to windows already open when Lumina starts. |
 | `launch-apps` | array of bundle ids | `[]` | Apps opened when the agent starts, e.g. `["com.apple.Terminal"]`. |
 | `pre-park-new-windows` | bool | `true` | Park a new window in the stash corner the moment it is created, so its default frame is not visible until the tile lands. |
+| `speculative-tile` | bool | `false` | Write a new standard window straight to its predicted tile instead of the corner; falls back to the corner on any doubt. |
+| `hide-until-tiled-apps` | array of bundle ids | `[]` | Hide these apps at launch and reveal them only after their first window is tiled (opt-in). |
 | `[gaps] inner` | 0–128 | `8` | Gap between tiles. |
 | `[gaps] outer` | 0–128 | `8` | Gap between tiles and the screen edges. |
 | `[native-tabs] apps` | array of bundle ids | Terminal, Ghostty | Apps whose tabs are separate windows (macOS native tabbing). |
 
 `float-existing` and `new-only` currently behave the same (v1): windows already open float, new ones tile.
+
+New windows are detected with `AXCreated`/`AXWindowCreated` plus a bounded launch watch that starts at `willLaunch`, so a window that exists before its observer installs is still caught in the first frames. It is parked in the stash corner before the adoption pass; with `speculative-tile` it is written straight to the tile it is about to occupy. Apps listed in `hide-until-tiled-apps` stay hidden until that pass has tiled their first window, then are revealed and reactivated.
 
 ### Window rules
 
@@ -161,7 +165,7 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 
 ## Status
 
-Layout and IPC are unit-tested with SwiftPM (225 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
+Layout and IPC are unit-tested with SwiftPM (236 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
 
 On macOS, `swift test` needs the Xcode toolchain (`export DEVELOPER_DIR=/Applications/Xcode.app`); Command Line Tools lack the `Testing` module.
 
