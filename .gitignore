@@ -194,3 +194,8 @@ core.*
 skills/
 AGENTS.md
 CLAUDE.md
+
+// Plans is intentionally gitignored, the PROMPTS file is explicitly mentioned because at times i
+// choose to unignore plans but usually intend to keep specifically PROMPTS.md gitignored
+plans/
+plans/PROMPTS.md
