@@ -54,6 +54,21 @@ struct VerifyTests {
         #expect(issues.contains { $0.kind == "visible-under-fullscreen" })
     }
 
+    @Test func missingSiblingLeafIsALayoutHole() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 2, pid: 2), usableIsWide: true)
+        var space = session[SpaceId.require(1)]!
+        // Drop one leaf from the node table; the container still splits the
+        // usable rect, so the remaining tile spans only half of it.
+        if let victim = space.leaf(containing: 2)?.id {
+            space.nodes.removeValue(forKey: victim)
+        }
+        session.spaces[SpaceId.require(1)] = space
+        let issues = verifySession(session, usable: usable, gaps: .default)
+        #expect(issues.contains { $0.kind == "layout-hole" })
+    }
+
     @Test func duplicateWindowAcrossWorkspacesIsAnIssue() {
         var session = Session.empty(spaceCount: 2)
         session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 5, pid: 5), usableIsWide: true)

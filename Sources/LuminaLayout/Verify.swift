@@ -87,6 +87,30 @@ public func verifySession(_ session: Session, usable: Rect, gaps: Gaps, slop: Do
                     ))
                 }
             }
+            // A single visible window must fill the usable rect; tiles that
+            // do not span it mean the layout has a hole (a stray container or
+            // a leaf the frame math skipped).
+            if !tiled.isEmpty {
+                var minX = Double.greatestFiniteMagnitude
+                var minY = Double.greatestFiniteMagnitude
+                var maxX = -Double.greatestFiniteMagnitude
+                var maxY = -Double.greatestFiniteMagnitude
+                for node in tiled {
+                    guard let rect = rects[node.id] else { continue }
+                    minX = min(minX, rect.minX)
+                    minY = min(minY, rect.minY)
+                    maxX = max(maxX, rect.maxX)
+                    maxY = max(maxY, rect.maxY)
+                }
+                if abs(minX - usable.minX) > slop || abs(minY - usable.minY) > slop
+                    || abs(maxX - usable.maxX) > slop || abs(maxY - usable.maxY) > slop
+                {
+                    issues.append(VerifyIssue(
+                        "layout-hole",
+                        "tiles span \(Int(maxX - minX))x\(Int(maxY - minY)) at \(Int(minX)),\(Int(minY)) but usable is \(Int(usable.w))x\(Int(usable.h)) at \(Int(usable.x)),\(Int(usable.y))"
+                    ))
+                }
+            }
             for i in 0..<tiled.count {
                 for j in (i + 1)..<tiled.count {
                     guard let a = rects[tiled[i].id], let b = rects[tiled[j].id] else { continue }

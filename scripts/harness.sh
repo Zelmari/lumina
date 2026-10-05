@@ -20,6 +20,10 @@
 #                managed window was restored to a usable size (Lumina stays
 #                quit afterwards; relaunch it yourself)
 #   LUMINA_LOG   agent log path (default ~/Library/Logs/Lumina.log)
+#   RECORD       set to 1 to write per-step geometry artifacts under
+#                artifacts/harness-<timestamp>/ (windows, workspaces, verify,
+#                debug-windows dumps, and geometry.txt)
+#   VERBOSE      set to 1 to print the per-window geometry table every step
 
 set -uo pipefail
 
@@ -28,6 +32,16 @@ WINDOW_COUNT="${WINDOW_COUNT:-3}"
 KEEP_WINDOWS="${KEEP_WINDOWS:-0}"
 FAILURES=0
 STEP=0
+
+ARTIFACTS=""
+if [[ "${RECORD:-0}" == "1" ]]; then
+  ARTIFACTS="$ROOT/artifacts/harness-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$ARTIFACTS"
+fi
+TMP_BEFORE="$(mktemp -t lumina-harness-before)"
+TMP_AFTER="$(mktemp -t lumina-harness-after)"
+cleanup_tmp() { rm -f "$TMP_BEFORE" "$TMP_AFTER"; }
+trap cleanup_tmp EXIT
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "harness.sh only runs on macOS." >&2
@@ -63,6 +77,57 @@ run() {
   printf '%s\n' "$out"
 }
 
+# One line per managed window: id, bundle, space, role, size, position.
+geometry_table() {
+  "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+for w in json.load(sys.stdin).get("windows", []):
+    print("id=%-7s %-28s space=%-2d %-7s %4dx%-4d @%d,%d" % (
+        w["cgWindowId"], (w.get("bundleId") or "?")[:28], w["space"], w["role"],
+        w["w"], w["h"], w["x"], w["y"]))
+' 2>/dev/null || true
+}
+
+# Per-step artifacts: the geometry a human/agent needs to see a sizing bug
+# after the fact. Off unless RECORD=1.
+record_step() {
+  local label="$1"
+  [[ -n "$ARTIFACTS" ]] || return 0
+  local n slug
+  n="$(printf '%02d' "$STEP")"
+  slug="$(printf '%s' "$label" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-//;s/-$//')"
+  "$LUMINA" list-windows > "$ARTIFACTS/step-$n-$slug.windows.json" 2>/dev/null
+  "$LUMINA" list-workspaces > "$ARTIFACTS/step-$n-$slug.workspaces.json" 2>/dev/null
+  "$LUMINA" verify > "$ARTIFACTS/step-$n-$slug.verify.json" 2>/dev/null
+  local dump
+  dump="$("$LUMINA" debug-windows 2>/dev/null)"
+  if [[ -n "$dump" && -f "$dump" ]]; then
+    cp "$dump" "$ARTIFACTS/step-$n-$slug.debug.json"
+  fi
+  {
+    echo "== step $STEP: $label"
+    geometry_table
+  } >> "$ARTIFACTS/geometry.txt"
+}
+
+# Ids whose geometry changed between two list-windows snapshots while staying
+# on the same workspace.
+geometry_moves() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+import json, sys
+before = {w["cgWindowId"]: w for w in json.load(open(sys.argv[1]))["windows"]}
+after = {w["cgWindowId"]: w for w in json.load(open(sys.argv[2]))["windows"]}
+moved = []
+for i, w in before.items():
+    n = after.get(i)
+    if not n or w["space"] != n["space"]:
+        continue
+    if any(abs(w[k] - n[k]) > 2 for k in ("x", "y", "w", "h")):
+        moved.append(i)
+print(" ".join(str(i) for i in sorted(moved)))
+PY
+}
+
 # Check invariants and that no tracked window silently left the model.
 verify() {
   local label="${1:-verify}"
@@ -76,6 +141,7 @@ verify() {
   rc=$?
   if [[ $rc -ne 0 ]]; then
     fail "$label: verify found issues ($out)"
+    geometry_table | sed 's/^/      /'
   else
     pass "$label: verify clean"
   fi
@@ -84,8 +150,13 @@ verify() {
     missing="$(missing_ids "$TRACKED_IDS")"
     if [[ -n "$missing" ]]; then
       fail "$label: windows left the model: $missing"
+      geometry_table | sed 's/^/      /'
     fi
   fi
+  if [[ "${VERBOSE:-0}" == "1" ]]; then
+    geometry_table | sed 's/^/      /'
+  fi
+  record_step "$label"
 }
 
 managed_count() {
@@ -115,21 +186,32 @@ print(" ".join(str(i) for i in sorted(expected - current)))
 ' "$1" 2>/dev/null || true
 }
 
-# `open -n` needs no Automation permission, unlike osascript-driven TextEdit.
+# `make new document` gives a default-size window that classifies as tiled.
+# `open -n` is the permission-free fallback, but TextEdit may restore a saved
+# (possibly parked) frame, so prefer the scripted path when allowed.
 open_windows() {
   local n="$1"
   for ((i = 0; i < n; i++)); do
-    open -n -a TextEdit >/dev/null 2>&1 ||
-      { fail "could not launch TextEdit window $((i + 1))"; return 1; }
+    if ! osascript -e 'tell application "TextEdit" to make new document' >/dev/null 2>&1; then
+      open -n -a TextEdit >/dev/null 2>&1 ||
+        { fail "could not launch TextEdit window $((i + 1))"; return 1; }
+    fi
     sleep 0.4
   done
 }
 
-# The harness owns every TextEdit instance it launched; the header warns the
-# user not to have documents open.
+# Close documents before quitting: killing TextEdit makes macOS restore the
+# open documents on the next launch, so repeated runs accumulate windows.
 close_windows() {
-  pkill -x TextEdit >/dev/null 2>&1 || true
+  osascript -e 'tell application "TextEdit" to close every document saving no' >/dev/null 2>&1 || true
+  osascript -e 'tell application "TextEdit" to quit' >/dev/null 2>&1 || true
   sleep 0.8
+  pkill -x TextEdit >/dev/null 2>&1 || true
+}
+
+# Start from zero test windows even if a previous run was interrupted.
+reset_test_app() {
+  close_windows
 }
 
 wait_for_count() {
@@ -156,6 +238,8 @@ if ! "$LUMINA" status >/dev/null 2>&1; then
   exit 2
 fi
 
+reset_test_app
+sleep 0.5
 baseline="$(managed_count)"
 say "baseline: $baseline managed windows"
 verify "baseline"
@@ -224,10 +308,19 @@ run balance >/dev/null
 verify "after resize/balance"
 
 say "workspace switch with hidden windows"
+"$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null
 run workspace 2 >/dev/null
 verify "on workspace 2"
 run workspace 1 >/dev/null
 verify "back on workspace 1"
+"$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null
+moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+if [[ -n "$moved" ]]; then
+  fail "geometry changed across a workspace round trip: $moved"
+  geometry_table | sed 's/^/      /'
+else
+  pass "geometry stable across a workspace round trip"
+fi
 
 say "move window to workspace 2 and back"
 run move-node-to-workspace 2 >/dev/null
@@ -298,6 +391,9 @@ else
   fi
 fi
 
+if [[ -n "$ARTIFACTS" ]]; then
+  printf '\nartifacts: %s\n' "$ARTIFACTS"
+fi
 if [[ $FAILURES -eq 0 ]]; then
   printf '\nharness: PASS (%d verify steps)\n' "$STEP"
   exit 0
