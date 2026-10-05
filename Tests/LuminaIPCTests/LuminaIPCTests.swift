@@ -122,13 +122,25 @@ struct CodecTests {
     @Test func requestWithoutArgsDecodes() throws {
         let line = #"{"v":1,"id":"x","cmd":"status"}"#
         let parsed = parseLine(line)
-        guard case .request(.status, let id) = parsed else {
+        guard case .request(.status(let full), let id) = parsed else {
             Issue.record("expected status, got \(parsed)")
             return
         }
         #expect(id == "x")
+        // No explicit `full` defaults to true so `lumina status` output is
+        // unchanged for scripts.
+        #expect(full)
         let direct = try JSONDecoder().decode(IPCRequest.self, from: Data(line.utf8))
         #expect(direct.args.isEmpty)
+    }
+
+    @Test func statusFullFalseParses() {
+        let line = #"{"v":1,"id":"x","cmd":"status","args":{"full":false}}"#
+        guard case .request(.status(let full), _) = parseLine(line) else {
+            Issue.record("expected status, got \(parseLine(line))")
+            return
+        }
+        #expect(!full)
     }
 
     @Test func jsonValueWholeDoubleRoundTrips() throws {

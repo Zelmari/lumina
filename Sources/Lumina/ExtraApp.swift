@@ -88,7 +88,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
         bootRegistry()
         maybeFirstRun()
         let timer = DispatchSource.makeTimerSource(queue: statusQueue)
-        timer.schedule(deadline: .now() + 0.8, repeating: 0.8)
+        // Leeway lets the OS coalesce the wakeup with other timers instead of
+        // forcing an exact 0.8s cadence forever.
+        timer.schedule(deadline: .now() + 0.8, repeating: 0.8, leeway: .milliseconds(400))
         timer.setEventHandler { [weak self] in self?.pollStatusBody() }
         timer.resume()
         statusTimer = timer
@@ -246,8 +248,13 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func fetchAgentStatus(socket: String) -> AgentStatus? {
-        guard let resp = Client.request(socketPath: socket, cmd: "status", args: [:], role: .agent),
-              let obj = resp.data?.object
+        guard let resp = Client.request(
+            socketPath: socket,
+            cmd: "status",
+            args: ["full": .bool(false)],
+            role: .agent
+        ),
+            let obj = resp.data?.object
         else { return nil }
         return AgentStatus(
             secureInput: obj["secureInput"]?.bool ?? false,

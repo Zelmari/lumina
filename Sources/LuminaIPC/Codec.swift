@@ -162,7 +162,7 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
     case "list-windows": return .ok(.listWindows)
     case "list-workspaces": return .ok(.listWorkspaces)
     case "verify": return .ok(.verify)
-    case "status": return .ok(.status)
+    case "status": return .ok(.status(full: args["full"]?.bool ?? true))
     case "ping": return .ok(.ping)
     case "mark-current": return .ok(.markCurrent)
     case "yield": return .ok(.yield)
