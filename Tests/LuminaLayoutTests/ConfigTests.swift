@@ -134,6 +134,30 @@ struct ConfigTests {
         #expect(config.bindings.contains(where: { $0.chord.keyName == "h" }))
     }
 
+    @Test func preParkNewWindowsDefaultsOnAndParsesOff() throws {
+        // The bundled default keeps the anti-flash pre-park on.
+        let bundled = try parseConfig(text: Config.bundledDefaultTOML).get()
+        #expect(bundled.preParkNewWindows)
+        // An explicit user value wins and merges over the bundled default.
+        let off = try parseConfig(
+            text: "pre-park-new-windows = false",
+            defaults: bundled
+        ).get()
+        #expect(!off.preParkNewWindows)
+        // Omitting it keeps whatever the defaults carried.
+        let (merged, error) = loadOrDefault(text: "[gaps]\nouter = 12\n")
+        #expect(error == nil)
+        #expect(merged.preParkNewWindows)
+    }
+
+    @Test func preParkNewWindowsIsAKnownTopLevelKey() throws {
+        let config = try parseConfig(
+            text: "pre-park-new-windows = false",
+            defaults: Config.bundledDefault
+        ).get()
+        #expect(!config.diagnostics.contains(where: { $0.contains("pre-park-new-windows") }))
+    }
+
     @Test func bindingTableHeaderWithCommentStillCollapsesDuplicates() throws {
         let text = """
         [bindings] # main modifier is alt

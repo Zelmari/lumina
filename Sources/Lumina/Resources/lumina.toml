@@ -1,5 +1,8 @@
 space-count = 10
 focus-follows-mouse = false
+# Park a new window in the stash corner until its tile lands, so the app's
+# own default frame is not visible.
+pre-park-new-windows = true
 # z-order, float-existing, or new-only
 launch-tiling = "z-order"
 launch-apps = []                       # e.g. ["com.apple.Terminal"]
