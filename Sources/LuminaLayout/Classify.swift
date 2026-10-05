@@ -157,12 +157,6 @@ public enum Classify {
 }
 
 public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyResult {
-    if !input.centerOnBoundDisplay {
-        return .unmanaged
-    }
-    if let role = input.role, Classify.nonWindowRoles.contains(role) {
-        return .unmanaged
-    }
     // An off-screen window that is not minimized is a hidden tab, a twin on
     // another native Space, or a stale AX entry. Adopting it tiles a window
     // nobody can see and leaves a hole where a real window should be. The
@@ -170,6 +164,31 @@ public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyRes
     // visible is lost here.
     if !input.isOnScreen && !input.isMinimized {
         return .ignored
+    }
+    return classifyOnScreen(input, rules: rules)
+}
+
+/// Classify as if the window were on screen. The agent conceals a new window
+/// (pre-park / predicted tile / launch shield) before CG lists it, and the
+/// normal off-screen gate would return `.ignored` for exactly those windows.
+public func classify(
+    _ input: ClassifyInput,
+    rules: [WindowRule],
+    ignoringOnScreen: Bool
+) -> ClassifyResult {
+    guard ignoringOnScreen else { return classify(input, rules: rules) }
+    var visible = input
+    visible.isOnScreen = true
+    return classifyOnScreen(visible, rules: rules)
+}
+
+/// The part of classification after the on-screen gate.
+private func classifyOnScreen(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyResult {
+    if !input.centerOnBoundDisplay {
+        return .unmanaged
+    }
+    if let role = input.role, Classify.nonWindowRoles.contains(role) {
+        return .unmanaged
     }
 
     var allowTiled = false

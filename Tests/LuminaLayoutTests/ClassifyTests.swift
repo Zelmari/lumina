@@ -109,6 +109,28 @@ struct ClassifyTests {
         #expect(classify(input, rules: []) == .ignored)
     }
 
+    @Test func ignoringOnScreenAdoptsAConcealedWindow() {
+        // The agent conceals a new window before CG lists it; classification
+        // must still decide tiled instead of dropping it as off-screen.
+        let input = ClassifyInput(
+            bundleId: "com.apple.TextEdit",
+            role: "AXWindow",
+            subrole: AXRoleName.standardWindow,
+            width: 800,
+            height: 600,
+            isOnScreen: false
+        )
+        #expect(classify(input, rules: []) == .ignored)
+        #expect(classify(input, rules: [], ignoringOnScreen: true) == .tiled)
+    }
+
+    @Test func ignoringOnScreenDoesNotBypassDialogOrRoleRules() {
+        let dialog = ClassifyInput(role: "AXWindow", subrole: AXRoleName.dialog, isOnScreen: false)
+        #expect(classify(dialog, rules: [], ignoringOnScreen: true) == .floating)
+        let nonWindow = ClassifyInput(role: "AXMenuBar", isOnScreen: false)
+        #expect(classify(nonWindow, rules: [], ignoringOnScreen: true) == .unmanaged)
+    }
+
     @Test func siriAppTilesUnlessDialog() {
         let siri = ClassifyInput(bundleId: "com.apple.siri", role: AXRoleName.standardWindow)
         #expect(classify(siri, rules: []) == .tiled)
