@@ -1,7 +1,36 @@
 # macOS native tabs (NSWindowTabGroup) — plan
 
-Status: proposed. Branch: `feat/macos-native-tabs`. Not started.
-Owner: agent. Review/merge: user after manual testing.
+Status: implemented on `feat/macos-native-tabs` (PR #3). Review/merge: user
+after manual testing.
+
+## Status (implementation)
+
+- **T0/T1 done.** Probe results: Terminal with tabs active exposes one
+  `AXWindow` plus an `AXTabGroup` child with `AXTabs`; Ghostty exposes each
+  tab as a separate `AXWindow` with no tab group. CG keeps listing the
+  inactive backing windows, so the removal gate kept them in the model
+  forever (six ghost Terminal tiles in one live session).
+- **T2/T3 done** as one unified rule: for a configured app, when exactly one
+  window is on-screen, the model slot is rebound to the active backing
+  window and the inactive backing windows are dropped outright. Two
+  on-screen windows are treated as genuinely separate. Live-tested with
+  Terminal (six ghosts collapsed to one; five tab switches kept one tile)
+  and Ghostty (fresh instance, Cmd-T tabs; switching changed the backing id
+  and the slot followed, no extra tile).
+- **T4 done.** `[native-tabs] apps = [...]` top-level list, defaults
+  Terminal + Ghostty.
+- **T5 done.** Overflow-check loop bounded; observations cleared on an
+  unresolvable element or a float.
+- **T6 done.** Terminal native-tabs harness section: creates tabs through
+  Shell > New Tab (System Events), switches them, asserts exactly one tile;
+  the AX tab count is read from the `AXTabGroup` because Terminal's
+  AppleScript count is stale. Full harness: 29 verify steps green.
+- **T7 done.** README "Known behavior" and `docs/compat.md` updated.
+- **T8/T9 done** (dwindle-preserving float policy, trusted originals) and
+  live-verified: a 4-window launch tiles dwindle-style with no floats, and
+  quit restores real pre-tiling frames.
+- **Open:** no automated Ghostty section (keybindings vary per user);
+  Ghostty was live-tested manually.
 
 ## Problem
 
