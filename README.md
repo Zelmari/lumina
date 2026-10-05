@@ -4,6 +4,15 @@ Window / tiling manager for macOS. Spiral tiling (Hyprland dwindle with permanen
 
 Lumina is a guest on macOS. Quitting it restores managed windows to their pre-tiling frames (they may overlap) and leaves apps open.
 
+## For agents
+
+**The CLI and the test harness are built for automated use by coding agents.**
+
+- Every `lumina` command is non-interactive and prints machine-readable JSON (`list-windows`, `list-workspaces`, `status`, `debug-windows`, `debug-ax`). `verify` is the oracle: exit 0 when the model is consistent, exit 1 with a JSON issue list otherwise. `status` exit 2 means no agent is running on this Space.
+- `scripts/harness.sh` is the end-to-end regression suite: it drives real apps through the full feature set, running `verify` plus an independent CG-window oracle after every step. Run it before and after a change; `RECORD=1` keeps per-step geometry artifacts for post-mortems.
+- Workflow for a bug: reproduce it as a failing harness assertion first, then fix until the harness is green. `plans/macos-native-tabs.md` is a worked example.
+- When touching AX behavior, `debug-ax <pid>` dumps an app's real accessibility attributes, so detection is designed against observed values instead of guesses.
+
 ## Requirements
 
 - Apple silicon only (arm64). Intel is not supported.
@@ -78,7 +87,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 
 ## CLI
 
-`lumina <command>` talks to the agent on the current Space:
+`lumina <command>` talks to the agent on the current Space. Exit codes: `0` success, `1` command error or `verify` issues, `2` no agent running on this Space. Output is JSON and stable for scripts and agents:
 
 | Command | Description |
 |---|---|
@@ -113,7 +122,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 
 ## Test harness
 
-`scripts/harness.sh` drives the real CLI against the running agent. It opens TextEdit windows and walks through focus, swap, float, fullscreen, resize/balance, opening on a fresh workspace, closing a single window (reflow), two workspace round trips (geometry stability), move-to-workspace, the menu-extra workspace count, config reload, and native tabs on a dedicated Ghostty instance, then cleans up. It asserts that no tracked window leaves the model and that geometry converges.
+`scripts/harness.sh` is the agent-facing end-to-end regression suite. It drives the real CLI against the running agent. It opens TextEdit windows and walks through focus, swap, float, fullscreen, resize/balance, opening on a fresh workspace, closing a single window (reflow), two workspace round trips (geometry stability), move-to-workspace, the menu-extra workspace count, config reload, and native tabs on a dedicated Ghostty instance, then cleans up. It asserts that no tracked window leaves the model and that geometry converges.
 
 `lumina verify` runs after every step and checks: duplicate windows, windows visible on an inactive workspace, tiles overlapping or outside the display, a layout hole that does not span the usable rect, stale focus, a retained dead AX element, a tiled window not at its tile, and a hidden-workspace window still on screen.
 
