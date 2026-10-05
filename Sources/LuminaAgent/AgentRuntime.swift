@@ -79,6 +79,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     var observedMinSizes: [UInt32: Size] = [:]
     var overflowStrikes: [UInt32: Int] = [:]
     var clampingOverflow = false
+    /// Consecutive overflow-check refreshes with no resolution. Bounded so a
+    /// window whose element is gone cannot schedule refreshes forever.
+    var overflowCheckPasses = 0
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
     /// Cascade offset for quit restore when the saved original is really the
@@ -1608,11 +1611,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard var node = space.nodes[nodeId], var window = node.leaf,
                   let el = resolvedElement(for: window)
             else {
-                if let node = space.nodes[nodeId], let window = node.leaf, !liveIds.contains(window.cgWindowId),
-                   !isYoung(window.cgWindowId)
-                {
-                    log.info("applyFrames missing window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
-                    ghosts.append(window.cgWindowId)
+                if let node = space.nodes[nodeId], let window = node.leaf {
+                    // An unresolvable window cannot be confirmed as refusing
+                    // its tile; drop any strike so it cannot loop.
+                    overflowStrikes[window.cgWindowId] = nil
+                    if !liveIds.contains(window.cgWindowId), !isYoung(window.cgWindowId) {
+                        log.info("applyFrames missing window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
+                        ghosts.append(window.cgWindowId)
+                    }
                 }
                 continue
             }
@@ -1686,13 +1692,25 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             clampingOverflow = true
             defer { clampingOverflow = false }
             log.info("layout overflow: clamping with observed minimum sizes")
+            overflowCheckPasses = 0
             clampOverflowOn(session.focusedSpace)
             applyFrames()
             return
         }
         if !overflowStrikes.isEmpty, !clampingOverflow {
             // A first refusal strike needs a quick second look to confirm.
-            scheduleRefresh(reason: "overflowCheck", delay: 0.2)
+            // Cap the retries: an unresolvable or already-floating window
+            // must not schedule refreshes forever.
+            if overflowCheckPasses < 5 {
+                overflowCheckPasses += 1
+                scheduleRefresh(reason: "overflowCheck", delay: 0.2)
+            } else {
+                log.info("layout overflow check gave up; clearing strikes")
+                overflowStrikes.removeAll()
+                overflowCheckPasses = 0
+            }
+        } else if overflowStrikes.isEmpty {
+            overflowCheckPasses = 0
         }
         if let fs, let node = space.nodes[fs], let fsWindow = node.leaf {
             if var window = node.leaf, let el = resolvedElement(for: window) {
@@ -2442,6 +2460,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         )
         session = clamped
         if !floated.isEmpty {
+            for w in floated { overflowStrikes[w.cgWindowId] = nil }
             placeFloated(floated, space: spaceId)
         }
         return !floated.isEmpty
