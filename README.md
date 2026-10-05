@@ -104,7 +104,9 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 | `list-workspaces` | Print workspaces as JSON |
 | `verify` | Check tiling invariants; exit 1 on any issue |
 | `status` | Print agent status as JSON |
-| `debug-windows` | Write a model dump (live AX frames, refresh summary) |
+| `ping` | One IPC round trip; prints pong JSON |
+| `bench [--count N] [--warmup W] [--max-p95-ms X]` | Measure IPC round-trip latency; exit 1 when p95 exceeds `X` |
+| `debug-windows` | Write a model dump (live AX frames, refresh summary, refresh latency) |
 | `debug-ax <pid>` | Dump an app's accessibility attributes as JSON |
 | `reload` | Reload the config; prints the parse error on failure |
 | `pause` / `resume` | Stop / resume managing windows |
@@ -122,7 +124,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 
 ## Test harness
 
-`scripts/harness.sh` is the agent-facing end-to-end regression suite. It drives the real CLI against the running agent. It opens TextEdit windows and walks through focus, swap, float, fullscreen, resize/balance, opening on a fresh workspace, closing a single window (reflow), two workspace round trips (geometry stability), move-to-workspace, the menu-extra workspace count, config reload, and native tabs on a dedicated Ghostty instance, then cleans up. It asserts that no tracked window leaves the model and that geometry converges.
+`scripts/harness.sh` is the agent-facing end-to-end regression suite. It drives the real CLI against the running agent. It opens TextEdit windows and walks through focus, swap, float, fullscreen, resize/balance, opening on a fresh workspace, closing a single window (reflow), two workspace round trips (geometry stability), move-to-workspace, the menu-extra workspace count, config reload, a latency section (`lumina bench` IPC round trips plus the agent's recorded refresh-to-frame p95), and native tabs on a dedicated Ghostty instance, then cleans up. It asserts that no tracked window leaves the model and that geometry converges.
 
 `lumina verify` runs after every step and checks: duplicate windows, windows visible on an inactive workspace, tiles overlapping or outside the display, a layout hole that does not span the usable rect, stale focus, a retained dead AX element, a tiled window not at its tile, and a hidden-workspace window still on screen.
 
@@ -139,6 +141,10 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 | `RECORD=1` | Write per-step `list-windows`/`list-workspaces`/`verify`/`debug-windows` artifacts plus `geometry.txt` under `artifacts/` |
 | `VERBOSE=1` | Print the per-window geometry table every step |
 | `TABS_TEST=0` | Skip the native-tabs section |
+| `BENCH=0` | Skip the latency section |
+| `BENCH_COUNT` / `BENCH_WARMUP` | Pings and warmup for `lumina bench` (default 50 / 5) |
+| `BENCH_MAX_P95_MS` | Fail when IPC round-trip p95 exceeds this (default 25) |
+| `BENCH_STRICT=1` / `BENCH_FRAME_MAX_MS` | Also gate on refresh-to-frame p95 (default 50) |
 | `LUMINA_LOG` | Agent log path (default `~/Library/Logs/Lumina.log`) |
 
 ## Known behavior
@@ -152,7 +158,7 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 
 ## Status
 
-Layout and IPC are unit-tested with SwiftPM (207 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
+Layout and IPC are unit-tested with SwiftPM (219 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
 
 On macOS, `swift test` needs the Xcode toolchain (`export DEVELOPER_DIR=/Applications/Xcode.app`); Command Line Tools lack the `Testing` module.
 

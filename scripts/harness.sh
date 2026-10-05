@@ -26,6 +26,12 @@
 #                debug-windows dumps, and geometry.txt)
 #   VERBOSE      set to 1 to print the per-window geometry table every step
 #   TABS_TEST    set to 0 to skip the native-tabs (Ghostty) section
+#   BENCH        set to 0 to skip the latency section (default 1)
+#   BENCH_COUNT  pings for `lumina bench` (default 50)
+#   BENCH_WARMUP warmup pings (default 5)
+#   BENCH_MAX_P95_MS  fail when IPC round-trip p95 exceeds this (default 25)
+#   BENCH_STRICT set to 1 to also fail when the agent's refresh-to-frame p95
+#                exceeds BENCH_FRAME_MAX_MS (default 50)
 
 set -uo pipefail
 
@@ -650,6 +656,70 @@ fi
 say "reload config"
 run reload >/dev/null
 verify "after reload"
+
+# Latency: pure IPC round trips (no Accessibility needed) and the agent's
+# recorded event-to-frame time. The IPC gate is always on; the frame gate is
+# opt-in because it is machine- and app-dependent.
+if [[ "${BENCH:-1}" != "0" ]]; then
+  say "latency: IPC round trips"
+  bench_out="$("$LUMINA" bench --count "${BENCH_COUNT:-50}" --warmup "${BENCH_WARMUP:-5}" --max-p95-ms "${BENCH_MAX_P95_MS:-25}" 2>&1)"
+  bench_rc=$?
+  printf '%s\n' "$bench_out"
+  if [[ $bench_rc -eq 0 ]]; then
+    pass "bench p95 within ${BENCH_MAX_P95_MS:-25}ms"
+  else
+    fail "bench exited $bench_rc"
+  fi
+  if [[ -n "$ARTIFACTS" ]]; then
+    printf '%s\n' "$bench_out" > "$ARTIFACTS/bench.json"
+  fi
+
+  say "latency: agent refresh-to-frame"
+  # Generate fresh samples with a workspace round trip, then read the p95 the
+  # agent recorded for real discovery events.
+  "$LUMINA" workspace 2 >/dev/null 2>&1
+  "$LUMINA" workspace 1 >/dev/null 2>&1
+  sleep 0.5
+  frame_out="$("$LUMINA" status 2>/dev/null | python3 -c '
+import json, sys
+try:
+    s = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+last = s.get("refreshLatencyMs")
+p95 = s.get("refreshLatencyP95Ms")
+if last is None:
+    print("no refresh latency samples yet")
+else:
+    print("refreshLatency last=%.1fms p95=%.1fms" % (last, p95 if p95 is not None else last))
+' 2>/dev/null || true)"
+  if [[ -n "$frame_out" ]]; then
+    printf '   %s\n' "$frame_out"
+  fi
+  if [[ -n "$ARTIFACTS" ]]; then
+    "$LUMINA" status > "$ARTIFACTS/bench-status.json" 2>/dev/null
+  fi
+  if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
+    frame_max="${BENCH_FRAME_MAX_MS:-50}"
+    if "$LUMINA" status 2>/dev/null | python3 -c "
+import json, sys
+s = json.load(sys.stdin)
+p95 = s.get('refreshLatencyP95Ms')
+limit = float('${frame_max}')
+if p95 is None:
+    print('no refresh latency samples; cannot gate')
+    sys.exit(1)
+if p95 > limit:
+    print('refresh p95 %.1fms exceeds %gms' % (p95, limit))
+    sys.exit(1)
+print('refresh p95 %.1fms within %gms' % (p95, limit))
+"; then
+      pass "refresh-to-frame p95 within ${frame_max}ms"
+    else
+      fail "refresh-to-frame p95 exceeds ${frame_max}ms"
+    fi
+  fi
+fi
 
 # Native tabs: each tab is a separate NSWindow, so every Cmd-T makes a new
 # backing window active. Lumina must keep exactly one tile per app window.
