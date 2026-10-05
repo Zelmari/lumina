@@ -837,13 +837,21 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // A retained element that stopped answering while the app's own AX
         // window list omits the id is a destroyed window. Remove it even if
         // CG keeps listing a lingering record, or its tile pins the split.
+        // AX can also keep answering for a window the app has closed and keep
+        // listing it; for the focused space's visible tiles, CG is the
+        // aliveness truth.
         let liveIds = Set(live.map(\.cgWindowId))
+        let cgLiveIds = cgWindowIds()
         let modelIds = session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId))
         let deadElementIds = modelIds.filter { id in
-            guard let el = elements[id], let pid = modelPids[id],
-                  !liveIds.contains(id), !failedManaged.contains(pid)
-            else { return false }
-            return !adapter.isAliveElement(el)
+            guard let pid = modelPids[id], !liveIds.contains(id), !failedManaged.contains(pid) else {
+                return false
+            }
+            if let el = elements[id], !adapter.isAliveElement(el) { return true }
+            if session.current.leaf(containing: id) != nil, !cgLiveIds.contains(id), !isYoung(id) {
+                return true
+            }
+            return false
         }
         let focusedBefore = session.current.focusedWindow
         // A recycled id is torn down like a removal, then re-adopted from the
@@ -2764,7 +2772,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             restashOffspace()
             return
         }
-        guard focused != lastSyncedNativeFocusedId else { return }
+        // Re-assert the OS-focused window when the model's focus drifted, even
+        // if this is the same window as the last sync: a stale model focus
+        // made the next command target the wrong window.
+        guard focused != lastSyncedNativeFocusedId || session.current.focusedWindow != focused else {
+            return
+        }
         lastSyncedNativeFocusedId = focused
         if let spaceId = session.spaceContaining(cgWindowId: focused), spaceId != session.focusedSpace {
             var s = session
@@ -3167,6 +3180,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "displayGone": .bool(displayGone),
             "instanceId": .string(instanceId.uuidString),
             "space": .int(session.focusedSpace.raw),
+            "focusedWindow": session.current.focusedWindow.map { .int(Int($0)) } ?? .null,
             "spaceCount": .int(session.spaceCount),
             "visibleSpaceCount": .int(visible),
             "isCurrent": .bool(isCurrent),
