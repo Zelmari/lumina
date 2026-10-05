@@ -77,11 +77,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// neighbour whose tile they overflow. A refusal must be seen twice with
     /// the window keeping its old size across a shrink request.
     var observedMinSizes: [UInt32: Size] = [:]
-    var overflowStrikes: [UInt32: Int] = [:]
+    /// A window that is still larger than its tile after a shrink request.
+    /// Only a size held for `overflowRefusalWindow` counts as a real minimum;
+    /// a slow app that simply has not applied the write yet clears it.
+    struct OverflowObservation {
+        var frame: Rect
+        var since: Date
+    }
+    var overflowObservations: [UInt32: OverflowObservation] = [:]
+    let overflowRefusalWindow: TimeInterval = 1.5
     var clampingOverflow = false
-    /// Consecutive overflow-check refreshes with no resolution. Bounded so a
-    /// window whose element is gone cannot schedule refreshes forever.
-    var overflowCheckPasses = 0
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
     /// Cascade offset for quit restore when the saved original is really the
@@ -1145,7 +1150,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             observedMinSizes[to] = minSize
             observedMinSizes[from] = nil
         }
-        overflowStrikes[from] = nil
+        overflowObservations[from] = nil
         for sid in session.spaces.keys {
             if session.spaces[sid]?.focusedWindow == from {
                 session.spaces[sid]?.focusedWindow = to
@@ -1206,7 +1211,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         forgetBorn(id)
         knownOriginals[id] = nil
         observedMinSizes[id] = nil
-        overflowStrikes[id] = nil
+        overflowObservations[id] = nil
     }
 
     /// Drop a window that is really gone: close it on the focused space, remove
@@ -1613,8 +1618,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             else {
                 if let node = space.nodes[nodeId], let window = node.leaf {
                     // An unresolvable window cannot be confirmed as refusing
-                    // its tile; drop any strike so it cannot loop.
-                    overflowStrikes[window.cgWindowId] = nil
+                    // its tile; drop any observation so it cannot loop.
+                    overflowObservations[window.cgWindowId] = nil
                     if !liveIds.contains(window.cgWindowId), !isYoung(window.cgWindowId) {
                         log.info("applyFrames missing window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
                         ghosts.append(window.cgWindowId)
@@ -1631,7 +1636,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 var s = session.spaces[session.focusedSpace]!
                 s.setNode(node)
                 session.spaces[session.focusedSpace] = s
-                overflowStrikes[window.cgWindowId] = nil
+                overflowObservations[window.cgWindowId] = nil
                 continue
             }
             window.lastOnscreenFrame = rect
@@ -1651,27 +1656,40 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             if let live = adapter.frame(of: el) {
                 // An app that refuses to shrink below its real minimum keeps
-                // its old frame across the write. That must be seen twice
-                // before it becomes a minimum: one read can be a slow app
-                // that simply has not applied the new size yet. A partial
-                // application (neither old nor target) is not a refusal.
+                // its old frame across the write. Only a size held for the
+                // whole refusal window counts: a slow app that has not
+                // applied the write yet clears the observation instead.
+                let id = window.cgWindowId
                 let askedToShrink = (liveBefore?.w ?? 0) > rect.w + 4
                     || (liveBefore?.h ?? 0) > rect.h + 4
                 let stillOverflows = live.w > rect.w + 4 || live.h > rect.h + 4
-                let keptOldSize = liveBefore.map { framesClose(live, $0, slop: 4) } ?? false
-                if askedToShrink, stillOverflows, keptOldSize {
-                    let strikes = (overflowStrikes[window.cgWindowId] ?? 0) + 1
-                    overflowStrikes[window.cgWindowId] = strikes
-                    if strikes >= 2 {
-                        let prior = observedMinSizes[window.cgWindowId] ?? .unknown
-                        observedMinSizes[window.cgWindowId] = Size(
-                            w: live.w > rect.w + 4 ? max(prior.w, live.w) : prior.w,
-                            h: live.h > rect.h + 4 ? max(prior.h, live.h) : prior.h
-                        )
-                        overflowed = true
+                if askedToShrink, stillOverflows {
+                    if isYoung(id) {
+                        // A just-adopted app (Electron especially) may take
+                        // seconds to apply the write. Keep observing and give
+                        // it time; non-application is not a minimum yet.
+                        overflowObservations[id] = OverflowObservation(frame: live, since: Date())
+                        scheduleRefresh(reason: "overflowCheck", delay: 1.0)
+                    } else if let obs = overflowObservations[id], framesClose(obs.frame, live, slop: 4) {
+                        if Date().timeIntervalSince(obs.since) >= overflowRefusalWindow {
+                            overflowObservations[id] = nil
+                            if !observedMinCovers(id: id, live: live, rect: rect) {
+                                let prior = observedMinSizes[id] ?? .unknown
+                                observedMinSizes[id] = Size(
+                                    w: live.w > rect.w + 4 ? max(prior.w, live.w) : prior.w,
+                                    h: live.h > rect.h + 4 ? max(prior.h, live.h) : prior.h
+                                )
+                                overflowed = true
+                            }
+                        }
+                    } else {
+                        overflowObservations[id] = OverflowObservation(frame: live, since: Date())
+                        if !observedMinCovers(id: id, live: live, rect: rect) {
+                            scheduleRefresh(reason: "overflowCheck", delay: overflowRefusalWindow + 0.1)
+                        }
                     }
                 } else {
-                    overflowStrikes[window.cgWindowId] = nil
+                    overflowObservations[id] = nil
                 }
                 // A busy app can land the size but drop the position, leaving
                 // the window overlapping its neighbours. Re-issue once when
@@ -1692,26 +1710,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             clampingOverflow = true
             defer { clampingOverflow = false }
             log.info("layout overflow: clamping with observed minimum sizes")
-            overflowCheckPasses = 0
             clampOverflowOn(session.focusedSpace)
             applyFrames()
             return
         }
-        if !overflowStrikes.isEmpty, !clampingOverflow {
-            // A first refusal strike needs a quick second look to confirm.
-            // Cap the retries: an unresolvable or already-floating window
-            // must not schedule refreshes forever.
-            if overflowCheckPasses < 5 {
-                overflowCheckPasses += 1
-                scheduleRefresh(reason: "overflowCheck", delay: 0.2)
-            } else {
-                log.info("layout overflow check gave up; clearing strikes")
-                overflowStrikes.removeAll()
-                overflowCheckPasses = 0
-            }
-        } else if overflowStrikes.isEmpty {
-            overflowCheckPasses = 0
-        }
+
         if let fs, let node = space.nodes[fs], let fsWindow = node.leaf {
             if var window = node.leaf, let el = resolvedElement(for: window) {
                 if let live = adapter.frame(of: el), !framesClose(live, usable, slop: 2) {
@@ -2460,10 +2463,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         )
         session = clamped
         if !floated.isEmpty {
-            for w in floated { overflowStrikes[w.cgWindowId] = nil }
+            for w in floated { overflowObservations[w.cgWindowId] = nil }
             placeFloated(floated, space: spaceId)
         }
         return !floated.isEmpty
+    }
+
+    /// True when the stored observed minimum already covers every axis this
+    /// frame overflows, so there is nothing new to learn and no reason to
+    /// schedule another check.
+    func observedMinCovers(id: UInt32, live: Rect, rect: Rect) -> Bool {
+        guard let min = observedMinSizes[id] else { return false }
+        let widthCovered = live.w <= rect.w + 4 || min.w >= live.w
+        let heightCovered = live.h <= rect.h + 4 || min.h >= live.h
+        return widthCovered && heightCovered
     }
 
     func minSizes() -> [UInt32: Size] {
@@ -2584,7 +2597,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let ids = elements.filter { adapter.pid(of: $0.value) == pid }.map(\.key)
         for (_, window) in ownedWindows(pid: pid) {
             observedMinSizes[window.cgWindowId] = nil
-            overflowStrikes[window.cgWindowId] = nil
+            overflowObservations[window.cgWindowId] = nil
         }
         for id in ids {
             for spaceId in Array(session.spaces.keys) {
@@ -2685,7 +2698,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func handleDisplayChange() {
         // Minimum sizes are display-relative; re-observe against the new one.
         observedMinSizes.removeAll()
-        overflowStrikes.removeAll()
+        overflowObservations.removeAll()
         adapter.menuBarScreenMaxY = menuBarMaxY()
         let available = NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: adapter.menuBarScreenMaxY)?.uuid }
         guard let bound else { return }
@@ -2946,10 +2959,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                       let el = elements[w.cgWindowId], adapter.pid(of: el) == w.pid,
                       adapter.isAliveElement(el), let live = adapter.frame(of: el)
                 else { continue }
-                // Still settling: just adopted, a write in flight, or a first
-                // overflow strike awaiting confirmation.
+                // Still settling: just adopted, a write in flight, or a
+                // refusal observation awaiting confirmation.
                 if isYoung(w.cgWindowId) || adapter.generationInFlight(for: w.cgWindowId)
-                    || overflowStrikes[w.cgWindowId] != nil
+                    || overflowObservations[w.cgWindowId] != nil
                 {
                     continue
                 }
@@ -3083,6 +3096,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func debugWindowJSON(_ window: WindowRef, space: SpaceId?) -> JSONValue {
         let element = debugAXElement(for: window)
         let liveFrame = element.flatMap { adapter.frame(of: $0) }
+        let axMin: JSONValue = element.map { el in
+            let size = adapter.minSize(of: el)
+            return .object(["w": .double(size.w), "h": .double(size.h)])
+        } ?? .null
+        let observed: JSONValue = observedMinSizes[window.cgWindowId].map {
+            .object(["w": .double($0.w), "h": .double($0.h)])
+        } ?? .null
         return .object([
             "cgWindowId": .int(Int(window.cgWindowId)),
             "pid": .int(Int(window.pid)),
@@ -3092,6 +3112,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "lastOnscreenFrame": debugRectJSON(window.lastOnscreenFrame),
             "axElementResolves": .bool(element != nil),
             "liveAXFrame": liveFrame.map { debugRectJSON($0) } ?? .null,
+            "axMinSize": axMin,
+            "observedMinSize": observed,
         ])
     }
 
