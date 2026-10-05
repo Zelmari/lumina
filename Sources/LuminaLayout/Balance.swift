@@ -198,6 +198,7 @@ extension Session {
         else {
             return (session, nil)
         }
+        let wasFocused = space.focusedWindow == window.cgWindowId
         // Floating the fullscreen leaf exits lumina-fullscreen. Clear the flag
         // before unstashing so `markUnstashed` restores the parked siblings
         // instead of treating the space as still fullscreen.
@@ -211,6 +212,11 @@ extension Session {
         session = session.remove(space: spaceId, node: nodeId)
         guard var space2 = session.spaces[spaceId] else { return (session, window) }
         space2.floating.append(window)
+        // `remove` promotes another leaf into the focus slot; without this the
+        // next command (focus/close/resize) would target that window instead.
+        if wasFocused {
+            space2.focusedWindow = window.cgWindowId
+        }
         session.spaces[spaceId] = space2
         return (session, window)
     }

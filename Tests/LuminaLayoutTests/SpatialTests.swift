@@ -80,7 +80,9 @@ struct SpatialTests {
         #expect(after.floating.count == 1)
         #expect(after.floating[0].cgWindowId == 1)
         #expect(after.floating[0].role == .floating)
-        #expect(after.floating[0].lastOnscreenFrame == Rect(x: 0, y: 0, w: 100, h: 100))
+        // The displaced tile takes the floater's old spot; keeping its own
+        // tile frame stacked it on top of the window now occupying the tile.
+        #expect(after.floating[0].lastOnscreenFrame == Rect(x: 9, y: 9, w: 20, h: 20))
         #expect(after.nodes[after.root!]?.ratio == ratiosBefore)
     }
 

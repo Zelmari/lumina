@@ -1175,22 +1175,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if let target = spatialTarget(dir) {
                 let a = focusedId() ?? 0
                 let b = target.cgWindowId
-                let swappedFloaters = session.current.floating.filter {
-                    $0.role == .floating && ($0.cgWindowId == a || $0.cgWindowId == b)
-                }.map(\.cgWindowId)
                 session = session.swap(space: session.focusedSpace, a: a, b: b)
-                // A two-floater swap only exchanges `lastOnscreenFrame` in the
-                // model, and `applyFrames` syncs floaters back from the live
-                // frame, so push the swapped frames out before that sync can
-                // undo them.
-                if swappedFloaters.count == 2 {
-                    for id in swappedFloaters {
-                        guard var w = session.current.floating.first(where: { $0.cgWindowId == id }),
-                              let el = resolvedElement(for: w)
-                        else { continue }
-                        _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &w)
-                        writeWindow(w)
-                    }
+                // A swap that involves a floater only exchanges
+                // `lastOnscreenFrame` in the model. Push the floating side's
+                // frame out before `applyFrames` syncs floaters back from the
+                // live frame, or the move is undone (and a tile<->floater swap
+                // leaves the displaced window under the newly tiled one).
+                let floatersAfter = session.current.floating.filter {
+                    $0.role == .floating && ($0.cgWindowId == a || $0.cgWindowId == b)
+                }
+                for w in floatersAfter {
+                    guard let el = resolvedElement(for: w) else { continue }
+                    var pushed = w
+                    _ = adapter.setFrame(w.lastOnscreenFrame, of: el, tag: &pushed)
+                    writeWindow(pushed)
                 }
                 applyFrames()
             }

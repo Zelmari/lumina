@@ -114,10 +114,13 @@ extension Session {
 private func exchangeTileFloater(space: inout Space, tile: NodeId, floaterIndex: Int) {
     guard var node = space.nodes[tile], var oldLeaf = node.leaf else { return }
     var floater = space.floating.remove(at: floaterIndex)
-    let oldFrame = oldLeaf.lastOnscreenFrame
+    // The displaced tiled window takes the floater's old position; the caller
+    // pushes that frame to AX. Leaving its own tile frame here left both
+    // windows stacked exactly on top of each other.
+    let floaterFrame = floater.lastOnscreenFrame
     floater.role = .tiled
     oldLeaf.role = .floating
-    oldLeaf.lastOnscreenFrame = oldFrame
+    oldLeaf.lastOnscreenFrame = floaterFrame
     node.leaf = floater
     space.setNode(node)
     space.floating.append(oldLeaf)
