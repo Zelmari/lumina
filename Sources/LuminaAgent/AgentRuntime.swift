@@ -1260,15 +1260,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             applyFrames()
         case .fullscreenNative:
-            if let id = focusedId(), let el = elements[id] {
-                adapter.setFullscreen(el, true)
+            if let id = focusedId(), let window = windowAnywhere(id),
+               let el = resolvedElement(for: window)
+            {
+                // Toggle, like Hyprland's fullscreen: pressing again exits.
+                adapter.setFullscreen(el, !adapter.isFullscreen(el))
             }
         case .floatToggle:
             let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)
             session = session.floatToggle(space: session.focusedSpace, usableIsWide: usableIsWide(usable))
             applyFrames()
         case .close:
-            if let id = focusedId(), let el = elements[id] {
+            if let id = focusedId(), let window = windowAnywhere(id),
+               let el = resolvedElement(for: window)
+            {
                 adapter.pressClose(of: el)
             }
         }
@@ -1326,7 +1331,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             return .success(id: id)
         case .reload:
-            reloadConfig()
+            if let error = reloadConfig() {
+                return .failure(id: id, error: error)
+            }
             return .success(id: id)
         case .quit:
             stop()
@@ -2402,21 +2409,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func reloadConfig() {
+    /// Returns the parse error when the new config was rejected, so `lumina
+    /// reload` and the menu can report it instead of claiming success.
+    @discardableResult
+    func reloadConfig() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let text = (try? String(contentsOfFile: LuminaPaths.configPath(home: home), encoding: .utf8)) ?? ""
         let (next, error) = applyReload(current: config, newText: text)
         configError = error
-        if error == nil {
-            let oldCount = session.spaceCount
-            config = next
-            if next.spaceCount != oldCount {
-                session = session.applySpaceCount(next.spaceCount, usableIsWide: usableIsWide(bound?.usableRect(gaps: next.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)))
-            }
-            if isCurrent, !userPaused { registerHotkeys(next.bindings) }
-            startOrStopFFM()
-            applyFrames()
+        guard error == nil else { return error }
+        let oldCount = session.spaceCount
+        config = next
+        if next.spaceCount != oldCount {
+            session = session.applySpaceCount(next.spaceCount, usableIsWide: usableIsWide(bound?.usableRect(gaps: next.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)))
         }
+        if isCurrent, !userPaused { registerHotkeys(next.bindings) }
+        startOrStopFFM()
+        applyFrames()
+        return nil
     }
 
     func watchConfig() {
@@ -2554,6 +2564,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "secureInput": .bool(secureInput),
             "axTrusted": .bool(axTrusted),
             "configError": configError.map { .string($0) } ?? .null,
+            "configDiagnostics": .array(config.diagnostics.map { .string($0) }),
             "paused": .bool(userPaused),
             "displayGone": .bool(displayGone),
             "instanceId": .string(instanceId.uuidString),

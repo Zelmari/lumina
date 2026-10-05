@@ -5,17 +5,36 @@ import TOMLDecoder
 
 public struct Chord: Equatable, Hashable, Sendable {
     public var keyName: String
+    public var option: Bool
+    public var cmd: Bool
+    public var ctrl: Bool
     public var shift: Bool
     public var keyCode: UInt32
 
-    public init(keyName: String, shift: Bool, keyCode: UInt32) {
+    public init(
+        keyName: String,
+        shift: Bool = false,
+        option: Bool = true,
+        cmd: Bool = false,
+        ctrl: Bool = false,
+        keyCode: UInt32
+    ) {
         self.keyName = keyName
+        self.option = option
+        self.cmd = cmd
+        self.ctrl = ctrl
         self.shift = shift
         self.keyCode = keyCode
     }
 
     public var description: String {
-        shift ? "alt-shift-\(keyName)" : "alt-\(keyName)"
+        var parts: [String] = []
+        if option { parts.append("alt") }
+        if cmd { parts.append("cmd") }
+        if ctrl { parts.append("ctrl") }
+        if shift { parts.append("shift") }
+        parts.append(keyName)
+        return parts.joined(separator: "-")
     }
 }
 
@@ -165,18 +184,32 @@ public enum VirtualKey {
 
 public func parseChord(_ raw: String) -> Chord? {
     let parts = raw.split(separator: "-").map(String.init)
-    guard let first = parts.first, first == "alt" else { return nil }
+    guard !parts.isEmpty else { return nil }
+    var option = false
+    var cmd = false
+    var ctrl = false
     var shift = false
     var key: String?
-    for part in parts.dropFirst() {
-        if part == "shift" {
+    for part in parts {
+        switch part {
+        case "alt", "opt", "option":
+            option = true
+        case "cmd", "command", "super":
+            cmd = true
+        case "ctrl", "control":
+            ctrl = true
+        case "shift":
             shift = true
-        } else {
+        default:
+            // A second key name is a typo, not a chord.
+            guard key == nil else { return nil }
             key = part
         }
     }
+    // A bare key or shift-only chord would swallow normal typing.
+    guard option || cmd || ctrl else { return nil }
     guard let key, let code = VirtualKey.table[key] else { return nil }
-    return Chord(keyName: key, shift: shift, keyCode: code)
+    return Chord(keyName: key, shift: shift, option: option, cmd: cmd, ctrl: ctrl, keyCode: code)
 }
 
 private struct RawConfig: Decodable {
@@ -250,61 +283,97 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
         diagnostics.append("unknown key: \(key)")
     }
 
-    guard let spaceCount = raw.spaceCount, (1...10).contains(spaceCount) else {
-        return .failure(ConfigError("space-count must be an integer 1...10"))
+    // Missing keys fall back to `defaults` (or the built-in defaults) so a
+    // partial config merges instead of being rejected wholesale.
+    let base = defaults ?? Config()
+
+    let spaceCount: Int
+    if let rawCount = raw.spaceCount {
+        guard (1...10).contains(rawCount) else {
+            return .failure(ConfigError("space-count must be an integer 1...10"))
+        }
+        spaceCount = rawCount
+    } else {
+        spaceCount = base.spaceCount
     }
-    guard let inner = raw.gaps?.inner, (0...128).contains(inner) else {
-        return .failure(ConfigError("gaps.inner must be an integer 0...128"))
+    let inner: Int
+    if let rawInner = raw.gaps?.inner {
+        guard (0...128).contains(rawInner) else {
+            return .failure(ConfigError("gaps.inner must be an integer 0...128"))
+        }
+        inner = rawInner
+    } else {
+        inner = base.gaps.inner
     }
-    guard let outer = raw.gaps?.outer, (0...128).contains(outer) else {
-        return .failure(ConfigError("gaps.outer must be an integer 0...128"))
+    let outer: Int
+    if let rawOuter = raw.gaps?.outer {
+        guard (0...128).contains(rawOuter) else {
+            return .failure(ConfigError("gaps.outer must be an integer 0...128"))
+        }
+        outer = rawOuter
+    } else {
+        outer = base.gaps.outer
     }
-    guard let ffm = raw.focusFollowsMouse else {
-        return .failure(ConfigError("focus-follows-mouse must be a bool"))
-    }
-    guard let launchRaw = raw.launchTiling, let launch = LaunchTiling(rawValue: launchRaw) else {
-        return .failure(ConfigError("launch-tiling must be z-order | float-existing | new-only"))
+    let ffm = raw.focusFollowsMouse ?? base.focusFollowsMouse
+    let launch: LaunchTiling
+    if let launchRaw = raw.launchTiling {
+        guard let parsed = LaunchTiling(rawValue: launchRaw) else {
+            return .failure(ConfigError("launch-tiling must be z-order | float-existing | new-only"))
+        }
+        launch = parsed
+    } else {
+        launch = base.launchTiling
     }
 
     var bindings: [Binding] = []
-    var seen: [Chord: Int] = [:]
-    for (chordRaw, commandRaw) in (raw.bindings ?? [:]).sorted(by: { $0.key < $1.key }) {
-        guard let chord = parseChord(chordRaw) else {
-            return .failure(ConfigError("unknown chord: \(chordRaw)"))
+    if let rawBindings = raw.bindings {
+        var seen: [Chord: Int] = [:]
+        for (chordRaw, commandRaw) in rawBindings.sorted(by: { $0.key < $1.key }) {
+            guard let chord = parseChord(chordRaw) else {
+                diagnostics.append("unknown chord \(chordRaw); skipped")
+                continue
+            }
+            guard let command = BoundCommand.parse(commandRaw) else {
+                diagnostics.append("unknown command \(commandRaw) for \(chordRaw); skipped")
+                continue
+            }
+            if let existing = seen[chord] {
+                diagnostics.append("duplicate chord \(chord.description); last wins")
+                bindings.remove(at: existing)
+                // indexes after existing shift; rebuild map
+                seen = [:]
+                for (i, b) in bindings.enumerated() { seen[b.chord] = i }
+            }
+            seen[chord] = bindings.count
+            bindings.append(Binding(chord: chord, command: command))
         }
-        guard let command = BoundCommand.parse(commandRaw) else {
-            return .failure(ConfigError("unknown command string: \(commandRaw)"))
-        }
-        if let existing = seen[chord] {
-            diagnostics.append("duplicate chord \(chord.description); last wins")
-            bindings.remove(at: existing)
-            // indexes after existing shift; rebuild map
-            seen = [:]
-            for (i, b) in bindings.enumerated() { seen[b.chord] = i }
-        }
-        seen[chord] = bindings.count
-        bindings.append(Binding(chord: chord, command: command))
+    } else {
+        bindings = base.bindings
     }
 
     var rules: [WindowRule] = []
-    for rule in raw.windowRule ?? [] {
-        guard let appId = rule.appId, !appId.isEmpty else {
-            diagnostics.append("window-rule missing app-id; skipped")
-            continue
-        }
-        guard let actionRaw = rule.action, let action = WindowRuleAction(rawValue: actionRaw) else {
-            diagnostics.append("window-rule bad action; skipped")
-            continue
-        }
-        if let pattern = rule.titleRegex {
-            do {
-                _ = try NSRegularExpression(pattern: pattern)
-            } catch {
-                diagnostics.append("bad title-regex \(pattern); skipped rule")
+    if let rawRules = raw.windowRule {
+        for rule in rawRules {
+            guard let appId = rule.appId, !appId.isEmpty else {
+                diagnostics.append("window-rule missing app-id; skipped")
                 continue
             }
+            guard let actionRaw = rule.action, let action = WindowRuleAction(rawValue: actionRaw) else {
+                diagnostics.append("window-rule bad action; skipped")
+                continue
+            }
+            if let pattern = rule.titleRegex {
+                do {
+                    _ = try NSRegularExpression(pattern: pattern)
+                } catch {
+                    diagnostics.append("bad title-regex \(pattern); skipped rule")
+                    continue
+                }
+            }
+            rules.append(WindowRule(appId: appId, titleRegex: rule.titleRegex, action: action))
         }
-        rules.append(WindowRule(appId: appId, titleRegex: rule.titleRegex, action: action))
+    } else {
+        rules = base.windowRules
     }
 
     return .success(
@@ -312,7 +381,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
             spaceCount: spaceCount,
             focusFollowsMouse: ffm,
             launchTiling: launch,
-            launchApps: raw.launchApps ?? [],
+            launchApps: raw.launchApps ?? base.launchApps,
             gaps: Gaps(inner: inner, outer: outer),
             bindings: bindings,
             windowRules: rules,
@@ -325,17 +394,18 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
 /// Invalid user TOML keeps the bundled default and reports the parse error.
 /// An empty path is “no file yet”, which is not an error.
 public func loadOrDefault(text: String?, bundledDefault: String = Config.bundledDefaultTOML) -> (config: Config, error: String?) {
-    guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        switch parseConfig(text: bundledDefault) {
-        case .success(let c): return (c, nil)
-        case .failure(let e): return (Config.bundledDefault, e.message)
-        }
+    let fallback: Config
+    switch parseConfig(text: bundledDefault) {
+    case .success(let c): fallback = c
+    case .failure: fallback = Config()
     }
-    switch parseConfig(text: text) {
+    guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return (fallback, nil)
+    }
+    // User keys override the bundled defaults; anything omitted stays default.
+    switch parseConfig(text: text, defaults: fallback) {
     case .success(let c): return (c, nil)
-    case .failure(let e):
-        let fallback = loadOrDefault(text: nil, bundledDefault: bundledDefault).config
-        return (fallback, e.message)
+    case .failure(let e): return (fallback, e.message)
     }
 }
 
@@ -429,12 +499,15 @@ func collapseDuplicateBindingKeys(_ text: String) -> (String, [String]) {
     var lastIndex: [String: Int] = [:]
     for (i, line) in lines.enumerated() {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("[[") {
+        // Strip a trailing comment so `[bindings] # mainMod` still counts.
+        let header = trimmed.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map { $0.trimmingCharacters(in: .whitespaces) } ?? trimmed
+        if header.hasPrefix("[[") {
             inBindings = false
             continue
         }
-        if trimmed.hasPrefix("[") {
-            inBindings = trimmed == "[bindings]"
+        if header.hasPrefix("[") {
+            inBindings = header == "[bindings]"
             continue
         }
         guard inBindings, !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
@@ -473,7 +546,7 @@ func unknownTopLevelKeys(in text: String) -> [String] {
 
 extension Config {
     public static let bundledDefaultTOML: String = """
-    space-count = 5
+    space-count = 10
     focus-follows-mouse = false
     # z-order, float-existing, or new-only
     launch-tiling = "z-order"

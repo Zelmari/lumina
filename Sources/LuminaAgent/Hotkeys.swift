@@ -13,6 +13,9 @@ public final class Hotkeys {
 
     public func register(bindings: [Binding]) {
         unregister()
+        // Only errors from this attempt should surface: a transient conflict
+        // used to keep the warning lit forever.
+        hotkeyError = nil
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let status = InstallEventHandler(
             GetApplicationEventTarget(),
@@ -31,7 +34,10 @@ public final class Hotkeys {
             return
         }
         for (index, binding) in bindings.enumerated() {
-            var modifiers: UInt32 = UInt32(optionKey)
+            var modifiers: UInt32 = 0
+            if binding.chord.option { modifiers |= UInt32(optionKey) }
+            if binding.chord.cmd { modifiers |= UInt32(cmdKey) }
+            if binding.chord.ctrl { modifiers |= UInt32(controlKey) }
             if binding.chord.shift { modifiers |= UInt32(shiftKey) }
             var ref: EventHotKeyRef?
             let id = EventHotKeyID(signature: OSType(0x4C554D41), id: UInt32(index + 1)) // 'LUMA'

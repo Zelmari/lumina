@@ -1,4 +1,4 @@
-space-count = 5
+space-count = 10
 focus-follows-mouse = false
 # z-order, float-existing, or new-only
 launch-tiling = "z-order"

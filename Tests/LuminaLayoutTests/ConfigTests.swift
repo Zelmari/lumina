@@ -6,7 +6,7 @@ struct ConfigTests {
     @Test func defaultBundledTOMLParses() throws {
         let result = parseConfig(text: Config.bundledDefaultTOML)
         let config = try result.get()
-        #expect(config.spaceCount == 5)
+        #expect(config.spaceCount == 10)
         #expect(config.focusFollowsMouse == false)
         #expect(config.launchTiling == .zOrder)
         #expect(config.gaps.inner == 8)
@@ -79,7 +79,7 @@ struct ConfigTests {
         #expect(config.diagnostics.contains(where: { $0.contains("title-regex") }))
     }
 
-    @Test func unknownCommandStringRejectsFile() {
+    @Test func unknownCommandStringIsSkippedWithDiagnostic() throws {
         let text = """
         space-count = 5
         focus-follows-mouse = false
@@ -90,8 +90,46 @@ struct ConfigTests {
         outer = 8
         [bindings]
         alt-h = "explode everything"
+        alt-j = "focus down"
         """
-        #expect(parseConfig(text: text).isFail)
+        let config = try parseConfig(text: text).get()
+        #expect(config.bindings.count == 1)
+        #expect(config.bindings[0].chord.keyName == "j")
+        #expect(config.diagnostics.contains(where: { $0.contains("explode everything") }))
+    }
+
+    @Test func partialConfigMergesBundledDefaults() throws {
+        let text = """
+        space-count = 3
+        [bindings]
+        alt-h = "focus right"
+        """
+        let (config, error) = loadOrDefault(text: text)
+        #expect(error == nil)
+        #expect(config.spaceCount == 3)
+        #expect(config.gaps.inner == 8)
+        #expect(config.launchTiling == .zOrder)
+        #expect(config.bindings.count == 1)
+        #expect(config.windowRules.contains(where: { $0.appId == "com.apple.Preferences" }))
+    }
+
+    @Test func omittedBindingsKeepBundledDefaults() throws {
+        let (config, error) = loadOrDefault(text: "[gaps]\nouter = 20\n")
+        #expect(error == nil)
+        #expect(config.gaps.outer == 20)
+        #expect(config.bindings.contains(where: { $0.chord.keyName == "h" }))
+    }
+
+    @Test func bindingTableHeaderWithCommentStillCollapsesDuplicates() throws {
+        let text = """
+        [bindings] # main modifier is alt
+        alt-h = "focus left"
+        alt-h = "focus right"
+        """
+        let config = try parseConfig(text: text).get()
+        let h = config.bindings.filter { $0.chord.keyName == "h" }
+        #expect(h.count == 1)
+        #expect(h[0].command == .focus(.right))
     }
 
     @Test func unknownTopLevelKeyIgnored() throws {
@@ -130,26 +168,25 @@ struct ConfigTests {
         #expect(h[0].command == .focus(.right))
     }
 
-    @Test func duplicateNormalizedChordLastWinsDeterministically() throws {
-        // `alt-cmd-h` drops the unsupported `cmd` modifier, so both raw keys
-        // normalize to the same chord. The lexicographically later key wins.
+    @Test func cmdModifierIsDistinctFromAlt() throws {
         let text = """
-        space-count = 5
-        focus-follows-mouse = false
-        launch-tiling = "z-order"
-        launch-apps = []
-        [gaps]
-        inner = 8
-        outer = 8
         [bindings]
         alt-cmd-h = "focus left"
         alt-h = "focus right"
         """
         let config = try parseConfig(text: text).get()
-        let h = config.bindings.filter { $0.chord.keyName == "h" && !$0.chord.shift }
-        #expect(h.count == 1)
-        #expect(h[0].command == .focus(.right))
-        #expect(config.diagnostics.contains(where: { $0.contains("duplicate chord") }))
+        #expect(config.bindings.count == 2)
+        #expect(config.bindings.contains(where: { $0.chord.cmd && $0.command == .focus(.left) }))
+        #expect(config.bindings.contains(where: { !$0.chord.cmd && $0.command == .focus(.right) }))
+    }
+
+    @Test func parseChordRejectsUnmodifiedKey() {
+        #expect(parseChord("h") == nil)
+        #expect(parseChord("shift-h") == nil)
+        #expect(parseChord("cmd-h")?.cmd == true)
+        #expect(parseChord("super-h")?.cmd == true)
+        #expect(parseChord("ctrl-alt-h")?.ctrl == true)
+        #expect(parseChord("alt-h-extra") == nil)
     }
 
     @Test func applySpaceCountPoursOntoSpace1() {
@@ -203,17 +240,17 @@ struct ConfigTests {
     @Test func invalidTomlKeepsDefaultAndReportsError() {
         let (config, error) = loadOrDefault(text: "space-count = 0\n")
         #expect(error != nil)
-        #expect(config.spaceCount == 5)
+        #expect(config.spaceCount == 10)
         let (missing, missingError) = loadOrDefault(text: nil)
         #expect(missingError == nil)
-        #expect(missing.spaceCount == 5)
+        #expect(missing.spaceCount == 10)
     }
 
     @Test func applyReloadKeepsLastGood() {
         let current = try! parseConfig(text: Config.bundledDefaultTOML).get()
         let (config, error) = applyReload(current: current, newText: "space-count = 0\n")
         #expect(error != nil)
-        #expect(config.spaceCount == 5)
+        #expect(config.spaceCount == 10)
     }
 
     @Test func applyReloadBlankTextKeepsCurrent() throws {
