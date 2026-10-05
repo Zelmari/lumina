@@ -1760,7 +1760,22 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var budgetBroke = false
         var visited: Set<NodeId> = []
         var overflowed = false
-        for (nodeId, rect) in rects {
+        // Land windows whose model target differs from the last applied frame
+        // first: a brand-new window is usually among them, and it must not wait
+        // behind verification reads of every settled tile. Ties break by node
+        // id so the pass is deterministic.
+        let settled: Set<NodeId> = Set(rects.compactMap { nodeId, rect -> NodeId? in
+            guard let window = space.nodes[nodeId]?.leaf, framesClose(window.lastOnscreenFrame, rect, slop: 2) else {
+                return nil
+            }
+            return nodeId
+        })
+        let orderedRects = rects.sorted { a, b in
+            let aSettled = settled.contains(a.key)
+            let bSettled = settled.contains(b.key)
+            return aSettled == bSettled ? a.key < b.key : !aSettled
+        }
+        for (nodeId, rect) in orderedRects {
             if MutationQueue.shared.shouldSkip(started: started) {
                 budgetBroke = true
                 log.info("layout pass exceeded 200ms; rescheduling remaining windows")
@@ -1772,7 +1787,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // the dedicated block below, so the loop writes nothing.
             if fs != nil { continue }
             guard var node = space.nodes[nodeId], var window = node.leaf,
-                  let el = resolvedElement(for: window)
+                  let el = cachedElement(for: window) ?? resolvedElement(for: window)
             else {
                 if let node = space.nodes[nodeId], let window = node.leaf {
                     // An unresolvable window cannot be confirmed as refusing
@@ -1791,18 +1806,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 // makes apps repaint and flicker for no reason.
                 window.lastOnscreenFrame = rect
                 node.leaf = window
-                var s = session.spaces[session.focusedSpace]!
-                s.setNode(node)
-                session.spaces[session.focusedSpace] = s
+                session.spaces[session.focusedSpace]?.nodes[nodeId] = node
                 overflowObservations[window.cgWindowId] = nil
                 continue
             }
             window.lastOnscreenFrame = rect
             let result = adapter.setFrame(rect, of: el, tag: &window)
             node.leaf = window
-            var s = session.spaces[session.focusedSpace]!
-            s.setNode(node)
-            session.spaces[session.focusedSpace] = s
+            session.spaces[session.focusedSpace]?.nodes[nodeId] = node
+            if case .rejected(let err) = result, err == .invalidUIElement {
+                // The retained element died mid-pass; drop it so the next
+                // resolution re-enumerates instead of trusting the cache.
+                elements[window.cgWindowId] = nil
+                adapter.forgetWindowId(window.cgWindowId)
+            }
             if result != .ok {
                 // Best effort. The next refresh session re-issues the layout;
                 // no model state changes because of a write result.
@@ -1874,7 +1891,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
 
         if let fs, let node = space.nodes[fs], let fsWindow = node.leaf {
-            if var window = node.leaf, let el = resolvedElement(for: window) {
+            if var window = node.leaf, let el = cachedElement(for: window) ?? resolvedElement(for: window) {
                 if let live = adapter.frame(of: el), !framesClose(live, usable, slop: 2) {
                     _ = adapter.setFrame(usable, of: el, tag: &window)
                     if let retryLive = adapter.frame(of: el),
@@ -1894,7 +1911,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         if var s = session.spaces[session.focusedSpace] {
             for i in s.floating.indices where s.floating[i].role == .floating {
-                guard let el = resolvedElement(for: s.floating[i]),
+                guard let el = cachedElement(for: s.floating[i]) ?? resolvedElement(for: s.floating[i]),
                       let live = adapter.frame(of: el),
                       !framesClose(live, s.floating[i].lastOnscreenFrame, slop: 2),
                       !isStashedAway(live),
@@ -1949,15 +1966,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         for (nodeId, rect) in rects {
             if let fs, fs != nodeId { continue }
             guard var node = space.nodes[nodeId], var window = node.leaf,
-                  let el = resolvedElement(for: window)
+                  let el = cachedElement(for: window) ?? resolvedElement(for: window)
             else { continue }
             if let live = adapter.frame(of: el), framesClose(live, rect, slop: 2) { continue }
             window.lastOnscreenFrame = rect
             let result = adapter.setFrame(rect, of: el, tag: &window)
             node.leaf = window
-            var s = session.spaces[session.focusedSpace]
-            s?.setNode(node)
-            if let s { session.spaces[session.focusedSpace] = s }
+            session.spaces[session.focusedSpace]?.nodes[nodeId] = node
+            if case .rejected(let err) = result, err == .invalidUIElement {
+                elements[window.cgWindowId] = nil
+                adapter.forgetWindowId(window.cgWindowId)
+            }
             if result != .ok {
                 if case .rejected(let err) = result {
                     log.info("continuation setFrame rejected(\(err.rawValue)) window=\(window.cgWindowId)")
@@ -2369,6 +2388,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             log.info("rescue offscreen window=\(id) pid=\(pid) \(Int(rect.w))x\(Int(rect.h))")
             if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
         }
+    }
+
+    /// Fast path for layout passes: trust the retained element for identity
+    /// and let a failed write fall back to the resolving path. Avoids a role
+    /// IPC read per window per pass; a dead element is caught by the write
+    /// result and evicted there.
+    func cachedElement(for window: WindowRef) -> AXUIElement? {
+        if let el = elements[window.cgWindowId], adapter.pid(of: el) == window.pid {
+            return el
+        }
+        return nil
     }
 
     func resolvedElement(for window: WindowRef) -> AXUIElement? {
