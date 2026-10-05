@@ -815,10 +815,10 @@ if [[ "${TABS_TEST:-1}" != "0" ]]; then
     fi
     # The cold launch should have been caught by the willLaunch watch (or, if
     # app-driven, the created note). Either is fine; report which.
-    if grep -q "launch watch start pid=$ghost_pid reason=willLaunch" "$LUMINA_LOG" 2>/dev/null; then
+    if grep -Eq "launch watch (start pid=$ghost_pid reason=willLaunch|sighting pid=$ghost_pid)" "$LUMINA_LOG" 2>/dev/null; then
       pass "cold launch watched from willLaunch"
     else
-      printf '   note: no willLaunch watch line for pid %s (created note handled it)\n' "$ghost_pid"
+      printf '   note: no launch-watch line for pid %s (created note handled it)\n' "$ghost_pid"
     fi
     for tab in 1 2 3; do
       ghostty_new_tab
