@@ -84,12 +84,17 @@ extension Session {
             return session.floatLeaf(space: spaceId, nodeId: leaf.id).0
         }
         if let idx = space.floating.firstIndex(where: { $0.cgWindowId == focused }) {
-            var session = self
-            var s = space
-            var w = s.floating.remove(at: idx)
-            session.spaces[spaceId] = s
+            var w = space.floating[idx]
             w.role = .tiled
-            session = session.insertSpiral(space: spaceId, newLeaf: w, usableIsWide: usableIsWide)
+            // Insert before removing the floater so a no-op insert on a
+            // corrupt tree cannot lose the window.
+            var session = insertSpiral(space: spaceId, newLeaf: w, usableIsWide: usableIsWide)
+            guard session.spaces[spaceId]?.leaf(containing: w.cgWindowId) != nil else {
+                return self
+            }
+            var s = session.spaces[spaceId]!
+            s.floating.removeAll { $0.cgWindowId == w.cgWindowId }
+            session.spaces[spaceId] = s
             if session.spaces[spaceId]?.luminaFullscreen != nil {
                 session = session.markStashed(space: spaceId, ids: [w.cgWindowId])
             }

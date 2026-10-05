@@ -686,10 +686,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if !failedManaged.isEmpty || unmanagedFailed {
             refreshUnresolved = true
         }
+        // Only a just-created window may be rebound: that is the Electron
+        // splash-replacement shape. A close plus an unrelated open must not
+        // inherit the old window's slot on another workspace.
+        let rebindable = Set((session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId))).filter { isYoung($0) })
         let delta = reconcile(
             model: session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId)),
             modelPids: modelPids,
-            live: live
+            live: live,
+            rebindableIds: rebindable
         )
         var removals: (real: [UInt32], deferred: [UInt32]) = (real: [], deferred: [])
         defer {

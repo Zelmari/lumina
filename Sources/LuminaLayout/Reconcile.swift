@@ -64,10 +64,16 @@ public struct ReconcileDelta: Equatable, Sendable {
 /// Diff the model's ids against a live enumeration. A pid that lost exactly
 /// one id and gained exactly one id in the same pass is a rebind; anything
 /// else is a plain add or remove.
+///
+/// `rebindableIds` limits which removed ids may be paired. Electron-style
+/// replacement happens while the placeholder is still young; without the cap,
+/// a close followed by an unrelated open in one pass would hand the new
+/// window the old window's slot on another workspace. Nil disables the cap.
 public func reconcile(
     model: Set<UInt32>,
     modelPids: [UInt32: Int32],
-    live: [LiveWindow]
+    live: [LiveWindow],
+    rebindableIds: Set<UInt32>? = nil
 ) -> ReconcileDelta {
     var liveById: [UInt32: LiveWindow] = [:]
     for w in live { liveById[w.cgWindowId] = w }
@@ -97,6 +103,7 @@ public func reconcile(
     var rebinds: [RebindPair] = []
     for (pid, removed) in removedByPid {
         guard removed.count == 1, let added = addedByPid[pid], added.count == 1 else { continue }
+        if let rebindableIds, !rebindableIds.contains(removed[0]) { continue }
         rebinds.append(RebindPair(from: removed[0], to: added[0]))
     }
 

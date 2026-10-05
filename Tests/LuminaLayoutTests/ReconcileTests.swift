@@ -47,6 +47,30 @@ struct ReconcileTests {
         #expect(delta.removed.isEmpty)
     }
 
+    @Test func matureRemovedIdIsNotReboundToAnUnrelatedOpen() {
+        // The removed window lived for a while; a close plus an unrelated open
+        // must be a remove + add, not a slot inheritance.
+        let delta = reconcile(
+            model: [7],
+            modelPids: [7: 10],
+            live: [live(8, pid: 10)],
+            rebindableIds: []
+        )
+        #expect(delta.rebinds.isEmpty)
+        #expect(delta.removed == [7])
+        #expect(delta.added == [8])
+    }
+
+    @Test func youngRemovedIdStillRebinds() {
+        let delta = reconcile(
+            model: [7],
+            modelPids: [7: 10],
+            live: [live(8, pid: 10)],
+            rebindableIds: [7]
+        )
+        #expect(delta.rebinds == [RebindPair(from: 7, to: 8)])
+    }
+
     @Test func twoRemovedOneAddedIsNotARebind() {
         let delta = reconcile(
             model: [7, 9],

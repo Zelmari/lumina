@@ -222,14 +222,18 @@ extension Session {
     /// placeholder (Electron splash) was classified floating and its real
     /// window replaced the id.
     public func tileFloater(space spaceId: SpaceId, cgWindowId: UInt32, usableIsWide: Bool) -> Session {
-        var session = self
-        guard var space = session.spaces[spaceId],
+        guard let space = spaces[spaceId],
               let idx = space.floating.firstIndex(where: { $0.cgWindowId == cgWindowId })
-        else { return session }
-        var window = space.floating.remove(at: idx)
+        else { return self }
+        var window = space.floating[idx]
         window.role = .tiled
-        session.spaces[spaceId] = space
-        session = session.insertSpiral(space: spaceId, newLeaf: window, usableIsWide: usableIsWide)
+        // Insert before removing the floater: on a corrupt tree `insertSpiral`
+        // no-ops, and removing first would drop the window from the model.
+        var session = insertSpiral(space: spaceId, newLeaf: window, usableIsWide: usableIsWide)
+        guard session.spaces[spaceId]?.leaf(containing: cgWindowId) != nil else { return self }
+        var s = session.spaces[spaceId]!
+        s.floating.removeAll { $0.cgWindowId == cgWindowId }
+        session.spaces[spaceId] = s
         if session.spaces[spaceId]?.luminaFullscreen != nil {
             session = session.markStashed(space: spaceId, ids: [window.cgWindowId])
         }

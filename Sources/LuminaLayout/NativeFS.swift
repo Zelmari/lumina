@@ -61,15 +61,14 @@ extension Session {
         let bookmark = w.nativeFSBookmark
         w.nativeFSBookmark = nil
         w.role = .tiled
-        var session = self
-        session.nativeFSWindows.removeAll { $0.cgWindowId == window.cgWindowId }
-        guard let bookmark, session.spaces[bookmark.spaceId] != nil else {
-            return session.insertSpiral(space: session.focusedSpace, newLeaf: w, usableIsWide: usableIsWide)
-        }
-        if let siblingId = bookmark.siblingId,
-           session.spaces[bookmark.spaceId]?.nodes[siblingId] != nil
+        // Insert first: `insertSpiral` no-ops on a corrupt tree, and dropping
+        // the bookmark before a failed insert would lose the window.
+        let inserted: Session
+        if let bookmark, spaces[bookmark.spaceId] != nil,
+           let siblingId = bookmark.siblingId,
+           spaces[bookmark.spaceId]?.nodes[siblingId] != nil
         {
-            return session.wrapSibling(
+            inserted = wrapSibling(
                 spaceId: bookmark.spaceId,
                 siblingId: siblingId,
                 window: w,
@@ -77,8 +76,16 @@ extension Session {
                 axis: bookmark.axis,
                 ratio: bookmark.ratioSnapshot
             )
+        } else {
+            let target = bookmark.flatMap { spaces[$0.spaceId] != nil ? $0.spaceId : nil } ?? focusedSpace
+            inserted = insertSpiral(space: target, newLeaf: w, usableIsWide: usableIsWide)
         }
-        return session.insertSpiral(space: bookmark.spaceId, newLeaf: w, usableIsWide: usableIsWide)
+        guard inserted.spaceContaining(cgWindowId: w.cgWindowId) != nil else {
+            return self
+        }
+        var session = inserted
+        session.nativeFSWindows.removeAll { $0.cgWindowId == window.cgWindowId }
+        return session
     }
 
     /// Put `window` back beside `siblingId`, which `remove` promoted into the old parent's slot.
