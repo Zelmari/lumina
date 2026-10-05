@@ -72,6 +72,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Event-to-frame latency of completed refresh sessions. Exposed in
     /// `debug-windows` and `status` so the harness can assert on it.
     var refreshLatency = LatencyStats(capacity: 256)
+    /// The same measure split by the path that caused the refresh: a created
+    /// note (already-running app) vs an app launch.
+    var createdLatency = LatencyStats(capacity: 128)
+    var launchedLatency = LatencyStats(capacity: 128)
     /// Pids launched recently. An app launched hidden (or via AppleScript)
     /// has no on-screen window, so it would otherwise never be enumerated;
     /// it is unhidden and re-checked. Entries expire so every background app
@@ -1124,7 +1128,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let modelChanged = !delta.isEmpty || !deadElementIds.isEmpty
         applyFrames(cgLive: cgLiveIds)
         if let receivedAt {
-            refreshLatency.record(milliseconds: Date().timeIntervalSince(receivedAt) * 1000)
+            let ms = Date().timeIntervalSince(receivedAt) * 1000
+            refreshLatency.record(milliseconds: ms)
+            if reason == kAXWindowCreatedNotification {
+                createdLatency.record(milliseconds: ms)
+            } else if reason == "appLaunched" || reason == "appActivated" {
+                launchedLatency.record(milliseconds: ms)
+            }
         }
         if modelChanged {
             restashOffspace()
@@ -3559,16 +3569,23 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     var lastRefreshSummary: RefreshSummary?
 
     func latencyJSON() -> JSONValue {
-        func number(_ value: Double?) -> JSONValue {
-            value.map { .double($0) } ?? .null
+        func stats(_ stats: LatencyStats) -> JSONValue {
+            func number(_ value: Double?) -> JSONValue {
+                value.map { .double($0) } ?? .null
+            }
+            return .object([
+                "samples": .int(stats.count),
+                "total": .int(stats.totalRecorded),
+                "lastMs": number(stats.last),
+                "p50Ms": number(stats.p50),
+                "p95Ms": number(stats.p95),
+                "maxMs": number(stats.max),
+            ])
         }
         return .object([
-            "samples": .int(refreshLatency.count),
-            "total": .int(refreshLatency.totalRecorded),
-            "lastMs": number(refreshLatency.last),
-            "p50Ms": number(refreshLatency.p50),
-            "p95Ms": number(refreshLatency.p95),
-            "maxMs": number(refreshLatency.max),
+            "all": stats(refreshLatency),
+            "created": stats(createdLatency),
+            "launched": stats(launchedLatency),
         ])
     }
 
