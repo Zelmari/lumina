@@ -198,9 +198,13 @@ extension Session {
         else {
             return (session, nil)
         }
-        // `remove` clears `luminaFullscreen`; return stashed siblings to the
-        // tree first so they do not stay parked (same class as FINDINGS 4.3).
+        // Floating the fullscreen leaf exits lumina-fullscreen. Clear the flag
+        // before unstashing so `markUnstashed` restores the parked siblings
+        // instead of treating the space as still fullscreen.
         if space.luminaFullscreen == nodeId {
+            var prepared = session.spaces[spaceId]!
+            prepared.luminaFullscreen = nil
+            session.spaces[spaceId] = prepared
             session = session.markUnstashed(space: spaceId)
         }
         window.role = .floating

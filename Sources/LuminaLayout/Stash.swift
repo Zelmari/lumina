@@ -215,9 +215,21 @@ extension Session {
     public func markUnstashed(space spaceId: SpaceId) -> Session {
         var session = self
         guard var space = session.spaces[spaceId] else { return session }
+        // While lumina-fullscreen is active only its own leaf comes back.
+        // Promoting parked siblings here made a return trip flash every
+        // hidden window on screen before they were parked again.
+        if let fs = space.luminaFullscreen {
+            if var node = space.nodes[fs], var leaf = node.leaf, leaf.role == .stashed {
+                leaf.role = .luminaFS
+                node.leaf = leaf
+                space.nodes[fs] = node
+            }
+            session.spaces[spaceId] = space
+            return session
+        }
         for (id, var node) in space.nodes {
             if var leaf = node.leaf, leaf.role == .stashed {
-                leaf.role = space.luminaFullscreen == id ? .luminaFS : .tiled
+                leaf.role = .tiled
                 node.leaf = leaf
                 space.nodes[id] = node
             }

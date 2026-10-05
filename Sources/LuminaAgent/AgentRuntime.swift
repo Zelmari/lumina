@@ -1225,8 +1225,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             session = session.balance(space: session.focusedSpace)
             applyFrames()
         case .fullscreenLumina:
+            let wasFS = session.current.luminaFullscreen != nil
             session = session.toggleLuminaFS(space: session.focusedSpace)
-            if session.current.luminaFullscreen != nil { stashSiblings() }
+            if session.current.luminaFullscreen != nil {
+                stashSiblings()
+            } else if wasFS {
+                // Exiting fullscreen: parked floaters need their frames back;
+                // tiled siblings are re-laid-out by applyFrames.
+                unstashSpace(session.focusedSpace)
+            }
             applyFrames()
         case .fullscreenNative:
             if let id = focusedId(), let el = elements[id] {
@@ -1643,6 +1650,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func unstashSpace(_ id: SpaceId, restoreOriginals: Bool = false) {
         guard let space = session.spaces[id] else { return }
+        // A space with active lumina-fullscreen keeps its siblings and
+        // floaters parked; applyFrames owns the FS leaf.
+        guard space.luminaFullscreen == nil else { return }
         for node in space.tiledLeaves() {
             if let w = node.leaf {
                 if restoreOriginals { restoreOriginal(w) } else { restoreWindow(w) }
@@ -2122,18 +2132,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard let bound else { return nil }
         let fs = session.current.luminaFullscreen
         for row in onScreenCGWindows(intersecting: bound.axFrame) {
-            guard let id = cgWindowID(row), owned(id) else { continue }
-            // Parked tiled siblings are not focus candidates while the
-            // lumina-fullscreen window owns the display.
+            guard let id = cgWindowID(row), owned(id), let window = lookup(id) else { continue }
+            // Parked windows (including hidden-space floaters whose 1px
+            // sliver intersects the display) are never focus candidates.
+            if window.role == .stashed { continue }
             if let fs, let leaf = session.current.leaf(containing: id), leaf.id != fs { continue }
             return id
         }
         if let fs {
             return session.current.nodes[fs]?.leaf?.cgWindowId
-                ?? session.current.floating.first?.cgWindowId
+                ?? session.current.floating.first(where: { $0.role != .stashed })?.cgWindowId
         }
-        return session.current.tiledLeaves().first?.leaf?.cgWindowId
-            ?? session.current.floating.first?.cgWindowId
+        return session.current.tiledLeaves().first(where: { $0.leaf?.role != .stashed })?.leaf?.cgWindowId
+            ?? session.current.floating.first(where: { $0.role != .stashed })?.cgWindowId
     }
 
     func owned(_ id: UInt32) -> Bool {

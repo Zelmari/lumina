@@ -125,22 +125,25 @@ extension Space {
     /// The agent moves the windows on screen with AX but macOS does not focus
     /// them, so the agent raises and focuses the candidate explicitly.
     public func focusRestorationCandidate() -> UInt32? {
-        if let focused = focusedWindow, contains(cgWindowId: focused) {
+        // Never restore focus to a parked window: nativeFocus would refuse it
+        // and the space would come back without keyboard focus.
+        if let focused = focusedWindow, let focusedRole = role(of: focused), focusedRole != .stashed {
             return focused
         }
         if let fs = luminaFullscreen, let w = nodes[fs]?.leaf?.cgWindowId {
             return w
         }
-        if let last = lastTiledLeaf, let w = nodes[last]?.leaf?.cgWindowId {
+        if let last = lastTiledLeaf, let leaf = nodes[last]?.leaf, leaf.role != .stashed {
+            return leaf.cgWindowId
+        }
+        if let w = tiledLeaves().first(where: { $0.leaf?.role != .stashed })?.leaf?.cgWindowId {
             return w
         }
-        if let w = tiledLeaves().first?.leaf?.cgWindowId {
-            return w
-        }
-        return floating.first?.cgWindowId
+        return floating.first(where: { $0.role != .stashed })?.cgWindowId
     }
 
-    private func contains(cgWindowId: UInt32) -> Bool {
-        leaf(containing: cgWindowId) != nil || floating.contains(where: { $0.cgWindowId == cgWindowId })
+    private func role(of cgWindowId: UInt32) -> WindowRole? {
+        if let w = leaf(containing: cgWindowId)?.leaf { return w.role }
+        return floating.first(where: { $0.cgWindowId == cgWindowId })?.role
     }
 }
