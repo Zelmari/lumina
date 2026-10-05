@@ -6,6 +6,13 @@ import LuminaIPC
 public final class AgentSocketServer {
     private var listenFD: Int32 = -1
     private let queue = DispatchQueue(label: "com.zelmari.lumina.agent.sock")
+    /// Connections are served off the accept queue so one slow client cannot
+    /// block accepts or another client's ping. Commands still serialize on
+    /// the mutation queue.
+    private let sessionQueue = DispatchQueue(
+        label: "com.zelmari.lumina.agent.sock.session",
+        attributes: .concurrent
+    )
     private var source: DispatchSourceRead?
     public var onCommand: ((AgentCmd, String) -> IPCResponse)?
     private let log: LuminaLog
@@ -100,7 +107,7 @@ public final class AgentSocketServer {
             &readTimeout,
             socklen_t(MemoryLayout<timeval>.size)
         )
-        queue.async { self.serve(client) }
+        sessionQueue.async { self.serve(client) }
     }
 
     private func serve(_ fd: Int32) {
