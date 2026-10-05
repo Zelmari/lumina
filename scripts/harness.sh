@@ -7,11 +7,11 @@
 #
 #   scripts/harness.sh
 #
-# Requirements: Lumina is running on this Space, Terminal has Accessibility
-# and Automation permission (System Settings → Privacy & Security), and
-# TextEdit is available. The script opens and closes TextEdit documents and
-# owns Terminal for the native-tabs section (it closes Terminal windows); do
-# not run it while you are editing a document or using Terminal.
+# Requirements: Lumina is running on this Space, the process running the
+# harness has Accessibility and Automation permission (System Settings →
+# Privacy & Security), and TextEdit is available. The script opens and
+# closes TextEdit documents and opens/kills a test Ghostty instance for the
+# native-tabs section; do not run it while you are editing a document.
 #
 # Env:
 #   LUMINA       path to the CLI (default: bundled app, PATH, then .build/debug)
@@ -25,6 +25,7 @@
 #                artifacts/harness-<timestamp>/ (windows, workspaces, verify,
 #                debug-windows dumps, and geometry.txt)
 #   VERBOSE      set to 1 to print the per-window geometry table every step
+#   TABS_TEST    set to 0 to skip the native-tabs (Ghostty) section
 
 set -uo pipefail
 
