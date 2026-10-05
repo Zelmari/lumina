@@ -8,6 +8,11 @@ launch-apps = []                       # e.g. ["com.apple.Terminal"]
 inner = 8
 outer = 8
 
+# Apps whose tabs are separate windows (macOS native tabbing). Lumina
+# keeps one tile per window and swaps the backing window on tab switch.
+[native-tabs]
+apps = ["com.apple.Terminal", "com.mitchellh.ghostty"]
+
 [bindings]
 alt-h = "focus left"
 alt-j = "focus down"

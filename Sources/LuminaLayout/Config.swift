@@ -122,6 +122,9 @@ public struct Config: Equatable, Sendable {
     public var gaps: Gaps
     public var bindings: [Binding]
     public var windowRules: [WindowRule]
+    /// Apps whose tabs are separate NSWindows (macOS native tabbing). Lumina
+    /// keeps one tile per tab group and swaps the backing window on switch.
+    public var nativeTabs: [String]
     public var unknownTopLevelKeys: [String]
     public var diagnostics: [String]
 
@@ -133,6 +136,7 @@ public struct Config: Equatable, Sendable {
         gaps: Gaps = .default,
         bindings: [Binding] = [],
         windowRules: [WindowRule] = [],
+        nativeTabs: [String] = [],
         unknownTopLevelKeys: [String] = [],
         diagnostics: [String] = []
     ) {
@@ -143,6 +147,7 @@ public struct Config: Equatable, Sendable {
         self.gaps = gaps
         self.bindings = bindings
         self.windowRules = windowRules
+        self.nativeTabs = nativeTabs
         self.unknownTopLevelKeys = unknownTopLevelKeys
         self.diagnostics = diagnostics
     }
@@ -220,6 +225,7 @@ private struct RawConfig: Decodable {
     var gaps: RawGaps?
     var bindings: [String: String]?
     var windowRule: [RawWindowRule]?
+    var nativeTabs: RawNativeTabs?
 
     enum CodingKeys: String, CodingKey {
         case spaceCount = "space-count"
@@ -229,7 +235,12 @@ private struct RawConfig: Decodable {
         case gaps
         case bindings
         case windowRule = "window-rule"
+        case nativeTabs = "native-tabs"
     }
+}
+
+private struct RawNativeTabs: Decodable {
+    var apps: [String]?
 }
 
 private struct RawGaps: Decodable {
@@ -257,6 +268,7 @@ public let knownTopLevelKeys: Set<String> = [
     "gaps",
     "bindings",
     "window-rule",
+    "native-tabs",
 ]
 
 public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config, ConfigError> {
@@ -376,6 +388,8 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
         rules = base.windowRules
     }
 
+    let nativeTabs = raw.nativeTabs?.apps ?? base.nativeTabs
+
     return .success(
         Config(
             spaceCount: spaceCount,
@@ -385,6 +399,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
             gaps: Gaps(inner: inner, outer: outer),
             bindings: bindings,
             windowRules: rules,
+            nativeTabs: nativeTabs,
             unknownTopLevelKeys: unknown,
             diagnostics: diagnostics
         )
@@ -561,6 +576,11 @@ extension Config {
     [gaps]
     inner = 8
     outer = 8
+
+    # Apps whose tabs are separate windows (macOS native tabbing). Lumina
+    # keeps one tile per window and swaps the backing window on tab switch.
+    [native-tabs]
+    apps = ["com.apple.Terminal", "com.mitchellh.ghostty"]
 
     [bindings]
     alt-h = "focus left"

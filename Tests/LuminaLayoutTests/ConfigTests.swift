@@ -15,6 +15,20 @@ struct ConfigTests {
         #expect(config.windowRules.contains(where: { $0.appId == "com.apple.Preferences" && $0.action == .float }))
         #expect(config.bindings.contains(where: { $0.chord.keyName == "h" && $0.command == .focus(.left) }))
         #expect(config.bindings.contains(where: { $0.chord.keyName == "0" && $0.command == .workspace(10) }))
+        #expect(config.nativeTabs == ["com.apple.Terminal", "com.mitchellh.ghostty"])
+    }
+
+    @Test func nativeTabsListParsesAndMerges() throws {
+        let explicit = try parseConfig(text: """
+        [native-tabs]
+        apps = ["com.example.app"]
+        """).get()
+        #expect(explicit.nativeTabs == ["com.example.app"])
+
+        // Omitted: the bundled defaults (or current config) apply.
+        let (merged, error) = loadOrDefault(text: "[gaps]\nouter = 20\n")
+        #expect(error == nil)
+        #expect(merged.nativeTabs.contains("com.apple.Terminal"))
     }
 
     @Test func bundledDefaultMatchesResourceFile() throws {
