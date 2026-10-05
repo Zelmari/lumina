@@ -327,6 +327,16 @@ managed_count() {
     python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("windows", [])))' 2>/dev/null || echo 0
 }
 
+status_visible_count() {
+  "$LUMINA" status 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin).get("visibleSpaceCount", 0))' 2>/dev/null || echo 0
+}
+
+status_space_count() {
+  "$LUMINA" status 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin).get("spaceCount", 10))' 2>/dev/null || echo 10
+}
+
 # Tab apps are excluded: their backing window id legitimately changes on a
 # tab switch (the tab section asserts their tile count separately).
 window_ids() {
@@ -600,6 +610,41 @@ verify "on workspace 2 after move"
 run move-node-to-workspace 1 >/dev/null
 run workspace 1 >/dev/null
 verify "back on workspace 1"
+
+# The menu extra strip shows at least five workspaces and grows only when a
+# higher one is used.
+say "menu extra workspace count grows with use"
+visible_before="$(status_visible_count)"
+configured="$(status_space_count)"
+if [[ "$visible_before" -ge 5 ]]; then
+  pass "strip shows at least 5 workspaces ($visible_before)"
+else
+  fail "strip shows only $visible_before workspaces (want at least 5)"
+fi
+target="$configured"
+[[ "$target" -gt 7 ]] && target=7
+if [[ "$target" -gt 5 ]]; then
+  run move-node-to-workspace "$target" >/dev/null
+  sleep 1
+  visible_used="$(status_visible_count)"
+  if [[ "$visible_used" -ge "$target" ]]; then
+    pass "strip grew to $visible_used after using workspace $target"
+  else
+    fail "strip did not grow after using workspace $target: $visible_used"
+  fi
+  run move-node-to-workspace 1 >/dev/null
+  run workspace 1 >/dev/null
+  sleep 1
+  visible_after="$(status_visible_count)"
+  if [[ "$visible_after" -ge 5 && "$visible_after" -le "$visible_used" ]]; then
+    pass "strip settled at $visible_after after the window left"
+  else
+    fail "strip did not settle: $visible_after (was $visible_used)"
+  fi
+  verify "after workspace count check"
+else
+  pass "configured space count is $configured; the 5-workspace minimum covers it"
+fi
 
 say "reload config"
 run reload >/dev/null

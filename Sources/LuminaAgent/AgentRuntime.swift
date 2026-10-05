@@ -3150,7 +3150,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func statusJSON() -> JSONValue {
-        .object([
+        let usedIndices = session.spaces.values
+            .filter { !$0.tiledLeaves().isEmpty || !$0.floating.isEmpty }
+            .map { $0.id.raw }
+        let visible = visibleWorkspaceCount(
+            configured: session.spaceCount,
+            focused: session.focusedSpace.raw,
+            used: usedIndices
+        )
+        return .object([
             "secureInput": .bool(secureInput),
             "axTrusted": .bool(axTrusted),
             "configError": configError.map { .string($0) } ?? .null,
@@ -3160,6 +3168,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "instanceId": .string(instanceId.uuidString),
             "space": .int(session.focusedSpace.raw),
             "spaceCount": .int(session.spaceCount),
+            "visibleSpaceCount": .int(visible),
             "isCurrent": .bool(isCurrent),
             "hasOnScreenIncludingSlivers": .bool(hasOnScreenIncludingSlivers()),
             "hotkeyError": hotkeys.hotkeyError.map { .string($0) } ?? .null,

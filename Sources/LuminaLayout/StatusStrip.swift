@@ -62,7 +62,6 @@ public func statusStrip(
     }
     let count = max(spaceCount, 1)
     let focus = min(max(focused, 1), count)
-    let compact = count > 5
     var segments: [StatusSegment] = []
     if warning {
         segments.append(
@@ -84,17 +83,26 @@ public func statusStrip(
             )
         )
     }
-    let lower = compact ? max(1, focus - 2) : 1
-    let upper = compact ? min(count, focus + 2) : count
-    if compact && lower > 1 {
-        segments.append(StatusSegment(label: "…", state: .idle, enabled: false))
-    }
-    for space in lower...upper {
+    // Every workspace the caller asked for is a digit. The caller passes the
+    // visible count (five minimum, growing with use), so collapsing the
+    // digits into ellipses would hide exactly the workspaces that are used.
+    for space in 1...count {
         let state: StatusSegmentState = paused ? .paused : (space == focus ? .active : .idle)
         segments.append(StatusSegment(label: "\(space)", state: state, enabled: true, space: space))
     }
-    if compact && upper < count {
-        segments.append(StatusSegment(label: "…", state: .idle, enabled: false))
-    }
-    return StatusStripModel(segments: segments, compact: compact)
+    return StatusStripModel(segments: segments, compact: false)
+}
+
+/// Workspaces the menu extra should show: at least `minimum`, one past the
+/// highest used index (the focused workspace counts as used), never more
+/// than configured. A workspace counts as used when it holds a window.
+public func visibleWorkspaceCount(
+    configured: Int,
+    focused: Int,
+    used: [Int],
+    minimum: Int = 5
+) -> Int {
+    let configured = max(configured, 1)
+    let highestUsed = max(used.max() ?? 1, max(focused, 1))
+    return min(configured, max(max(minimum, 1), highestUsed))
 }
