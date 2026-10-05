@@ -1342,10 +1342,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 break
             }
             visited.insert(nodeId)
-            // The lumina-fullscreen leaf is owned by the dedicated block
-            // below; writing its tile rect first snapped it back and forth
-            // on every pass.
-            if let fs, fs == nodeId { continue }
+            // While lumina-fullscreen is active every other leaf is a parked
+            // sibling and must not be written. The FS leaf itself is owned by
+            // the dedicated block below, so the loop writes nothing.
+            if fs != nil { continue }
             guard var node = space.nodes[nodeId], var window = node.leaf,
                   let el = resolvedElement(for: window)
             else {
@@ -1452,7 +1452,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let space = session.current
         let fs = space.luminaFullscreen
         for (nodeId, rect) in rects {
-            if let fs, fs == nodeId { continue }
+            if let fs, fs != nodeId { continue }
             guard var node = space.nodes[nodeId], var window = node.leaf,
                   let el = resolvedElement(for: window)
             else { continue }
