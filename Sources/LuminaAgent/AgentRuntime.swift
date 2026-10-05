@@ -1931,7 +1931,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                         overflowObservations[id] = OverflowObservation(frame: live, since: Date())
                         scheduleRefresh(reason: "overflowCheck", delay: 1.0)
                     } else if let obs = overflowObservations[id], framesClose(obs.frame, live, slop: 4) {
-                        if Date().timeIntervalSince(obs.since) >= overflowRefusalWindow {
+                        let elapsed = Date().timeIntervalSince(obs.since)
+                        if elapsed >= overflowRefusalWindow {
                             overflowObservations[id] = nil
                             if !observedMinCovers(id: id, live: live, rect: rect) {
                                 let prior = observedMinSizes[id] ?? .unknown
@@ -1941,6 +1942,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                                 )
                                 overflowed = true
                             }
+                        } else {
+                            // The size is being held but the refusal window has
+                            // not closed yet. Without a follow-up the window
+                            // would overlap its neighbour until some unrelated
+                            // event triggered another pass.
+                            scheduleRefresh(
+                                reason: "overflowCheck",
+                                delay: overflowRefusalWindow - elapsed + 0.1
+                            )
                         }
                     } else {
                         overflowObservations[id] = OverflowObservation(frame: live, since: Date())
