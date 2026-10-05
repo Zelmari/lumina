@@ -9,8 +9,9 @@
 #
 # Requirements: Lumina is running on this Space, Terminal has Accessibility
 # and Automation permission (System Settings → Privacy & Security), and
-# TextEdit is available. The script opens and closes TextEdit documents; do
-# not run it while you are editing a document.
+# TextEdit is available. The script opens and closes TextEdit documents and
+# owns Terminal for the native-tabs section (it closes Terminal windows); do
+# not run it while you are editing a document or using Terminal.
 #
 # Env:
 #   LUMINA       path to the CLI (default: bundled app, PATH, then .build/debug)
@@ -40,7 +41,18 @@ if [[ "${RECORD:-0}" == "1" ]]; then
 fi
 TMP_BEFORE="$(mktemp -t lumina-harness-before)"
 TMP_AFTER="$(mktemp -t lumina-harness-after)"
-cleanup_tmp() { rm -f "$TMP_BEFORE" "$TMP_AFTER"; }
+# Independent OS-truth window dumper, compiled once.
+CGWINDOWS_BIN=""
+if [[ -f "$ROOT/scripts/cgwindows.swift" ]] && command -v swiftc >/dev/null 2>&1; then
+  CGWINDOWS_BIN="$(mktemp -t lumina-cgwindows)"
+  if ! swiftc -O -o "$CGWINDOWS_BIN" "$ROOT/scripts/cgwindows.swift" >/dev/null 2>&1; then
+    CGWINDOWS_BIN=""
+  fi
+fi
+cleanup_tmp() {
+  rm -f "$TMP_BEFORE" "$TMP_AFTER"
+  [[ -n "$CGWINDOWS_BIN" ]] && rm -f "$CGWINDOWS_BIN"
+}
 trap cleanup_tmp EXIT
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -153,6 +165,131 @@ print(" ".join(str(i) for i in sorted(moved)))
 PY
 }
 
+live_windows() {
+  [[ -n "$CGWINDOWS_BIN" ]] || return 1
+  local pids
+  pids="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+print(" ".join(str(w["pid"]) for w in json.load(sys.stdin).get("windows", [])))
+' 2>/dev/null)"
+  if [[ -z "$pids" ]]; then
+    echo "[]"
+    return 0
+  fi
+  "$CGWINDOWS_BIN" $pids
+}
+
+# Independent live-geometry check against real CG border coordinates, not the
+# model: tile/tile overlap, a focused-space tile with no live window (closed
+# but still in the model), a real frame far from its model frame, and a tiled
+# area that no longer spans the model's tiles. Floater-over-tile is noted but
+# allowed by design.
+assert_live_geometry() {
+  local label="$1"
+  [[ -n "$CGWINDOWS_BIN" ]] || return 0
+  # A window that refuses its tile floats after the 1.5s refusal hold; give
+  # the layout that convergence window before failing.
+  local attempt out
+  for attempt in 1 2 3; do
+    local model live focused
+    model="$("$LUMINA" list-windows 2>/dev/null)"
+    focused="$("$LUMINA" list-workspaces 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["focused"])' 2>/dev/null)"
+    live="$(live_windows 2>/dev/null)" || return 0
+    [[ -z "$model" || -z "$focused" || -z "$live" ]] && return 0
+    out="$(MODEL="$model" LIVE="$live" FOCUSED="$focused" python3 - <<'PY'
+import json, os
+model = json.loads(os.environ["MODEL"])
+live = json.loads(os.environ["LIVE"])
+focused = int(os.environ["FOCUSED"])
+live_by_id = {w["cgWindowId"]: w for w in live}
+windows = model.get("windows", [])
+tiles = [w for w in windows if w.get("role") == "tiled" and w.get("space") == focused]
+floats = [w for w in windows if w.get("role") == "floating" and w.get("space") == focused]
+problems = []
+notes = []
+
+def rect(w):
+    return (w["x"], w["y"], w["x"] + w["w"], w["y"] + w["h"])
+
+def overlap(a, b, slop=4):
+    ax, ay, ax2, ay2 = rect(a)
+    bx, by, bx2, by2 = rect(b)
+    iw = min(ax2, bx2) - max(ax, bx)
+    ih = min(ay2, by2) - max(ay, by)
+    return iw > slop and ih > slop
+
+for w in tiles:
+    lw = live_by_id.get(w["cgWindowId"])
+    if lw is None:
+        problems.append("live-missing-window id=%s %s model=%.0fx%.0f@%.0f,%.0f" % (
+            w["cgWindowId"], w.get("bundleId", "?"), w["w"], w["h"], w["x"], w["y"]))
+        continue
+    if (abs(lw["x"] - w["x"]) > 12 or abs(lw["y"] - w["y"]) > 12
+            or abs(lw["w"] - w["w"]) > 12 or abs(lw["h"] - w["h"]) > 12):
+        problems.append("live-frame-mismatch id=%s %s live=%.0fx%.0f@%.0f,%.0f model=%.0fx%.0f@%.0f,%.0f" % (
+            w["cgWindowId"], w.get("bundleId", "?"),
+            lw["w"], lw["h"], lw["x"], lw["y"], w["w"], w["h"], w["x"], w["y"]))
+
+for i in range(len(tiles)):
+    for j in range(i + 1, len(tiles)):
+        a, b = tiles[i], tiles[j]
+        la, lb = live_by_id.get(a["cgWindowId"]), live_by_id.get(b["cgWindowId"])
+        if la is None or lb is None:
+            continue
+        if overlap(la, lb):
+            problems.append("live-overlap id=%s %s %.0fx%.0f@%.0f,%.0f vs id=%s %s %.0fx%.0f@%.0f,%.0f" % (
+                a["cgWindowId"], a.get("bundleId", "?"), la["w"], la["h"], la["x"], la["y"],
+                b["cgWindowId"], b.get("bundleId", "?"), lb["w"], lb["h"], lb["x"], lb["y"]))
+
+for f in floats:
+    lf = live_by_id.get(f["cgWindowId"])
+    if lf is None:
+        continue
+    for t in tiles:
+        lt = live_by_id.get(t["cgWindowId"])
+        if lt is not None and overlap(lf, lt):
+            notes.append("floater-over-tile id=%s %s over id=%s %s" % (
+                f["cgWindowId"], f.get("bundleId", "?"), t["cgWindowId"], t.get("bundleId", "?")))
+
+def bbox(entries):
+    if not entries:
+        return None
+    xs = [e[0] for e in entries]
+    ys = [e[1] for e in entries]
+    x2 = [e[2] for e in entries]
+    y2 = [e[3] for e in entries]
+    return (min(xs), min(ys), max(x2), max(y2))
+
+model_bbox = bbox([rect(w) for w in tiles])
+live_bbox = bbox([rect(live_by_id[w["cgWindowId"]]) for w in tiles if w["cgWindowId"] in live_by_id])
+if model_bbox and live_bbox and any(abs(a - b) > 6 for a, b in zip(model_bbox, live_bbox)):
+    problems.append("live-coverage-hole model=%s live=%s" % (
+        ",".join("%.0f" % v for v in model_bbox),
+        ",".join("%.0f" % v for v in live_bbox)))
+
+for n in notes:
+    print("NOTE " + n)
+for p in problems:
+    print("PROBLEM " + p)
+PY
+)"
+    if [[ -z "$out" ]]; then
+      return 0
+    fi
+    if printf '%s\n' "$out" | grep -q '^PROBLEM' && [[ "$attempt" -lt 3 ]]; then
+      if [[ "$attempt" -eq 1 ]]; then sleep 0.8; else sleep 1.5; fi
+      continue
+    fi
+    printf '%s\n' "$out" | grep '^NOTE' | sed 's/^NOTE/   note:/' || true
+    if printf '%s\n' "$out" | grep -q '^PROBLEM'; then
+      fail "$label: live geometry issues:"
+      printf '%s\n' "$out" | grep '^PROBLEM' | sed 's/^PROBLEM/      /'
+      geometry_table | sed 's/^/      /'
+    fi
+    return 0
+  done
+}
+
 # Check invariants and that no tracked window silently left the model.
 verify() {
   local label="${1:-verify}"
@@ -181,6 +318,7 @@ verify() {
   if [[ "${VERBOSE:-0}" == "1" ]]; then
     geometry_table | sed 's/^/      /'
   fi
+  assert_live_geometry "$label"
   record_step "$label"
 }
 
@@ -286,61 +424,45 @@ wait_for_space_count() {
   return 1
 }
 
-bundle_count() {
-  "$LUMINA" list-windows 2>/dev/null |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); print(sum(1 for w in d.get("windows", []) if w.get("bundleId") == sys.argv[1]))' "$1" 2>/dev/null || echo 0
-}
-
-wait_for_bundle_count() {
-  local bundle="$1" want="$2" deadline=$((SECONDS + 10))
+wait_for_count_at_most() {
+  local want="$1" deadline=$((SECONDS + 10))
   while ((SECONDS < deadline)); do
-    if [[ "$(bundle_count "$bundle")" -ge "$want" ]]; then return 0; fi
+    if [[ "$(managed_count)" -le "$want" ]]; then return 0; fi
     sleep 0.4
   done
   return 1
 }
 
-# Terminal.app exposes its tab bar as an AXTabGroup; tabs are created via
-# Shell > New Tab > profile and switched by clicking the tab buttons.
-terminal_front_id() {
-  osascript -e 'tell application "Terminal" to id of front window' 2>/dev/null || true
+# The native-tabs section uses a dedicated Ghostty instance: each tab is a
+# separate NSWindow, so every Cmd-T activates a new backing window.
+ghostty_pids() {
+  ps -axo pid,comm | grep 'Ghostty.app/Contents/MacOS/ghostty' | grep -v grep | awk '{print $1}'
 }
 
-# Terminal's AppleScript tab count is stale; the AXTabGroup is the truth.
-terminal_tab_count() {
-  local pid json
-  pid="$(ps -axo pid,comm | rg 'Terminal.app/Contents/MacOS/Terminal' | awk '{print $1}' | head -1)"
-  [[ -z "$pid" ]] && { echo 0; return; }
-  json="$("$LUMINA" debug-ax "$pid" 2>/dev/null)"
-  printf '%s' "$json" | python3 -c '
+pid_count() {
+  "$LUMINA" list-windows 2>/dev/null |
+    python3 -c '
 import json, sys
-d = json.load(sys.stdin)
-count = 0
-def walk(n):
-    global count
-    if n.get("role") == "AXRadioButton" and n.get("subrole") == "AXTabButton":
-        count += 1
-    for c in n.get("children", []):
-        walk(c)
-for w in d.get("windows", []):
-    walk(w)
-print(count)
-' 2>/dev/null || echo 0
+pid = int(sys.argv[1])
+print(sum(1 for w in json.load(sys.stdin).get("windows", []) if w.get("pid") == pid))
+' "$1" 2>/dev/null || echo 0
 }
 
-terminal_new_tab() {
-  osascript -e 'tell application "Terminal" to activate' \
-    -e 'tell application "System Events" to tell process "Terminal" to click menu item "New Tab" of menu "Shell" of menu bar 1' \
-    -e 'delay 0.4' \
-    -e 'tell application "System Events" to tell process "Terminal" to click menu item 1 of menu of menu item "New Tab" of menu "Shell" of menu bar 1' 2>&1
+wait_for_pid_count() {
+  local pid="$1" want="$2" deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    if [[ "$(pid_count "$pid")" -eq "$want" ]]; then return 0; fi
+    sleep 0.4
+  done
+  return 1
 }
 
-terminal_switch_tab() {
-  osascript -e "tell application \"System Events\" to tell process \"Terminal\" to click radio button $1 of tab group 1 of window 1" 2>&1
+ghostty_new_tab() {
+  osascript -e 'tell application "System Events" to keystroke "t" using command down' >/dev/null 2>&1 || true
 }
 
-terminal_close_window() {
-  osascript -e "tell application \"Terminal\" to close window id $1 saving no" 2>&1
+ghostty_next_tab() {
+  osascript -e 'tell application "System Events" to keystroke "]" using {command down, shift down}' >/dev/null 2>&1 || true
 }
 
 say "Lumina at $LUMINA"
@@ -418,6 +540,24 @@ run resize shrink >/dev/null
 run balance >/dev/null
 verify "after resize/balance"
 
+# Closing one window (app stays running) must reflow the remaining tiles.
+# The live-geometry oracle inside verify catches a stale tile/coverage hole.
+say "closing one window reflows the rest"
+before_ids="$(window_ids)"
+open_windows 1
+closed_id="$(new_textedit_id "$before_ids")"
+close_count="$(managed_count)"
+osascript -e 'tell application "TextEdit" to close front window saving no' >/dev/null 2>&1
+if wait_for_count_at_most "$((close_count - 1))"; then
+  pass "closed window left the model"
+else
+  fail "closed window still managed: $(managed_count) (was $close_count)"
+fi
+if [[ -n "$closed_id" ]]; then
+  TRACKED_IDS="$(printf '%s' "$TRACKED_IDS" | tr ' ' '\n' | grep -v "^${closed_id}$" | tr '\n' ' ')"
+fi
+verify "after closing one window"
+
 say "workspace switch with hidden windows"
 # The first round trip may converge once (observed minimum sizes can
 # re-balance a split); the layout must be identical on the next one.
@@ -465,58 +605,65 @@ say "reload config"
 run reload >/dev/null
 verify "after reload"
 
-# Native tabs: Terminal implements each tab as a separate NSWindow. Lumina
-# must keep exactly one tile for the app window and swap the backing window
-# on a tab switch, never add or lose a tile.
+# Native tabs: each tab is a separate NSWindow, so every Cmd-T makes a new
+# backing window active. Lumina must keep exactly one tile per app window.
+# A dedicated Ghostty instance is opened and killed, so the user's session
+# and any Terminal windows are untouched, and the pid count is exact.
 if [[ "${TABS_TEST:-1}" != "0" ]]; then
-  say "native tabs: one Terminal tile across tab switches"
+  say "native tabs: one Ghostty tile across tab creation and switches"
   saved_tracked="${TRACKED_IDS:-}"
   TRACKED_IDS=""
-  terminal_before="$(bundle_count com.apple.Terminal)"
-  created_terminal=0
-  if [[ "$terminal_before" -eq 0 ]]; then
-    open -n -a Terminal >/dev/null 2>&1
-    if wait_for_bundle_count com.apple.Terminal 1; then
-      pass "Terminal window adopted"
-      created_terminal=1
-    else
-      fail "Terminal window was not adopted"
-    fi
-  fi
-  expected_terminal="$terminal_before"
-  [[ "$expected_terminal" -eq 0 ]] && expected_terminal=1
-
-  terminal_new_tab >/dev/null 2>&1
-  sleep 1
-  terminal_new_tab >/dev/null 2>&1
-  sleep 1
-  tabs_created="$(terminal_tab_count)"
-  if [[ "$tabs_created" -ge 3 ]]; then
-    pass "created $tabs_created Terminal tabs"
-  else
-    fail "could not create Terminal tabs (count=$tabs_created)"
-  fi
-
-  for tab in 2 3 1 2 1; do
-    terminal_switch_tab "$tab" >/dev/null 2>&1
-    sleep 0.8
-    verify "after Terminal tab $tab"
-    managed="$(bundle_count com.apple.Terminal)"
-    if [[ "$managed" -eq "$expected_terminal" ]]; then
-      pass "tab $tab: Terminal still has $managed tile(s)"
-    else
-      fail "tab $tab: Terminal has $managed managed windows (want $expected_terminal)"
-      geometry_table | sed 's/^/      /'
-    fi
+  pids_before="$(ghostty_pids)"
+  open -n -a Ghostty >/dev/null 2>&1
+  ghost_pid=""
+  deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    for p in $(ghostty_pids); do
+      if ! printf '%s\n' "$pids_before" | grep -qx "$p"; then
+        ghost_pid="$p"
+        break
+      fi
+    done
+    [[ -n "$ghost_pid" ]] && break
+    sleep 0.4
   done
-
-  if [[ "$created_terminal" -eq 1 ]]; then
-    terminal_close_window "$(terminal_front_id)" >/dev/null 2>&1
-    sleep 1
-    if wait_for_bundle_count com.apple.Terminal 0; then
-      pass "Terminal window closed cleanly"
+  if [[ -z "$ghost_pid" ]]; then
+    fail "could not start a test Ghostty instance"
+  else
+    if wait_for_pid_count "$ghost_pid" 1; then
+      pass "Ghostty window adopted"
     else
-      fail "Terminal window did not close: $(bundle_count com.apple.Terminal) still managed"
+      fail "Ghostty window was not adopted"
+    fi
+    for tab in 1 2 3; do
+      ghostty_new_tab
+      sleep 1.2
+      managed="$(pid_count "$ghost_pid")"
+      if [[ "$managed" -eq 1 ]]; then
+        pass "after Cmd-T $tab: Ghostty still has 1 tile"
+      else
+        fail "after Cmd-T $tab: Ghostty has $managed managed windows (want 1)"
+        geometry_table | sed 's/^/      /'
+      fi
+      verify "after Ghostty tab $tab"
+    done
+    # Tab switching is best effort: the key binding is user-configurable.
+    for i in 1 2 3; do
+      ghostty_next_tab
+      sleep 0.8
+      managed="$(pid_count "$ghost_pid")"
+      if [[ "$managed" -eq 1 ]]; then
+        pass "after tab switch $i: Ghostty still has 1 tile"
+      else
+        fail "after tab switch $i: Ghostty has $managed managed windows (want 1)"
+      fi
+    done
+    verify "after Ghostty tabs"
+    kill "$ghost_pid" >/dev/null 2>&1 || true
+    if wait_for_pid_count "$ghost_pid" 0; then
+      pass "test Ghostty instance removed"
+    else
+      fail "test Ghostty instance still managed"
     fi
   fi
   TRACKED_IDS="$saved_tracked"
