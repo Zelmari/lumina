@@ -51,6 +51,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         /// internal settle/retry timers whose delay is deliberate.
         var receivedAt: Date?
     }
+    /// One app's enumeration result. Scans run concurrently; only the adapter
+    /// and pure helpers are touched off the mutation queue.
+    struct PidScan {
+        var pid: pid_t
+        var elements: [UInt32: AXUIElement] = [:]
+        var live: [LiveWindow] = []
+        var failed = false
+        var empty = false
+        var unresolved = false
+    }
+
     var pendingRefresh: RefreshRequest?
     var refreshScheduled = false
     /// The in-flight coalescing timer. Kept so a fresh event can preempt a
@@ -732,6 +743,78 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         return true
     }
 
+    /// Enumerate one app's windows. May run on a worker thread, so it only
+    /// touches the adapter and pure helpers, never the session.
+    func scanPid(
+        _ pid: pid_t,
+        onScreen: Set<UInt32>,
+        onScreenRows: [[String: Any]],
+        unmanagedLayeredIds: Set<UInt32>,
+        modelPidSet: Set<pid_t>
+    ) -> PidScan {
+        var scan = PidScan(pid: pid)
+        func hasUnmanagedOnScreen() -> Bool {
+            onScreenRows.contains { row in
+                guard let rect = cgWindowRect(row), rect.w >= 50, rect.h >= 50 else { return false }
+                return cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
+                    && cgWindowID(row).map { unmanagedLayeredIds.contains($0) } == true
+            }
+        }
+        func hasAnyOnScreenWindow() -> Bool {
+            onScreenRows.contains { row in
+                guard let rect = cgWindowRect(row), rect.w >= 50, rect.h >= 50 else { return false }
+                return cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
+            }
+        }
+        switch adapter.enumerateWindows(pid: pid) {
+        case .failed:
+            scan.failed = true
+            if hasUnmanagedOnScreen() {
+                log.info("refresh ax read failed unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
+                scan.unresolved = true
+            }
+        case .list(let elements):
+            if elements.isEmpty {
+                // An app that owns on-screen or model windows but answers an
+                // empty AXWindows list has either torn its accessibility tree
+                // down (Ghostty/Electron) or closed its last window. The read
+                // itself succeeded, so removals still count misses and
+                // resolve; a hard `.failed` read is the only unbounded
+                // deferral. Forget the wake state so the app is asked again
+                // instead of looking windowless.
+                if hasAnyOnScreenWindow() || modelPidSet.contains(pid) {
+                    log.info("refresh ax empty pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?"); will re-wake")
+                    scan.empty = true
+                    adapter.markAccessibilityUnhealthy(pid: pid)
+                    // Ask directly; `resolvedElement` short-circuits on a
+                    // retained element and would never re-wake.
+                    adapter.wakeAccessibility(pid: pid)
+                    scan.unresolved = true
+                } else if hasUnmanagedOnScreen() {
+                    log.info("refresh ax empty unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
+                    scan.unresolved = true
+                }
+            }
+            for el in elements {
+                guard let id = adapter.windowId(for: el) else {
+                    log.info("refresh unresolved window id pid=\(pid) role=\(adapter.role(of: el) ?? "?")")
+                    continue
+                }
+                adapter.markAccessibilityHealthy(pid: pid)
+                let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
+                scan.live.append(LiveWindow(
+                    cgWindowId: id,
+                    pid: pid,
+                    bundleId: adapter.bundleId(pid: pid),
+                    frame: frame,
+                    onScreen: onScreen.contains(id)
+                ))
+                scan.elements[id] = el
+            }
+        }
+        return scan
+    }
+
     /// One declarative pass: re-read every relevant app's AX window list, GC
     /// windows that are gone, rebind replaced ids, adopt new ones, then lay
     /// out. Convergence by repetition; no per-event repair.
@@ -774,67 +857,45 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard cgWindowLayer(row) == 0, let id = cgWindowID(row), !modelIds.contains(id) else { return nil }
             return id
         })
-        func hasUnmanagedOnScreen(_ pid: pid_t) -> Bool {
-            onScreenRows.contains { row in
-                guard let rect = cgWindowRect(row), rect.w >= 50, rect.h >= 50 else { return false }
-                return cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
-                    && cgWindowID(row).map { unmanagedLayeredIds.contains($0) } == true
-            }
-        }
-        func hasAnyOnScreenWindow(_ pid: pid_t) -> Bool {
-            onScreenRows.contains { row in
-                guard let rect = cgWindowRect(row), rect.w >= 50, rect.h >= 50 else { return false }
-                return cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
-            }
-        }
         let modelPidSet = Set(modelPids.values)
-        for pid in refreshPids() {
-            switch adapter.enumerateWindows(pid: pid) {
-            case .failed:
-                axFailedPids.insert(pid)
-                if hasUnmanagedOnScreen(pid) {
-                    log.info("refresh ax read failed unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
-                    refreshUnresolved = true
-                }
-            case .list(let elements):
-                if elements.isEmpty {
-                    // An app that owns on-screen or model windows but answers
-                    // an empty AXWindows list has either torn its
-                    // accessibility tree down (Ghostty/Electron) or closed
-                    // its last window. The read itself succeeded, so removals
-                    // still count misses and resolve; a hard `.failed` read is
-                    // the only unbounded deferral. Forget the wake state so
-                    // the app is asked again instead of looking windowless.
-                    if hasAnyOnScreenWindow(pid) || modelPidSet.contains(pid) {
-                        log.info("refresh ax empty pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?"); will re-wake")
-                        axEmptyPids.insert(pid)
-                        adapter.markAccessibilityUnhealthy(pid: pid)
-                        // Ask directly; `resolvedElement` short-circuits on a
-                        // retained element and would never re-wake.
-                        adapter.wakeAccessibility(pid: pid)
-                        refreshUnresolved = true
-                    } else if hasUnmanagedOnScreen(pid) {
-                        log.info("refresh ax empty unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
-                        refreshUnresolved = true
-                    }
-                }
-                for el in elements {
-                    guard let id = adapter.windowId(for: el) else {
-                        log.info("refresh unresolved window id pid=\(pid) role=\(adapter.role(of: el) ?? "?")")
-                        continue
-                    }
-                    adapter.markAccessibilityHealthy(pid: pid)
-                    let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                    live.append(LiveWindow(
-                        cgWindowId: id,
-                        pid: pid,
-                        bundleId: adapter.bundleId(pid: pid),
-                        frame: frame,
-                        onScreen: onScreen.contains(id)
-                    ))
-                    elementsById[id] = el
-                }
+        let pids = refreshPids(onScreenRows: onScreenRows)
+        let scans: [PidScan]
+        if pids.count > 1 {
+            // App AX reads are independent; a slow app (Chromium, Electron)
+            // must not serialize behind the others. AeroSpace's thread-per-app
+            // is the model: wall time becomes the slowest app, not the sum.
+            var collected = [PidScan?](repeating: nil, count: pids.count)
+            let lock = NSLock()
+            DispatchQueue.concurrentPerform(iterations: pids.count) { index in
+                let scan = scanPid(
+                    pids[index],
+                    onScreen: onScreen,
+                    onScreenRows: onScreenRows,
+                    unmanagedLayeredIds: unmanagedLayeredIds,
+                    modelPidSet: modelPidSet
+                )
+                lock.lock()
+                collected[index] = scan
+                lock.unlock()
             }
+            scans = collected.compactMap { $0 }
+        } else {
+            scans = pids.map {
+                scanPid(
+                    $0,
+                    onScreen: onScreen,
+                    onScreenRows: onScreenRows,
+                    unmanagedLayeredIds: unmanagedLayeredIds,
+                    modelPidSet: modelPidSet
+                )
+            }
+        }
+        for scan in scans {
+            if scan.failed { axFailedPids.insert(scan.pid) }
+            if scan.empty { axEmptyPids.insert(scan.pid) }
+            if scan.unresolved { refreshUnresolved = true }
+            live.append(contentsOf: scan.live)
+            for (id, el) in scan.elements { elementsById[id] = el }
         }
         if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier, !isOurProcess(front) {
             _ = adoptFocusedWindow(pid: front, live: &live, elementsById: &elementsById, onScreen: onScreen)
@@ -894,6 +955,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var elementLive: Set<UInt32> = []
         for id in delta.removed {
             guard let el = elements[id], let pid = modelPids[id], adapter.pid(of: el) == pid else { continue }
+            // An app whose AXWindows read failed is unresponsive; a role read
+            // would only add another timeout per window. The removal gate
+            // already defers removals for failed pids, so the veto is moot.
+            if failedManaged.contains(pid) { continue }
             if adapter.isAliveElement(el) { elementLive.insert(id) }
         }
         // One CG liveness snapshot per pass, taken as late as possible so a
@@ -987,7 +1052,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // (an AX read per parked window) and only re-apply frames. The next
         // pass that changes the model re-parks anything that drifted.
         let modelChanged = !delta.isEmpty || !deadElementIds.isEmpty
-        applyFrames()
+        applyFrames(cgLive: cgLiveIds)
         if let receivedAt {
             refreshLatency.record(milliseconds: Date().timeIntervalSince(receivedAt) * 1000)
         }
@@ -1034,16 +1099,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     /// Pids worth enumerating this pass: everything we manage, everything with
     /// an on-screen window, and the frontmost app.
-    func refreshPids() -> [pid_t] {
+    func refreshPids(onScreenRows: [[String: Any]]? = nil) -> [pid_t] {
         var pids = Set<pid_t>()
         for space in session.spaces.values {
             for node in space.tiledLeaves() { if let w = node.leaf { pids.insert(w.pid) } }
             for w in space.floating { pids.insert(w.pid) }
         }
-        if let bound {
-            for row in onScreenCGWindows(intersecting: bound.axFrame) {
-                if let pid = cgOwnerPID(row), !isOurProcess(pid) { pids.insert(pid) }
-            }
+        let rows = onScreenRows ?? bound.map { onScreenCGWindows(intersecting: $0.axFrame) } ?? []
+        for row in rows {
+            if let pid = cgOwnerPID(row), !isOurProcess(pid) { pids.insert(pid) }
         }
         if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier, !isOurProcess(front) {
             pids.insert(front)
@@ -1829,7 +1893,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func applyFrames() {
+    func applyFrames(cgLive: Set<UInt32>? = nil) {
         if isStopping() || userPaused || displayGone || !isCurrent { return }
         refreshBound()
         guard let bound else { return }
@@ -1840,7 +1904,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let space = session.current
         let rects = frames(space: space, usable: usable, gaps: config.gaps)
         let fs = space.luminaFullscreen
-        let liveIds = cgWindowIds()
+        // A refresh already has a CG liveness snapshot; reusing it saves a
+        // WindowServer round trip on the hot path.
+        let liveIds = cgLive ?? cgWindowIds()
         var ghosts: [UInt32] = []
         var budgetBroke = false
         var visited: Set<NodeId> = []
