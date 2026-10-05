@@ -1505,7 +1505,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         switch cmd {
         case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces, .verify,
-             .accessibilityPrompt:
+             .accessibilityPrompt, .debugAX:
             break
         default:
             if userPaused || displayGone || !isCurrent { return .success(id: id) }
@@ -1581,6 +1581,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         case .accessibilityPrompt:
             requestAgentAXPrompt()
             return .success(id: id)
+        case .debugAX(let pid):
+            let windows = adapter.windows(pid: pid)
+            return .success(id: id, data: .object([
+                "pid": .int(Int(pid)),
+                "bundleId": .string(adapter.bundleId(pid: pid) ?? ""),
+                "windowCount": .int(windows.count),
+                "windows": .array(windows.map { adapter.debugElementJSON($0) }),
+            ]))
         case .debugWindows:
             return .success(id: id, data: debugWindowsJSON())
         }

@@ -602,6 +602,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .markCurrent: return "mark-current"
     case .yield: return "yield"
     case .accessibilityPrompt: return "accessibility-prompt"
+    case .debugAX: return "debug-ax"
     case .debugWindows: return "debug-windows"
     }
 }
@@ -616,6 +617,7 @@ func agentCmdArgs(_ cmd: AgentCmd) -> [String: JSONValue] {
     case .swap(let d): return ["dir": .string(d.rawValue)]
     case .resize(let d): return ["delta": .string(d.rawValue)]
     case .fullscreen(let m): return ["mode": .string(m.rawValue)]
+    case .debugAX(let pid): return ["pid": .int(Int(pid))]
     default: return [:]
     }
 }

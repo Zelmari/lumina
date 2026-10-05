@@ -24,6 +24,7 @@ public enum CLIArgs {
     verify                       check tiling invariants; exit 1 on issues
     status                       print agent status as JSON
     debug-windows                write a debug dump
+    debug-ax <pid>               dump an app's AX attributes as JSON
     reload                       reload ~/.config/lumina/lumina.toml
     pause | resume               stop / resume managing windows
     start                        start Lumina on this Space
@@ -80,6 +81,11 @@ public enum CLIArgs {
                 return IPCRequest(id: id, cmd: "fullscreen", args: ["mode": .string(args[1])])
             }
             return IPCRequest(id: id, cmd: "fullscreen")
+        case "debug-ax":
+            guard args.count >= 2, let pid = Int(args[1]) else {
+                return IPCRequest(id: id, cmd: "debug-ax")
+            }
+            return IPCRequest(id: id, cmd: "debug-ax", args: ["pid": .int(pid)])
         case "float-toggle", "balance", "close", "pause", "resume", "reload",
              "list-windows", "list-workspaces", "verify", "status", "debug-windows",
              "start", "quit-all", "open-config", "current-token", "grant-accessibility":

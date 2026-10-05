@@ -94,6 +94,8 @@ public enum AgentCmd: Equatable, Sendable {
     case yield
     /// Show the Accessibility grant prompt again (freshly reset TCC record).
     case accessibilityPrompt
+    /// Dump an app's AX attribute names and tab-related values.
+    case debugAX(pid: Int32)
     case debugWindows
 }
 
