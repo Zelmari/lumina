@@ -3088,6 +3088,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let modelIds = Set(ownedWindows(pid: pid).map { $0.1.cgWindowId })
         let elementIds = Set(elements.filter { adapter.pid(of: $0.value) == pid }.map(\.key))
         let ids = modelIds.union(elementIds)
+        // A pre-parked window of a terminating app must not leave its marker
+        // behind: CGWindowIDs are recycled and the next owner would inherit
+        // the old frame as its "original".
+        for id in Array(preParked.keys) where ids.contains(id) || elements[id].flatMap({ adapter.pid(of: $0) }) == pid {
+            preParked[id] = nil
+        }
         for (_, window) in ownedWindows(pid: pid) {
             observedMinSizes[window.cgWindowId] = nil
             overflowObservations[window.cgWindowId] = nil
