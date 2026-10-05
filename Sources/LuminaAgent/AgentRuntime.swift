@@ -631,6 +631,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // A window exists. Stop polling and hand it to the mutation queue; if
         // the id is not resolvable yet, the fast retry ladder takes over.
         let id = adapter.windowIdIfKnown(for: element)
+        let seenFrame = adapter.frame(of: element)
         nonisolated(unsafe) let token = Unmanaged.passRetained(element).toOpaque()
         let seenAfter = Int(elapsed * 1000)
         let attempts = watch.attempts
@@ -640,7 +641,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let element = Unmanaged<AXUIElement>.fromOpaque(token).takeRetainedValue()
             if let id, self.ownedAnywhere(id) { return }
             let idText = id.map(String.init) ?? "?"
-            self.log.info("launch watch sighting pid=\(pid) id=\(idText) after=\(seenAfter)ms attempts=\(attempts)")
+            let frameText = seenFrame.map { "\(Int($0.w))x\(Int($0.h))@\(Int($0.x)),\(Int($0.y))" } ?? "?"
+            self.log.info("launch watch sighting pid=\(pid) id=\(idText) frame=\(frameText) after=\(seenAfter)ms attempts=\(attempts)")
             self.preParkNewWindow(element)
             // Hard preemption: a pending coalesced timer must not delay the
             // pass that adopts this window.
@@ -935,12 +937,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         bound: BoundDisplay
     ) -> Rect? {
         if let bundle {
-            if config.nativeTabs.contains(bundle) { return nil }
+            if config.nativeTabs.contains(bundle) {
+                log.info("pre-park tile skip window=\(id) reason=native-tabs")
+                return nil
+            }
             // A float/ignore rule for the app (even a title-regex one we cannot
             // evaluate yet) makes the predicted tile untrustworthy.
             if config.windowRules.contains(where: {
                 $0.appId == bundle && ($0.action == .float || $0.action == .ignore)
-            }) { return nil }
+            }) {
+                log.info("pre-park tile skip window=\(id) reason=float-rule")
+                return nil
+            }
         }
         let rows = onScreenCGWindows(intersecting: bound.axFrame)
         let onScreen = Set(rows.compactMap(cgWindowID))
@@ -950,13 +958,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             bound: bound,
             onScreenIds: onScreen,
             onScreenRows: rows
-        ) else { return nil }
-        guard classify(input, rules: config.windowRules, ignoringOnScreen: true) == .tiled else { return nil }
+        ) else {
+            log.info("pre-park tile skip window=\(id) reason=classify-input")
+            return nil
+        }
+        let result = classify(input, rules: config.windowRules, ignoringOnScreen: true)
+        guard result == .tiled else {
+            log.info("pre-park tile skip window=\(id) reason=not-tiled(\(result))")
+            return nil
+        }
         let usable = bound.usableRect(gaps: config.gaps)
         let probe = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
         let measured = adapter.minSize(of: element)
         let minSizes: [UInt32: Size] = measured == .unknown ? [:] : [id: measured]
-        return session.predictedTile(
+        let tile = session.predictedTile(
             space: session.focusedSpace,
             window: probe,
             usable: usable,
@@ -964,6 +979,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             usableIsWide: usableIsWide(usable),
             minSizes: minSizes
         )
+        if tile == nil {
+            log.info("pre-park tile skip window=\(id) reason=no-prediction")
+        }
+        return tile
     }
 
     /// Put a pre-parked window back where the app had it. Called when the pass
