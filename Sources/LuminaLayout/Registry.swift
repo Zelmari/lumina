@@ -100,6 +100,8 @@ public struct AgentStatus: Equatable, Sendable, Codable {
     public var displayGone: Bool
     public var hotkeyError: String?
     public var spaceCount: Int?
+    /// Workspaces the menu extra should show: at least five, growing with use.
+    public var visibleSpaceCount: Int?
     public var isCurrent: Bool
     public var hasOnScreenIncludingSlivers: Bool
     public var skylightSpaceId: UInt64?
@@ -114,6 +116,7 @@ public struct AgentStatus: Equatable, Sendable, Codable {
         displayGone: Bool = false,
         hotkeyError: String? = nil,
         spaceCount: Int? = nil,
+        visibleSpaceCount: Int? = nil,
         isCurrent: Bool = false,
         hasOnScreenIncludingSlivers: Bool = false,
         skylightSpaceId: UInt64? = nil
@@ -127,6 +130,7 @@ public struct AgentStatus: Equatable, Sendable, Codable {
         self.displayGone = displayGone
         self.hotkeyError = hotkeyError
         self.spaceCount = spaceCount
+        self.visibleSpaceCount = visibleSpaceCount
         self.isCurrent = isCurrent
         self.hasOnScreenIncludingSlivers = hasOnScreenIncludingSlivers
         self.skylightSpaceId = skylightSpaceId

@@ -259,6 +259,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
             displayGone: obj["displayGone"]?.bool ?? false,
             hotkeyError: obj["hotkeyError"]?.string,
             spaceCount: obj["spaceCount"]?.int,
+            visibleSpaceCount: obj["visibleSpaceCount"]?.int,
             isCurrent: obj["isCurrent"]?.bool ?? false,
             hasOnScreenIncludingSlivers: obj["hasOnScreenIncludingSlivers"]?.bool ?? false,
             skylightSpaceId: obj["skylightSpaceId"]?.int.map { UInt64($0) }
@@ -431,7 +432,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
                     }
                 }
             }
-            let spaceCount = st.spaceCount ?? 10
+            // The strip shows at least five workspaces and grows with use;
+            // fall back to the configured count for older agents.
+            let spaceCount = st.visibleSpaceCount ?? st.spaceCount ?? 10
             let focused = st.space ?? 1
             let paused = st.paused
             let warning = extraWarning(status: st)
