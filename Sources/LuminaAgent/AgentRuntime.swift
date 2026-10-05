@@ -563,6 +563,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         let nc = NSWorkspace.shared.notificationCenter
         nc.addObserver(self, selector: #selector(appLaunched(_:)), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        nc.addObserver(self, selector: #selector(appWillLaunch(_:)), name: NSWorkspace.willLaunchApplicationNotification, object: nil)
         nc.addObserver(self, selector: #selector(appTerminated(_:)), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         nc.addObserver(self, selector: #selector(appHidden(_:)), name: NSWorkspace.didHideApplicationNotification, object: nil)
         nc.addObserver(self, selector: #selector(appActivated(_:)), name: NSWorkspace.didActivateApplicationNotification, object: nil)
@@ -656,6 +657,28 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if adapter.role(of: element) == "AXWindow" { return element }
         }
         return nil
+    }
+
+    /// The earliest launch signal: macOS posts it as the app checks in, before
+    /// its first window exists (the userInfo carries the NSRunningApplication,
+    /// per the AppKit header contract for all application notifications).
+    @objc func appWillLaunch(_ n: Notification) {
+        guard isCurrent, !userPaused else { return }
+        guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        let pid = app.processIdentifier
+        if Thread.isMainThread {
+            observers.watch(pid: pid)
+        } else {
+            DispatchQueue.main.async { self.observers.watch(pid: pid) }
+        }
+        MutationQueue.shared.hop { [weak self] in
+            guard let self else { return }
+            self.recentlyLaunchedPids[pid] = Date()
+            self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
+            self.launchPollDelay = 0.25
+            self.startLaunchWatch(pid: pid, reason: "willLaunch")
+            self.scheduleRefresh(reason: "willLaunch")
+        }
     }
 
     @objc func appLaunched(_ n: Notification) {
@@ -1298,7 +1321,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             refreshLatency.record(milliseconds: ms)
             if reason == kAXWindowCreatedNotification || reason == kAXCreatedNotification {
                 createdLatency.record(milliseconds: ms)
-            } else if reason == "appLaunched" || reason == "appActivated" || reason == "launchWatch" {
+            } else if reason == "appLaunched" || reason == "appActivated" || reason == "launchWatch"
+                || reason == "willLaunch"
+            {
                 launchedLatency.record(milliseconds: ms)
             }
         }
