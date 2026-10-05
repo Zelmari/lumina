@@ -1216,6 +1216,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 let from = session.focusedSpace.raw
                 session = session.moveNodeToWorkspace(id, usableIsWide: usableIsWide(usable))
                 log.info("move-node-to-workspace window=\(focused) \(from)->\(id.raw) focusedSpace=\(session.focusedSpace.raw)")
+                // The destination may hold parked windows; bring them back
+                // before laying out, like switchSpace does.
+                unstashSpace(id)
                 restashOffspace()
                 applyFrames()
                 nativeFocus(focused)
@@ -1415,8 +1418,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             for i in s.floating.indices where s.floating[i].role == .floating {
                 guard let el = resolvedElement(for: s.floating[i]),
                       let live = adapter.frame(of: el),
-                      !framesClose(live, s.floating[i].lastOnscreenFrame, slop: 2)
+                      !framesClose(live, s.floating[i].lastOnscreenFrame, slop: 2),
+                      !isStashedAway(live)
                 else { continue }
+                // Never record a park frame as a floater's saved position: a
+                // window we forgot to unstash would lose where it belongs.
                 s.floating[i].lastOnscreenFrame = live
             }
             session.spaces[session.focusedSpace] = s
