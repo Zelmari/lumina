@@ -678,6 +678,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         refreshUnresolved = false
         let onScreenRows = onScreenCGWindows(intersecting: bound.axFrame)
         let onScreen = Set(onScreenRows.compactMap(cgWindowID))
+        // One model-id set per pass. It used to be rebuilt several times (once
+        // per on-screen row), which dominated the non-AX cost between an
+        // event and the frame write.
+        let modelIds = session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId))
         var elementsById: [UInt32: AXUIElement] = [:]
         var live: [LiveWindow] = []
         var modelPids: [UInt32: Int32] = [:]
@@ -702,7 +706,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         /// these are not treated as hard failures for removal.
         var axEmptyPids: Set<pid_t> = []
         let unmanagedLayeredIds: Set<UInt32> = Set(onScreenRows.compactMap { row -> UInt32? in
-            guard cgWindowLayer(row) == 0, let id = cgWindowID(row), !session.allWindowIds.contains(id) else { return nil }
+            guard cgWindowLayer(row) == 0, let id = cgWindowID(row), !modelIds.contains(id) else { return nil }
             return id
         })
         func hasUnmanagedOnScreen(_ pid: pid_t) -> Bool {
@@ -778,7 +782,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let unmanagedFailed = onScreenRows.contains { row in
             guard let pid = cgOwnerPID(row), axFailedPids.contains(pid), !isOurProcess(pid),
                   cgWindowLayer(row) == 0, let id = cgWindowID(row) else { return false }
-            return !session.allWindowIds.contains(id)
+            return !modelIds.contains(id)
         }
         if !failedManaged.isEmpty {
             log.info("refresh ax read failed managed pids=\(failedManaged.sorted())")
@@ -789,9 +793,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // Only a just-created window may be rebound: that is the Electron
         // splash-replacement shape. A close plus an unrelated open must not
         // inherit the old window's slot on another workspace.
-        let rebindable = Set((session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId))).filter { isYoung($0) })
+        let rebindable = Set(modelIds.filter { isYoung($0) })
         let delta = reconcile(
-            model: session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId)),
+            model: modelIds,
             modelPids: modelPids,
             live: live,
             rebindableIds: rebindable
@@ -810,11 +814,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // Check suspension before the gate classifies: a pass the lock-screen
         // guard is about to discard must not advance the miss counters.
         if shouldSuspendMassRemoval(
-            modelCount: session.allWindowIds.count,
+            modelCount: modelIds.count,
             removedCount: delta.removed.count,
             screenLocked: screenLockedOrAsleep()
         ) {
-            log.info("refresh suspended mass removal removed=\(delta.removed.count) of \(session.allWindowIds.count); screen locked/asleep")
+            log.info("refresh suspended mass removal removed=\(delta.removed.count) of \(modelIds.count); screen locked/asleep")
             scheduleRefresh(reason: "massLossSuspended", delay: 2.0)
             return
         }
@@ -827,9 +831,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard let el = elements[id], let pid = modelPids[id], adapter.pid(of: el) == pid else { continue }
             if adapter.isAliveElement(el) { elementLive.insert(id) }
         }
+        // One CG liveness snapshot per pass, taken as late as possible so a
+        // window destroyed during AX enumeration is not still counted live.
+        // Used by both the removal gate and the dead-element check.
+        let cgLiveIds = cgWindowIds()
         removals = removalGate.classify(
             removed: delta.removed,
-            cgLive: cgWindowIds(),
+            cgLive: cgLiveIds,
             pidOf: modelPids,
             axFailedPids: failedManaged,
             floatingIds: floatingIds,
@@ -850,8 +858,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // listing it; for the focused space's visible tiles, CG is the
         // aliveness truth.
         let liveIds = Set(live.map(\.cgWindowId))
-        let cgLiveIds = cgWindowIds()
-        let modelIds = session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId))
         let deadElementIds = modelIds.filter { id in
             guard let pid = modelPids[id], !liveIds.contains(id), !failedManaged.contains(pid) else {
                 return false
@@ -905,16 +911,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 if let pid = adapter.pid(of: el) { observers.watchWindow(el, pid: pid) }
             }
         }
-        var claimed = session.allWindowIds.union(elements.keys).union(session.nativeFSWindows.map(\.cgWindowId))
+        // Recompute here, after removals/recycles, so a recycled id is not in
+        // the exclusion set when its replacement is adopted.
+        var claimed = session.allWindowIds.union(elements.keys)
         for id in delta.added + delta.recycled {
             guard let el = elementsById[id] else { continue }
             onCreate(el, claimed: &claimed, apply: false, space: space)
         }
+        // Nothing entered or left the model: skip the hidden-space park sweep
+        // (an AX read per parked window) and only re-apply frames. The next
+        // pass that changes the model re-parks anything that drifted.
+        let modelChanged = !delta.isEmpty || !deadElementIds.isEmpty
         applyFrames()
         if let receivedAt {
             refreshLatency.record(milliseconds: Date().timeIntervalSince(receivedAt) * 1000)
         }
-        restashOffspace()
+        if modelChanged {
+            restashOffspace()
+        }
         if !delta.isEmpty || refreshUnresolved || !removals.deferred.isEmpty {
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             log.info("refresh reason=\(reason) added=\(delta.added.count + delta.recycled.count) removed=\(removals.real.count) deferred=\(removals.deferred.count) rebinds=\(delta.rebinds.count) unresolved=\(refreshUnresolved) \(ms)ms")
