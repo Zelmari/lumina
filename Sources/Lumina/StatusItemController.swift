@@ -84,6 +84,25 @@ final class StatusItemController {
         )
     }
 
+    /// Optimistically highlight a workspace the user just selected, before the
+    /// authoritative status arrives. The next poll either confirms it (no
+    /// visible change) or corrects the highlight.
+    func showPendingSpace(_ n: Int) {
+        guard current, n != focused else { return }
+        focused = n
+        let tip = [warning.tooltip, loginNote].compactMap { $0 }.joined(separator: "\n")
+        apply(
+            statusStrip(
+                spaceCount: spaceCount,
+                focused: n,
+                paused: paused,
+                warning: warning != .none,
+                current: true
+            ),
+            tooltip: tip.isEmpty ? nil : tip
+        )
+    }
+
     private func apply(_ model: StatusStripModel, tooltip: String?) {
         stripView?.warningTooltip = warning.tooltip
         stripView?.inactiveTooltip = loginNote

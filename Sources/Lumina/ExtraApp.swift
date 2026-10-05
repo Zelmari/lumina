@@ -64,7 +64,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
     func start() {
         log.info("menu extra start")
         writeDefaultConfigIfNeeded()
-        status.onDigit = { [weak self] n in self?.sendToCurrent(.workspace(id: n)) }
+        status.onDigit = { [weak self] n in self?.selectSpace(n) }
         status.onOpenConfig = { [weak self] in self?.openConfig() }
         status.onGrantAccessibility = { [weak self] in self?.grantAccessibility() }
         status.onReload = { [weak self] in self?.sendToCurrent(.reload) }
@@ -85,6 +85,16 @@ final class ExtraController: NSObject, @unchecked Sendable {
             log.error("menu socket bind failed path=\(menuPath) \(error)")
         }
         menuServer = server
+        // Free OS events beat waiting up to a timer interval: poll on native
+        // Space changes, app activation, and wake.
+        let nc = NSWorkspace.shared.notificationCenter
+        for name in [
+            NSWorkspace.activeSpaceDidChangeNotification,
+            NSWorkspace.didActivateApplicationNotification,
+            NSWorkspace.didWakeNotification,
+        ] {
+            nc.addObserver(self, selector: #selector(workspaceChanged(_:)), name: name, object: nil)
+        }
         bootRegistry()
         maybeFirstRun()
         let timer = DispatchSource.makeTimerSource(queue: statusQueue)
@@ -388,6 +398,17 @@ final class ExtraController: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Strip click: highlight the digit immediately, send the command and
+    /// reconcile off the main thread. Blocking main on the switch delays the
+    /// very update the user is waiting for.
+    func selectSpace(_ n: Int) {
+        status.showPendingSpace(n)
+        statusQueue.async { [weak self] in
+            self?.sendToCurrent(.workspace(id: n))
+            self?.pollStatus()
+        }
+    }
+
     func sendToCurrent(_ cmd: AgentCmd) {
         guard let rec = currentRecord() else { return }
         sendTo(instance: rec.instanceId, socket: rec.socket, cmd)
@@ -468,12 +489,18 @@ final class ExtraController: NSObject, @unchecked Sendable {
         ])
     }
 
+    @objc func workspaceChanged(_ notification: Notification) {
+        pollStatus()
+    }
+
     func togglePause() {
         if status.pausedNow {
             sendToCurrent(.resume)
         } else {
             sendToCurrent(.pause)
         }
+        // Don't wait for the next timer tick to show the pause state.
+        pollStatus()
     }
 
     func quitCurrent() {
