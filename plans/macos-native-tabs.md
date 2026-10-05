@@ -49,9 +49,39 @@ removals deferred. This must be bounded independently of the tab work.
 - Two genuinely separate windows of the same app tiled side by side.
 - Multi-display tab semantics beyond the current one-display model.
 
+## Spec-first harness (methodology)
+
+The harness must encode intended, user-visible behavior, not mirror the
+implementation. Rules for this branch:
+
+1. **Red first.** Every behavior gets a failing harness assertion before the
+   fix. T0 is the Terminal-tab regression that must fail on `main`.
+2. **Independent oracle.** Measurement comes from the OS and the CLI — a
+   standalone `CGWindowList` helper under `scripts/` plus `lumina` commands —
+   never from the code's own model. `lumina verify` is a diagnostic, not the
+   only oracle.
+3. **Absolute expectations**, not just relative diffs: one logical window =
+   one tile; a lone window fills the usable rect; tiles cover the usable
+   rect; hidden-workspace windows are outside the display; every managed id
+   exists in the OS window list.
+4. **Golden geometry** for deterministic scenarios, diffed on every run and
+   updated only deliberately.
+5. **Logs are diagnostics.** Quit restore is checked with real window bounds
+   after quit, not by grepping the agent log.
+6. **Negative cases** included: last tab closed, tab dragged out into its
+   own window, quit from fullscreen, app hidden at launch.
+
 ## Design
 
 Two routes, tried in order. The exact route needs a runtime probe first.
+
+### T0 — Red-first harness regression (Terminal tabs)
+
+Write the T6 Terminal-tab section and run it against `main` **before any
+product change**: one Terminal window, add tabs, switch forward/back several
+times. It must fail (managed window count grows by one per tab visited,
+`verify` reports tiles with no matching on-screen window). Commit the test
+first so the fix commit is verifiable against a real red baseline.
 
 ### T1 — Probe AX tab metadata (diagnostic, keeper)
 
@@ -87,13 +117,34 @@ Questions to answer on Terminal.app and Ghostty:
   inserting; remember the previous tab ids per pid so switching back
   rebinds again. Never applies to `.floating`/dialog/hard-float windows.
 
-### T4 — Opt-in config
+### T4 — Config (decided: top-level app list)
 
-- `[[window-rule]]` gains `tabs = "native"` (or `action = "native-tabs"`)
-  applied only to listed bundle ids; default off. Document
-  `com.apple.Terminal` and `com.mitchellh.ghostty` in `docs/compat.md`.
-- Keep the generic path behind this flag so a heuristic misfire cannot
-  affect other apps.
+Add a top-level table, parsed once at startup/reload:
+
+```toml
+[native-tabs]
+apps = ["com.apple.Terminal", "com.mitchellh.ghostty"]
+```
+
+Default empty. Consulted when a window is adopted: those bundle ids get
+tab-group handling (exact route if T1 succeeds, otherwise the T3 rebind).
+
+Why this and not a `[[window-rule]]`:
+
+- Window rules are **per window**, optionally title-matched, ordered with
+  last-match-wins, and answer tile/float/ignore. Native tabbing is an
+  **app-level** property of the app's windowing implementation, and it must
+  be known before a window is classified and adopted.
+- Mixing it into rule ordering invites contradictions (`action = "float"`
+  plus `tabs = "native"`) and title dependence that the behavior does not
+  have.
+- A top-level list has no ordering or title semantics, is trivial to expose
+  in `status`/debug output (`nativeTabsApps`), and leaves room to add
+  options later (e.g. `mode = "auto" | "rebind"`) without a breaking change.
+
+If T1's exact detection is reliable, the list can default to the two known
+apps; it stays as an escape hatch either way. Document both apps in
+`docs/compat.md`.
 
 ### T5 — Bound the overflow loop
 
@@ -106,18 +157,21 @@ Questions to answer on Terminal.app and Ghostty:
 Extend `scripts/harness.sh` with a native-tabs section:
 
 1. Open one Terminal window (`open -n -a Terminal`).
-2. Add tabs: System Events `keystroke "t" using command down` (requires
-   Accessibility for the harness runner). If not permitted, skip the tab
-   steps with a clear warning and keep the window-level checks.
+2. Add tabs with System Events (`keystroke "t" using command down`). This
+   requires Accessibility permission for the harness runner. **The user has
+   confirmed they will grant it at the prompt**, so treat a permission
+   failure as a hard error with a clear message — not a silent skip.
 3. Switch tabs forward/back (`keystroke "]" using command down`, then
    `"["`), several times.
-4. Assert: managed Terminal window count stays 1; `verify` clean; no window
-   ids lost; geometry converges and is stable; record artifacts.
-5. Close the extra tabs (Cmd-W via System Events) and the window.
+4. Assert with the independent oracle and the CLI: managed Terminal window
+   count stays 1; the one tile fills the usable rect; `verify` clean; no
+   window ids lost; geometry converges and is stable; record artifacts.
+5. Close the extra tabs (Cmd-W via System Events) and the window; assert the
+   count returns to baseline.
 6. Keep the existing TextEdit suite and all current assertions unchanged.
 
 Add `--tabs-only`/`TABS_TEST=1` so this section can run alone while
-iterating, and include it in the default run when permission allows.
+iterating, and include it in the default run.
 
 ### T7 — Docs
 
@@ -139,11 +193,12 @@ iterating, and include it in the default run when permission allows.
 
 ## Risks and rollback
 
-- Heuristic misfire: opt-in rule, default off; each step is its own commit
-  and can be reverted independently.
+- Heuristic misfire: top-level opt-in list, default empty; each step is its
+  own commit and can be reverted independently.
 - T1 shows no window mapping: fall back to T3; exact route dropped.
-- System Events permission missing: tab steps skip with a warning; manual
-  testing still covers it.
+- System Events permission is expected and will be granted at the prompt; if
+  it is later revoked, the tab section fails loudly with a clear message
+  instead of passing quietly.
 - Tab windows on other native Spaces are out of scope; they stay ignored as
   they are today.
 
@@ -158,7 +213,7 @@ iterating, and include it in the default run when permission allows.
 
 1. Does Terminal/Ghostty expose `AXTabGroup`/`AXTabs` with a window mapping?
    (T1 answers before any heuristic code is written.)
-2. Config shape: `tabs = "native"` on `[[window-rule]]` vs a top-level
-   `[native-tabs]` bundle-id list.
-3. Should the tile keep the group's original slot when the user drags one
+2. Should the tile keep the group's original slot when the user drags one
    tab out into its own window (out of scope now; decide if it appears).
+
+Resolved: config shape is the top-level `[native-tabs] apps` list (T4).
