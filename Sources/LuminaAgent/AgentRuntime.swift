@@ -47,8 +47,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var reason: String
         var space: SpaceId
         /// When the first event of this coalesced burst arrived. The delta to
-        /// the end of `applyFrames` is the latency users feel.
-        var receivedAt: Date
+        /// the end of `applyFrames` is the latency users feel. Nil for
+        /// internal settle/retry timers whose delay is deliberate.
+        var receivedAt: Date?
     }
     var pendingRefresh: RefreshRequest?
     var refreshScheduled = false
@@ -668,7 +669,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // window appeared on the workspace they had left.
         // Keep the first event's timestamp across coalesced bursts so the
         // recorded latency covers the whole wait, not just the last event.
-        let receivedAt = pendingRefresh?.receivedAt ?? Date()
+        // Only event-driven schedules (the default short delay) get one; a
+        // deliberate settle delay would otherwise show up as user latency.
+        let receivedAt: Date? = delay <= 0.05
+            ? (pendingRefresh?.receivedAt ?? Date())
+            : pendingRefresh?.receivedAt
         pendingRefresh = RefreshRequest(reason: reason, space: session.focusedSpace, receivedAt: receivedAt)
         guard !refreshScheduled else { return }
         refreshScheduled = true
