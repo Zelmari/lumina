@@ -542,7 +542,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard isCurrent, !userPaused else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             let pid = app.processIdentifier
-            DispatchQueue.main.async { self.observers.watch(pid: pid) }
+            // Watch on this turn, not one main-queue hop later: a window the
+            // app creates during launch can otherwise outrun the observer and
+            // force the slow poll ladder.
+            if Thread.isMainThread {
+                observers.watch(pid: pid)
+            } else {
+                DispatchQueue.main.async { self.observers.watch(pid: pid) }
+            }
             MutationQueue.shared.hop { [weak self] in
                 guard let self else { return }
                 self.recentlyLaunchedPids[pid] = Date()
@@ -576,6 +583,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     @objc func appActivated(_ n: Notification) {
         guard !userPaused, isCurrent else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+            // Insurance for a launch notification whose observer install
+            // failed: activation is frequent and watch() is idempotent.
+            observers.watch(pid: app.processIdentifier)
             MutationQueue.shared.hop {
                 self.scheduleRefresh(reason: "appActivated")
                 if self.ownedWindows(pid: app.processIdentifier).isEmpty {
@@ -635,7 +645,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if name == kAXUIElementDestroyedNotification {
                 lastWindowClosedAt = Date()
             }
-            scheduleRefresh(reason: name)
+            // A created window is the visible path: no coalescing delay, so
+            // the pass starts as soon as the queue is free.
+            scheduleRefresh(reason: name, delay: name == kAXWindowCreatedNotification ? 0 : 0.015)
         case kAXFocusedWindowChangedNotification:
             let win = adapter.focusedWindow(of: element)
                 ?? adapter.focusedWindow(of: AXUIElementCreateApplication(pid))
