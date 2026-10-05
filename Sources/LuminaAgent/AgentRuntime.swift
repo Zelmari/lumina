@@ -653,16 +653,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func handleAX(pid: pid_t, name: String, element: AXUIElement) {
         if userPaused || displayGone || !isCurrent { return }
         switch name {
-        case kAXWindowCreatedNotification, kAXUIElementDestroyedNotification:
+        case kAXWindowCreatedNotification, kAXCreatedNotification, kAXUIElementDestroyedNotification:
             if name == kAXUIElementDestroyedNotification {
                 lastWindowClosedAt = Date()
             }
             if name == kAXWindowCreatedNotification {
                 preParkNewWindow(element)
+            } else if name == kAXCreatedNotification {
+                // Generic element creation fires for every AX element. Filter
+                // to window elements with a local id lookup before any AX read,
+                // so tree churn never pays for a role probe.
+                if adapter.windowIdIfKnown(for: element) != nil {
+                    preParkNewWindow(element)
+                }
             }
             // A created window is the visible path: no coalescing delay, so
             // the pass starts as soon as the queue is free.
-            scheduleRefresh(reason: name, delay: name == kAXWindowCreatedNotification ? 0 : 0.015)
+            let created = name != kAXUIElementDestroyedNotification
+            scheduleRefresh(reason: name, delay: created ? 0 : 0.015)
         case kAXFocusedWindowChangedNotification:
             let win = adapter.focusedWindow(of: element)
                 ?? adapter.focusedWindow(of: AXUIElementCreateApplication(pid))
@@ -1130,9 +1138,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let receivedAt {
             let ms = Date().timeIntervalSince(receivedAt) * 1000
             refreshLatency.record(milliseconds: ms)
-            if reason == kAXWindowCreatedNotification {
+            if reason == kAXWindowCreatedNotification || reason == kAXCreatedNotification {
                 createdLatency.record(milliseconds: ms)
-            } else if reason == "appLaunched" || reason == "appActivated" {
+            } else if reason == "appLaunched" || reason == "appActivated" || reason == "launchWatch" {
                 launchedLatency.record(milliseconds: ms)
             }
         }

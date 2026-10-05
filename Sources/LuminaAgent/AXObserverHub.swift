@@ -43,6 +43,10 @@ public final class AXObserverHub: @unchecked Sendable {
         let app = AXUIElementCreateApplication(pid)
         let appNotes = [
             kAXWindowCreatedNotification,
+            // Generic element creation. It arrives before the window-specific
+            // note for some apps and is what yabai uses as its primary signal;
+            // the handler filters it down to window elements cheaply.
+            kAXCreatedNotification,
             kAXFocusedWindowChangedNotification,
             kAXApplicationHiddenNotification,
         ]
