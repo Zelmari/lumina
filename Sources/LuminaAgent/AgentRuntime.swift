@@ -53,6 +53,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
     var pendingRefresh: RefreshRequest?
     var refreshScheduled = false
+    /// The in-flight coalescing timer. Kept so a fresh event can preempt a
+    /// long internal retry (deferred removal, unresolved, overflow check)
+    /// instead of waiting behind it.
+    var refreshWorkItem: DispatchWorkItem?
+    var refreshIsEventDriven = false
     /// Event-to-frame latency of completed refresh sessions. Exposed in
     /// `debug-windows` and `status` so the harness can assert on it.
     var refreshLatency = LatencyStats(capacity: 256)
@@ -208,6 +213,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         stopLock.unlock()
         pendingRefresh = nil
         refreshScheduled = false
+        refreshWorkItem?.cancel()
+        refreshWorkItem = nil
         for item in resizeDebounce.values { item.cancel() }
         resizeDebounce.removeAll()
         configDebounce?.cancel()
@@ -675,15 +682,27 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             ? (pendingRefresh?.receivedAt ?? Date())
             : pendingRefresh?.receivedAt
         pendingRefresh = RefreshRequest(reason: reason, space: session.focusedSpace, receivedAt: receivedAt)
-        guard !refreshScheduled else { return }
+        if refreshScheduled {
+            // A fresh event must not wait behind an internal retry timer with
+            // a deliberate delay. An event already scheduled fires as planned;
+            // a later event just joins it.
+            guard delay <= 0.05, !refreshIsEventDriven else { return }
+            refreshWorkItem?.cancel()
+            refreshScheduled = false
+        }
         refreshScheduled = true
-        MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+        refreshIsEventDriven = delay <= 0.05
+        let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.refreshScheduled = false
+            self.refreshIsEventDriven = false
+            self.refreshWorkItem = nil
             guard let request = self.pendingRefresh else { return }
             self.pendingRefresh = nil
             self.runRefresh(reason: request.reason, space: request.space, receivedAt: request.receivedAt)
         }
+        refreshWorkItem = work
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     /// Chromium/Electron can answer AXWindows with an empty or partial list.
