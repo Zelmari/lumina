@@ -219,6 +219,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             })
             session.spaces[rebuild] = space
         }
+        clampOverflowOn(rebuild)
         applyFrames()
         watchRunningApps()
         startOrStopFFM()
@@ -982,6 +983,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if result == .tiled, space.floating.contains(where: { $0.cgWindowId == id }) {
             log.info("rebind retile window=\(id) pid=\(pid)")
             session = session.tileFloater(space: sid, cgWindowId: id, usableIsWide: usableIsWide(usable))
+            clampOverflowOn(sid)
         } else if result == .floating, let leaf = space.leaf(containing: id) {
             log.info("rebind refloat window=\(id) pid=\(pid)")
             session = session.floatLeaf(space: sid, nodeId: leaf.id).0
@@ -1234,6 +1236,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 let from = session.focusedSpace.raw
                 session = session.moveNodeToWorkspace(id, usableIsWide: usableIsWide(usable))
                 log.info("move-node-to-workspace window=\(focused) \(from)->\(id.raw) focusedSpace=\(session.focusedSpace.raw)")
+                clampOverflowOn(id)
                 // The destination may hold parked windows; bring them back
                 // before laying out, like switchSpace does.
                 unstashSpace(id)
@@ -2123,6 +2126,27 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Float any window whose minimum size cannot fit its tile, so an app that
+    /// refuses to shrink cannot permanently overlap its neighbour. Falls back
+    /// on the focused (newest) leaf, like the insert path.
+    @discardableResult
+    func clampOverflowOn(_ spaceId: SpaceId) -> Bool {
+        guard let bound, session.spaces[spaceId] != nil else { return false }
+        let usable = bound.usableRect(gaps: config.gaps)
+        let (clamped, floated) = session.clampOverflow(
+            space: spaceId,
+            minSizes: minSizes(),
+            usable: usable,
+            gaps: config.gaps,
+            preferFloat: session.spaces[spaceId]?.lastTiledLeaf
+        )
+        session = clamped
+        if !floated.isEmpty {
+            placeFloated(floated, space: spaceId)
+        }
+        return !floated.isEmpty
+    }
+
     func minSizes() -> [UInt32: Size] {
         var out: [UInt32: Size] = [:]
         for (id, el) in elements {
@@ -2338,6 +2362,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             displayGone = false
             refreshBound()
             if isCurrent, !userPaused { registerHotkeys() }
+            clampOverflowOn(session.focusedSpace)
+            applyFrames()
+            restashOffspace()
+            return
+        }
+        // Still attached, but the usable geometry may have changed (scaled
+        // resolution, Dock/menu bar, another display added). Re-apply so no
+        // tile keeps a rect computed against the old frame.
+        refreshBound()
+        if isCurrent, !userPaused {
+            clampOverflowOn(session.focusedSpace)
             applyFrames()
             restashOffspace()
         }
