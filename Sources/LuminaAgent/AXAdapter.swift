@@ -60,6 +60,11 @@ public final class AXAdapter {
     private var accessibilityWakeAt: [pid_t: Date] = [:]
     private var accessibilityHealthy: Set<pid_t> = []
     private var accessibilityDelivered: Set<pid_t> = []
+    /// Application element and last observed AXEnhancedUserInterface value.
+    /// Every frame write toggles that flag, and the prior value used to cost
+    /// an application-element creation plus an attribute read per window.
+    private var enhancedUICache: [pid_t: (app: AXUIElement, prior: Bool, at: Date)] = [:]
+    private let enhancedUICacheTTL: TimeInterval = 2
     private let accessibilityWakeRetry: TimeInterval = 2
     private let log: LuminaLog
     public var menuBarScreenMaxY: Double = 0
@@ -236,6 +241,7 @@ public final class AXAdapter {
         accessibilityWakeAt[pid] = nil
         accessibilityHealthy.remove(pid)
         accessibilityDelivered.remove(pid)
+        enhancedUICache[pid] = nil
         lock.unlock()
     }
 
@@ -386,17 +392,34 @@ public final class AXAdapter {
     /// In macOS Accessibility, AXEnhancedUserInterface is an application-level attribute.
     /// When true, macOS forces animations on window moves and resizes. Setting it to false
     /// temporarily disables window animations so moves and resizes snap immediately.
+    /// The application element and its prior value are cached briefly: a reflow
+    /// writes many windows and must not pay an app creation plus an attribute
+    /// read for each one.
     private func disableAnimations(_ element: AXUIElement) -> () -> Void {
         guard let pid = pid(of: element) else { return {} }
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, axWriteTimeout)
         let attr = "AXEnhancedUserInterface" as CFString
-        var ref: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, attr, &ref) == .success else {
-            // Restoring needs the prior value; without it, never disable the flag.
-            return {}
+        let now = Date()
+        lock.lock()
+        let cached = enhancedUICache[pid]
+        lock.unlock()
+        let app: AXUIElement
+        let prior: Bool
+        if let cached, now.timeIntervalSince(cached.at) < enhancedUICacheTTL {
+            app = cached.app
+            prior = cached.prior
+        } else {
+            app = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(app, axWriteTimeout)
+            var ref: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(app, attr, &ref) == .success else {
+                // Restoring needs the prior value; without it, never disable the flag.
+                return {}
+            }
+            prior = (ref as? Bool) ?? false
+            lock.lock()
+            enhancedUICache[pid] = (app, prior, now)
+            lock.unlock()
         }
-        let prior = ref as? Bool
         AXUIElementSetAttributeValue(app, attr, kCFBooleanFalse)
         return {
             if prior == true {
