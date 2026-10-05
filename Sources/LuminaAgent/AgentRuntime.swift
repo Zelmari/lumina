@@ -99,6 +99,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     let launchWatchSlowInterval: TimeInterval = 0.05
     let launchWatchFirstPhaseSeconds: TimeInterval = 0.4
     let launchWatchMaxSeconds: TimeInterval = 2.0
+    /// Pids hidden from launch until their first window is tiled (opt-in via
+    /// `hide-until-tiled-apps`). Bounded by a timeout so an app is never
+    /// stranded hidden. Mutation-queue owned.
+    var shieldedPids: Set<pid_t> = []
+    var shieldTimeouts: [pid_t: DispatchWorkItem] = [:]
+    /// Pids that have been through the shield once. The shield applies to an
+    /// app's first window after launch; the later didLaunch note must not hide
+    /// a process that was already revealed.
+    var shieldedOnce: Set<pid_t> = []
+    /// Pids whose window was adopted this pass while shielded; revealed after
+    /// applyFrames so the app first appears already tiled.
+    var pendingShieldReveal: Set<pid_t> = []
+    let shieldTimeout: TimeInterval = 1.5
     /// Bounded follow-up passes when a window was not resolvable yet.
     var unresolvedRefreshPasses = 0
     var refreshUnresolved = false
@@ -267,6 +280,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         refreshWorkItem?.cancel()
         refreshWorkItem = nil
         cancelAllLaunchWatches()
+        // Never leave an app hidden after Lumina quits.
+        for pid in Array(shieldedPids) {
+            shieldTimeouts.removeValue(forKey: pid)?.cancel()
+            adapter.unhide(pid: pid)
+        }
+        shieldedPids.removeAll()
+        shieldedOnce.removeAll()
+        pendingShieldReveal.removeAll()
         for item in resizeDebounce.values { item.cancel() }
         resizeDebounce.removeAll()
         configDebounce?.cancel()
@@ -481,7 +502,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     excludingWindowIds: used
                 ) else { continue }
                 adapter.markAccessibilityHealthy(pid: pid)
-                if adapter.isAppHidden(pid: pid) {
+                let shielded = shieldedPids.contains(pid)
+                if adapter.isAppHidden(pid: pid), !shielded {
                     // Unhide and re-check on the next pass; only a window
                     // that becomes on-screen is adopted.
                     adapter.unhide(pid: pid)
@@ -489,7 +511,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     refreshUnresolved = true
                     continue
                 }
-                let result = classify(input, rules: config.windowRules)
+                let result = shielded
+                    ? classify(input, rules: config.windowRules, ignoringOnScreen: true)
+                    : classify(input, rules: config.windowRules)
                 log.info(
                     "classify \(app.bundleIdentifier ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
                 )
@@ -508,6 +532,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 let w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: original)
                 knownOriginals[id] = original
                 markBorn(id)
+                if shielded { pendingShieldReveal.insert(pid) }
                 used.insert(id)
                 out.append(w)
             }
@@ -573,6 +598,52 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         nc.addObserver(self, selector: #selector(spaceChanged(_:)), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         nc.addObserver(self, selector: #selector(didWake(_:)), name: NSWorkspace.didWakeNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged(_:)), name: NSApplication.didChangeScreenParametersNotification, object: nil)
+    }
+
+    // MARK: - Launch shield
+
+    /// Hide a launching app until its first window is tiled, when its bundle
+    /// is in `hide-until-tiled-apps`. Never called unless the user opted in.
+    func shieldAppIfConfigured(pid: pid_t) {
+        guard !shieldedOnce.contains(pid) else { return }
+        guard let bundle = adapter.bundleId(pid: pid), config.hideUntilTiledApps.contains(bundle) else { return }
+        guard shieldedPids.insert(pid).inserted else { return }
+        shieldedOnce.insert(pid)
+        let hidden = adapter.hide(pid: pid)
+        let item = DispatchWorkItem { [weak self] in self?.unshield(pid: pid, reason: "timeout") }
+        shieldTimeouts[pid] = item
+        MutationQueue.shared.queue.asyncAfter(deadline: .now() + shieldTimeout, execute: item)
+        log.info("launch shield hide pid=\(pid) bundle=\(bundle) hidden=\(hidden)")
+        if !hidden {
+            // The app may not have checked in yet, where hide() is a no-op.
+            // Retry briefly; the shield timeout still bounds it.
+            for delay in [0.1, 0.3] {
+                MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                    guard let self, self.shieldedPids.contains(pid) else { return }
+                    _ = self.adapter.hide(pid: pid)
+                }
+            }
+        }
+    }
+
+    /// Reveal a shielded app and schedule a settle pass; unhiding changes what
+    /// CG lists on screen, and the app may repaint or reposition.
+    func unshield(pid: pid_t, reason: String) {
+        guard shieldedPids.remove(pid) != nil else { return }
+        shieldTimeouts.removeValue(forKey: pid)?.cancel()
+        pendingShieldReveal.remove(pid)
+        adapter.unhide(pid: pid)
+        adapter.activate(pid: pid)
+        log.info("launch shield reveal pid=\(pid) reason=\(reason)")
+        scheduleRefresh(reason: "shieldUnhide", delay: 0.05, eventDriven: false)
+    }
+
+    /// Forget a shield without revealing (the app is terminating or stopped).
+    func dropShield(pid: pid_t) {
+        shieldedPids.remove(pid)
+        shieldedOnce.remove(pid)
+        shieldTimeouts.removeValue(forKey: pid)?.cancel()
+        pendingShieldReveal.remove(pid)
     }
 
     // MARK: - Launch watch
@@ -682,6 +753,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
             self.launchPollDelay = 0.25
             self.startLaunchWatch(pid: pid, reason: "willLaunch")
+            self.shieldAppIfConfigured(pid: pid)
             self.scheduleRefresh(reason: "willLaunch")
         }
     }
@@ -704,6 +776,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
                 self.launchPollDelay = 0.25
                 self.startLaunchWatch(pid: pid, reason: "appLaunched")
+                self.shieldAppIfConfigured(pid: pid)
                 self.scheduleRefresh(reason: "appLaunched")
             }
         }
@@ -714,6 +787,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             MutationQueue.shared.hop {
                 self.recentlyLaunchedPids[app.processIdentifier] = nil
                 self.cancelLaunchWatch(pid: app.processIdentifier)
+                self.dropShield(pid: app.processIdentifier)
                 self.observers.unwatch(pid: app.processIdentifier)
                 self.adapter.forgetAccessibility(pid: app.processIdentifier)
                 self.dropPid(app.processIdentifier)
@@ -725,6 +799,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
                 guard self.isCurrent, !self.userPaused, !self.ownedWindows(pid: app.processIdentifier).isEmpty else { return }
+                // A shielded app is hidden on purpose until its window tiles.
+                guard !self.shieldedPids.contains(app.processIdentifier) else { return }
                 self.adapter.unhide(pid: app.processIdentifier)
             }
         }
@@ -742,6 +818,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 // activating app's window: siblings are settled when it
                 // appears instead of shifting around it.
                 self.applyFrames()
+                if self.shieldedPids.contains(app.processIdentifier) { return }
                 if self.ownedWindows(pid: app.processIdentifier).isEmpty {
                     self.launchPollsRemaining = max(self.launchPollsRemaining, 3)
                     self.launchPollDelay = 0.25
@@ -1410,6 +1487,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // pass that changes the model re-parks anything that drifted.
         let modelChanged = !delta.isEmpty || !deadElementIds.isEmpty
         applyFrames(cgLive: cgLiveIds)
+        // A shielded app is revealed only now, after the pass has written the
+        // tile, so it first appears already placed.
+        if !pendingShieldReveal.isEmpty {
+            for pid in Array(pendingShieldReveal) {
+                unshield(pid: pid, reason: "tiled")
+            }
+        }
         if let receivedAt {
             let ms = Date().timeIntervalSince(receivedAt) * 1000
             refreshLatency.record(milliseconds: ms)
@@ -1563,7 +1647,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             refreshUnresolved = true
             return
         }
-        if adapter.isAppHidden(pid: pid) {
+        let shielded = shieldedPids.contains(pid)
+        if adapter.isAppHidden(pid: pid), !shielded {
             // A background launch (open/AppleScript) leaves the app hidden.
             // Unhide it and re-check next pass: only a window that actually
             // becomes on-screen is adopted, so hidden tabs and twins stay
@@ -1605,7 +1690,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if apply { applyFrames() }
             return
         }
-        let result = classify(input, rules: config.windowRules)
+        let result = shielded
+            ? classify(input, rules: config.windowRules, ignoringOnScreen: true)
+            : classify(input, rules: config.windowRules)
         log.info(
             "onCreate \(input.bundleId ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
         )
@@ -1687,6 +1774,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // Adopted; stop treating the pid as a pending launch.
         recentlyLaunchedPids[pid] = nil
         cancelLaunchWatch(pid: pid)
+        if shielded { pendingShieldReveal.insert(pid) }
         if targetId != session.focusedSpace {
             // The user moved on before this window settled. It belongs to the
             // space that was focused when it appeared; stash its role and
@@ -3375,6 +3463,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func dropPid(_ pid: pid_t) {
         cancelLaunchWatch(pid: pid)
+        dropShield(pid: pid)
         let fsBefore = session.current.luminaFullscreen
         // The element map can already be empty for a closed window (the
         // liveness probe cleared it), so union with the model's own ids.
@@ -3411,6 +3500,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// the native focused window id changed since the last sync; re-processing
     /// the same window caused focus ping-pong on every activation.
     func syncFocusToFrontmostApp(pid: pid_t) {
+        // A shielded app is hidden; do not follow focus to a window nobody
+        // can see yet. The reveal schedules its own settle pass.
+        guard !shieldedPids.contains(pid) else { return }
         let app = AXUIElementCreateApplication(pid)
         guard let focused = adapter.focusedWindow(of: app).flatMap({ adapter.windowId(for: $0) }),
               ownedAnywhere(focused),
@@ -3546,7 +3638,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 log.info("launch-apps skip unknown \(id)")
                 continue
             }
-            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration()) { _, err in
+            let configuration = NSWorkspace.OpenConfiguration()
+            if config.hideUntilTiledApps.contains(id) {
+                // Launch hidden; the launch shield reveals it after its first
+                // window is tiled. The willLaunch handler also hides as a
+                // fallback for apps that ignore this.
+                configuration.activates = false
+                configuration.hides = true
+            }
+            NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, err in
                 if err != nil { self.log.info("launch-apps failed \(id)") }
             }
         }

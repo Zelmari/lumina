@@ -482,6 +482,24 @@ public final class AXAdapter {
         }
     }
 
+    /// Best-effort hide, used by the launch shield before a window is visible.
+    /// False means the app has not finished checking in or refuses to hide; the
+    /// shield times out and reveals normally.
+    @discardableResult
+    public func hide(pid: pid_t) -> Bool {
+        NSRunningApplication(processIdentifier: pid)?.hide() ?? false
+    }
+
+    /// Bring an app forward after the shield reveals its window.
+    public func activate(pid: pid_t) {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return }
+        if #available(macOS 14.0, *) {
+            app.activate()
+        } else {
+            app.activate(options: [.activateIgnoringOtherApps])
+        }
+    }
+
     public func hasZoomButton(_ element: AXUIElement) -> Bool {
         var ref: CFTypeRef?
         if AXUIElementCopyAttributeValue(element, kAXZoomButtonAttribute as CFString, &ref) == .success,
