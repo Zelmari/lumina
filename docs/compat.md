@@ -16,4 +16,6 @@ System UI (Spotlight, Notification Center, Control Center, permission sheets, lo
 | Zoom | `us.zoom.xos` | Jumps away from the standard 1 px corner park, so a hidden window can come back on screen. | none: the agent parks Zoom with a 0 inset (`stashFrame(inset: 0)`). Add `action = "float"` if meeting windows land on the wrong Space. |
 | Electron/Chromium splash-window apps (Discord, Slack, VS Code) | varies | The splash window and the real window have different `CGWindowID`s, so one refresh pass sees one id replace another. | none in most cases: a one-in/one-out pass rebinds the ids for that pid. Add `action = "float"` for an app whose splash never settles into a tile. |
 
-Native tab groups: only the on-screen tab is a tile. Hidden tab windows are ignored until they become visible. That public heuristic will be wrong for some apps — record them here.
+Native tab groups: macOS implements each tab as a separate `NSWindow`, so the window APIs report every tab as a window. Lumina keeps one tile per app window and swaps the backing window on a tab switch. Configure the apps under `[native-tabs] apps = [...]` (Terminal and Ghostty ship by default). Safari draws its own tab bar in one window and is not affected.
+
+Known native-tab apps: `com.apple.Terminal` (exposes an `AXTabGroup`), `com.mitchellh.ghostty` (tabs appear as separate AX windows). Add others to the list if they exhibit ghost tiles on tab switches.
