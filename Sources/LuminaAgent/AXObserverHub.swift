@@ -50,7 +50,10 @@ public final class AXObserverHub: @unchecked Sendable {
         for n in appNotes {
             AXObserverAddNotification(observer, app, n as CFString, refcon)
         }
-        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        // .commonModes, not .defaultMode: a window can be created while the
+        // main run loop is in a tracking/modal mode (menu open, drag), and
+        // .defaultMode defers the note until that mode ends.
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         observers[pid] = observer
     }
 
@@ -111,7 +114,7 @@ public final class AXObserverHub: @unchecked Sendable {
         // terminated app to remove each window note.
         watchedWindows[pid] = nil
         guard let observer = observers.removeValue(forKey: pid) else { return }
-        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode)
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
     }
 }
 #endif
