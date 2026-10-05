@@ -121,6 +121,11 @@ extension Session {
     }
 
     /// After insert and after display-frame change.
+    ///
+    /// Dwindle splits are the product: this never rebalances ratios to
+    /// accommodate a minimum size. A window whose subtree cannot fit its
+    /// current span is floated instead, so the remaining tiles keep the
+    /// splits the user (or the spiral) chose.
     public func clampOverflow(
         space spaceId: SpaceId,
         minSizes: [UInt32: Size],
@@ -144,28 +149,19 @@ extension Session {
                     return lhs.id.raw < rhs.id.raw
                 }
             for container in containers {
-                let b = container.children[1]
                 guard let current = session.spaces[spaceId] else { break }
-                if let adjusted = clampSibling(
-                    parent: container,
+                guard let offenderChild = overflowingChild(
+                    container: container,
                     space: current,
                     minSizes: minSizes,
                     usable: usable,
                     gaps: gaps,
-                    floor: sliverFloor,
-                    unknownUsesFloor: true
-                ) {
-                    if adjusted.ratio != container.ratio {
-                        var s = current
-                        s.setNode(adjusted)
-                        session.spaces[spaceId] = s
-                        break
-                    }
-                    continue
-                }
-                // Both cannot fit. Prefer floating the newly inserted / focused leaf,
-                // including when it sits under a nested container.
-                let offender = leafToFloat(in: container, space: space, prefer: preferFloat) ?? b
+                    prefer: preferFloat
+                ) else { continue }
+                // Prefer floating the newly inserted / focused leaf when it
+                // sits under the offending subtree.
+                let offender = offenderLeaf(childId: offenderChild, space: current, prefer: preferFloat)
+                    ?? offenderChild
                 let (after, win) = session.floatLeaf(space: spaceId, nodeId: offender)
                 session = after
                 if let win { floated.append(win) }
@@ -173,7 +169,7 @@ extension Session {
                 break
             }
             if !didFloat {
-                // Recheck leaves for < 1pt slivers after weight clamp.
+                // Recheck leaves for < 1pt slivers.
                 let space = session.spaces[spaceId]!
                 let leafRects = frames(space: space, usable: usable, gaps: gaps)
                 if let sliver = leafRects.first(where: { _, r in
@@ -188,6 +184,66 @@ extension Session {
             if !didFloat { break }
         }
         return (session, floated)
+    }
+
+    /// The child of `container` whose subtree minimum cannot fit its current
+    /// span along the container axis. When several do, prefer the one that
+    /// contains `prefer`; otherwise the last one (root-first, then newest).
+    private func overflowingChild(
+        container: Node,
+        space: Space,
+        minSizes: [UInt32: Size],
+        usable: Rect,
+        gaps: Gaps,
+        prefer: NodeId?
+    ) -> NodeId? {
+        guard container.children.count == 2 else { return nil }
+        let rects = nodeFrames(root: space.root, nodes: space.nodes, usable: usable, gaps: gaps)
+        var violating: [NodeId] = []
+        for child in container.children {
+            guard let rect = rects[child] else { continue }
+            let span = axisSpan(rect, axis: container.axis)
+            let needed = subtreeMin(
+                id: child,
+                space: space,
+                axis: container.axis,
+                minSizes: minSizes,
+                gaps: gaps,
+                floor: sliverFloor,
+                unknownUsesFloor: true
+            )
+            if span + 1e-9 < needed { violating.append(child) }
+        }
+        guard !violating.isEmpty else { return nil }
+        if let prefer,
+           let chosen = violating.first(where: { id in
+               guard let node = space.nodes[id] else { return false }
+               return containsNode(node, prefer, space: space)
+           })
+        {
+            return chosen
+        }
+        return violating.last
+    }
+
+    /// A leaf to float inside the offending subtree, preferring `prefer` when
+    /// it is contained there, else the first leaf depth-first.
+    private func offenderLeaf(childId: NodeId, space: Space, prefer: NodeId?) -> NodeId? {
+        if let prefer, space.nodes[prefer]?.isLeaf == true,
+           let child = space.nodes[childId], containsNode(child, prefer, space: space)
+        {
+            return prefer
+        }
+        return firstLeaf(id: childId, space: space)
+    }
+
+    private func firstLeaf(id: NodeId, space: Space) -> NodeId? {
+        guard let node = space.nodes[id] else { return nil }
+        if node.isLeaf { return id }
+        for child in node.children {
+            if let leaf = firstLeaf(id: child, space: space) { return leaf }
+        }
+        return nil
     }
 
     public func floatLeaf(space spaceId: SpaceId, nodeId: NodeId) -> (Session, WindowRef?) {
@@ -297,22 +353,6 @@ private func nodeDepth(_ id: NodeId, in space: Space) -> Int {
     return 1 + nodeDepth(parent, in: space)
 }
 
-private func leafToFloat(in container: Node, space: Space, prefer: NodeId?) -> NodeId? {
-    if let prefer, containsNode(container, prefer, space: space), space.nodes[prefer]?.isLeaf == true {
-        return prefer
-    }
-    func firstLeaf(_ id: NodeId) -> NodeId? {
-        guard let node = space.nodes[id] else { return nil }
-        if node.isLeaf { return id }
-        for child in node.children {
-            if let leaf = firstLeaf(child) { return leaf }
-        }
-        return nil
-    }
-    if let last = container.children.last, let leaf = firstLeaf(last) { return leaf }
-    return container.children.first.flatMap(firstLeaf)
-}
-
 private func minNeeded(leaf: Node, axis: Axis, minSizes: [UInt32: Size], floor: Double, unknownUsesFloor: Bool) -> Double {
     guard let window = leaf.leaf else { return floor }
     let size = minSizes[window.cgWindowId] ?? .unknown
@@ -349,64 +389,4 @@ private func childrenMeetMins(
         if span + 1e-9 < needed { return false }
     }
     return true
-}
-
-/// Clamp sibling first so both meet min. Returns nil if both cannot fit.
-private func clampSibling(
-    parent: Node,
-    space: Space,
-    minSizes: [UInt32: Size],
-    usable: Rect,
-    gaps: Gaps,
-    floor: Double,
-    unknownUsesFloor: Bool
-) -> Node? {
-    guard parent.children.count == 2 else { return parent }
-    let rects = nodeFrames(root: space.root, nodes: space.nodes, usable: usable, gaps: gaps)
-    guard let container = rects[parent.id] else { return parent }
-    let available = axisSpan(container, axis: parent.axis) - Double(gaps.inner)
-    let a = parent.children[0]
-    let b = parent.children[1]
-    func needed(_ id: NodeId) -> Double {
-        subtreeMin(
-            id: id,
-            space: space,
-            axis: parent.axis,
-            minSizes: minSizes,
-            gaps: gaps,
-            floor: floor,
-            unknownUsesFloor: unknownUsesFloor
-        )
-    }
-    let minA = needed(a)
-    let minB = needed(b)
-    if minA + minB > available + 1e-9 {
-        return nil
-    }
-    let weights = normalizedWeights(parent)
-    let sum = weights.reduce(0, +)
-    func weight(forSpan s: Double) -> Double {
-        guard available > 0 else { return 0 }
-        return (s / available) * sum
-    }
-    var wa = weights[0]
-    var wb = weights[1]
-    let needA = weight(forSpan: minA)
-    let needB = weight(forSpan: minB)
-    if wa < needA {
-        let deficit = needA - wa
-        wa = needA
-        wb -= deficit
-    }
-    if wb < needB {
-        let deficit = needB - wb
-        wb = needB
-        wa -= deficit
-    }
-    if wa < needA - 1e-9 || wb < needB - 1e-9 {
-        return nil
-    }
-    var parent = parent
-    parent.ratio = [wa, wb]
-    return parent
 }

@@ -84,9 +84,10 @@ struct BalanceResizeTests {
         #expect(f[root.children[0]]!.w + 1e-6 >= 80)
     }
 
-    @Test func siblingClampKeepsBothTiled() {
-        // usable 400, mins 150+150 = 300, both fit. Start 50/50 (200 each).
-        // Raise min of child 1 to 250; sibling clamp should give 250/150.
+    @Test func siblingMinConflictFloatsTheOffendingLeaf() {
+        // usable 400, 50/50 (200 each). win2's minimum (250) exceeds its
+        // span. Dwindle splits are not rebalanced: win2 floats and win1
+        // keeps the whole width.
         let box = Rect(x: 0, y: 0, w: 400, h: 400)
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
@@ -98,14 +99,11 @@ struct BalanceResizeTests {
             usable: box,
             gaps: gaps
         )
-        #expect(floated.isEmpty)
+        #expect(floated.map(\.cgWindowId) == [2])
         let space = after[space1]!
-        #expect(space.root != nil)
+        #expect(space.nodes[space.root!]?.leaf?.cgWindowId == 1)
         let f = frames(space: space, usable: box, gaps: gaps)
-        let root = space.nodes[space.root!]!
-        #expect(f[root.children[0]]!.w + 1e-6 >= 150)
-        #expect(f[root.children[1]]!.w + 1e-6 >= 250)
-        #expect(space.floating.isEmpty)
+        #expect(f.values.first!.w == 400)
     }
 
     @Test func bothMinsOverflowFloatsOversizedLeaf() {
@@ -132,9 +130,10 @@ struct BalanceResizeTests {
         #expect(f.values.first!.w == 200)
     }
 
-    @Test func nestedMinSizeClampsTheOuterSplit() {
-        // win1 | (win2 over win3). Width mins live on the vertical pair, so the
-        // right column must be at least 300 even though it is not a leaf.
+    @Test func nestedMinSizeFloatsInsteadOfRebalancing() {
+        // win1 | (win2 over win3), root skewed 0.9/0.1. The right column's
+        // minimum (300) exceeds its 50pt span; its leaves float rather than
+        // the root ratio being widened.
         let box = Rect(x: 0, y: 0, w: 500, h: 400)
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: space1, newLeaf: win(1), usableIsWide: true)
@@ -152,16 +151,9 @@ struct BalanceResizeTests {
             3: Size(w: 300, h: 0),
         ]
         let (after, floated) = session.clampOverflow(space: space1, minSizes: mins, usable: box, gaps: gaps)
-        #expect(floated.isEmpty)
+        #expect(floated.map(\.cgWindowId) == [2, 3])
         let clamped = after[space1]!
-        let laid = frames(space: clamped, usable: box, gaps: gaps)
-        let parent = clamped.nodes[clamped.root!]!
-        let left = laid[parent.children[0]]!
-        let right = clamped.nodes[parent.children[1]]!
-        #expect(left.w + 1e-6 >= 100)
-        for child in right.children {
-            #expect(laid[child]!.w + 1e-6 >= 300)
-        }
+        #expect(clamped.nodes[clamped.root!]?.leaf?.cgWindowId == 1)
     }
 
     @Test func overflowResolvesRootBeforeNestedContainer() {
