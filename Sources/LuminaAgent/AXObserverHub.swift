@@ -51,9 +51,15 @@ public final class AXObserverHub: @unchecked Sendable {
             kAXApplicationHiddenNotification,
         ]
         let refcon = Unmanaged.passUnretained(self).toOpaque()
+        var added = 0
         for n in appNotes {
-            AXObserverAddNotification(observer, app, n as CFString, refcon)
+            if AXObserverAddNotification(observer, app, n as CFString, refcon) == .success {
+                added += 1
+            }
         }
+        // An app whose AX server is not up yet fails every note. Do not cache
+        // a deaf observer, or later watch() calls would never retry.
+        guard added > 0 else { return }
         // .commonModes, not .defaultMode: a window can be created while the
         // main run loop is in a tracking/modal mode (menu open, drag), and
         // .defaultMode defers the note until that mode ends.
