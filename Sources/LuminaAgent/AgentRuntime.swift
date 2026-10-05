@@ -81,6 +81,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Bounded follow-up passes when a window was not resolvable yet.
     var unresolvedRefreshPasses = 0
     var refreshUnresolved = false
+    /// A just-created window that CG has not listed yet used to wait the full
+    /// 1.0s unresolved retry. Fast passes resolve it within ~100ms.
+    var unresolvedFastPasses = 0
+    var fastRetryRequested = false
+    let unresolvedFastDelays: [TimeInterval] = [0.02, 0.05, 0.1]
     /// Bounded post-launch discovery polls. A freshly launched app can create
     /// its window after the one refresh `appLaunched` schedules, and the
     /// window-created notification is easily missed while the AX observer is
@@ -314,7 +319,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         startOrStopFFM()
         // Apps can drop or delay the first frame write; one cheap settle pass
         // converges the layout without waiting for the user to click.
-        scheduleRefresh(reason: "bootSettle", delay: 0.6)
+        scheduleRefresh(reason: "bootSettle", delay: 0.6, eventDriven: false)
         log.info("bootLayout tiled=\(tileable.count) floating=\(floaters.count) usable=\(usable.w)x\(usable.h)")
     }
 
@@ -444,7 +449,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     // Unhide and re-check on the next pass; only a window
                     // that becomes on-screen is adopted.
                     adapter.unhide(pid: pid)
-                    scheduleRefresh(reason: "unhide", delay: 0.2)
+                    scheduleRefresh(reason: "unhide", delay: 0.2, eventDriven: false)
                     refreshUnresolved = true
                     continue
                 }
@@ -683,7 +688,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// created/moved/resized/title burst a single window emits, short enough
     /// that the frame lands before the user notices. AeroSpace fires without
     /// a debounce but pays several full refreshes per window; ours runs once.
-    func scheduleRefresh(reason: String, delay: TimeInterval = 0.015) {
+    func scheduleRefresh(reason: String, delay: TimeInterval = 0.015, eventDriven: Bool = true) {
         guard !isStopping() else { return }
         // New windows land on the space focused when their event arrives.
         // Keeping an older request's space let a launch poll scheduled before
@@ -691,22 +696,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // window appeared on the workspace they had left.
         // Keep the first event's timestamp across coalesced bursts so the
         // recorded latency covers the whole wait, not just the last event.
-        // Only event-driven schedules (the default short delay) get one; a
-        // deliberate settle delay would otherwise show up as user latency.
-        let receivedAt: Date? = delay <= 0.05
+        // Only event-driven schedules get one; a deliberate settle delay would
+        // otherwise show up as user latency. An internal retry keeps an
+        // already-pending event timestamp, and never preempts a pending event.
+        let receivedAt: Date? = eventDriven
             ? (pendingRefresh?.receivedAt ?? Date())
             : pendingRefresh?.receivedAt
         pendingRefresh = RefreshRequest(reason: reason, space: session.focusedSpace, receivedAt: receivedAt)
         if refreshScheduled {
-            // A fresh event must not wait behind an internal retry timer with
-            // a deliberate delay. An event already scheduled fires as planned;
-            // a later event just joins it.
-            guard delay <= 0.05, !refreshIsEventDriven else { return }
+            guard eventDriven, !refreshIsEventDriven else { return }
             refreshWorkItem?.cancel()
             refreshScheduled = false
         }
         refreshScheduled = true
-        refreshIsEventDriven = delay <= 0.05
+        refreshIsEventDriven = eventDriven
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.refreshScheduled = false
@@ -949,7 +952,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             screenLocked: screenLockedOrAsleep()
         ) {
             log.info("refresh suspended mass removal removed=\(delta.removed.count) of \(modelIds.count); screen locked/asleep")
-            scheduleRefresh(reason: "massLossSuspended", delay: 2.0)
+            scheduleRefresh(reason: "massLossSuspended", delay: 2.0, eventDriven: false)
             return
         }
         // A retained AX element that still answers a role read vetoes removal:
@@ -983,7 +986,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // The shared unresolved retry is capped; a deferred removal needs
             // its own pass so a lingering CG record cannot strand a dead tile
             // until some unrelated event.
-            scheduleRefresh(reason: "deferredRemoval", delay: 1.0)
+            scheduleRefresh(reason: "deferredRemoval", delay: 1.0, eventDriven: false)
         }
         // A retained element that stopped answering while the app's own AX
         // window list omits the id is a destroyed window. Remove it even if
@@ -1067,11 +1070,21 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let ms = Int(Date().timeIntervalSince(started) * 1000)
             log.info("refresh reason=\(reason) added=\(delta.added.count + delta.recycled.count) removed=\(removals.real.count) deferred=\(removals.deferred.count) rebinds=\(delta.rebinds.count) unresolved=\(refreshUnresolved) \(ms)ms")
         }
-        if refreshUnresolved, unresolvedRefreshPasses < 2 {
-            unresolvedRefreshPasses += 1
-            scheduleRefresh(reason: "unresolved", delay: 1.0)
-        } else if !refreshUnresolved {
+        if refreshUnresolved {
+            if fastRetryRequested, unresolvedFastPasses < unresolvedFastDelays.count {
+                let delay = unresolvedFastDelays[unresolvedFastPasses]
+                unresolvedFastPasses += 1
+                fastRetryRequested = false
+                scheduleRefresh(reason: "unresolvedFast", delay: delay, eventDriven: false)
+            } else if unresolvedRefreshPasses < 2 {
+                unresolvedRefreshPasses += 1
+                fastRetryRequested = false
+                scheduleRefresh(reason: "unresolved", delay: 1.0, eventDriven: false)
+            }
+        } else {
             unresolvedRefreshPasses = 0
+            unresolvedFastPasses = 0
+            fastRetryRequested = false
         }
         if launchPollsRemaining > 0, !delta.added.isEmpty || !delta.recycled.isEmpty {
             // A window belonging to the launched app appeared: further
@@ -1089,7 +1102,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // Only a discovery poll consumes the budget; the refresh that
             // observed the launch just starts the series.
             if reason == "launchPoll" { launchPollsRemaining -= 1 }
-            scheduleRefresh(reason: "launchPoll", delay: launchPollDelay)
+            scheduleRefresh(reason: "launchPoll", delay: launchPollDelay, eventDriven: false)
             launchPollDelay = min(launchPollDelay * 2, 1.5)
         }
     }
@@ -1193,7 +1206,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // becomes on-screen is adopted, so hidden tabs and twins stay
             // out of the tree.
             adapter.unhide(pid: pid)
-            scheduleRefresh(reason: "unhide", delay: 0.2)
+            scheduleRefresh(reason: "unhide", delay: 0.2, eventDriven: false)
             refreshUnresolved = true
             return
         }
@@ -1237,9 +1250,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         if result == .unmanaged || result == .ignored {
             // Classified from a placeholder frame (or before appearing
-            // on-screen): resolve it on a later session.
+            // on-screen): resolve it on a later session. A just-created
+            // window gets the fast ladder instead of the 1.0s retry, because
+            // it is the visible path between "app opened" and "tile lands".
             if input.width < 50 || input.height < 50 || !input.isOnScreen {
                 refreshUnresolved = true
+                fastRetryRequested = true
             }
             return
         }
@@ -1251,6 +1267,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // hard float is a real decision even when small, so dialogs and
             // panels are adopted instead of floating unseen forever.
             refreshUnresolved = true
+            fastRetryRequested = true
             return
         }
         claimed.insert(id)
@@ -1999,7 +2016,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                         // seconds to apply the write. Keep observing and give
                         // it time; non-application is not a minimum yet.
                         overflowObservations[id] = OverflowObservation(frame: live, since: Date())
-                        scheduleRefresh(reason: "overflowCheck", delay: 1.0)
+                        scheduleRefresh(reason: "overflowCheck", delay: 1.0, eventDriven: false)
                     } else if let obs = overflowObservations[id], framesClose(obs.frame, live, slop: 4) {
                         let elapsed = Date().timeIntervalSince(obs.since)
                         if elapsed >= overflowRefusalWindow {
@@ -2025,7 +2042,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     } else {
                         overflowObservations[id] = OverflowObservation(frame: live, since: Date())
                         if !observedMinCovers(id: id, live: live, rect: rect) {
-                            scheduleRefresh(reason: "overflowCheck", delay: overflowRefusalWindow + 0.1)
+                            scheduleRefresh(reason: "overflowCheck", delay: overflowRefusalWindow + 0.1, eventDriven: false)
                         }
                     }
                 } else {
@@ -2202,7 +2219,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         writeSession()
         // A dropped park or tile write settles on the next pass instead of
         // staying visible until the user clicks something.
-        scheduleRefresh(reason: "switchSettle", delay: 0.4)
+        scheduleRefresh(reason: "switchSettle", delay: 0.4, eventDriven: false)
     }
 
     func switchSpaceBy(_ transform: (Session) -> Session) {
@@ -2217,7 +2234,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         restashOffspace()
         focusRestoredWindow(on: session.focusedSpace)
         writeSession()
-        scheduleRefresh(reason: "switchSettle", delay: 0.4)
+        scheduleRefresh(reason: "switchSettle", delay: 0.4, eventDriven: false)
     }
 
     /// Remember the currently focused window on the outgoing space so a later
