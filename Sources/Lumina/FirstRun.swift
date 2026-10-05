@@ -7,6 +7,9 @@ final class FirstRunController: @unchecked Sendable {
     weak var extra: ExtraController?
     var axTrusted: () -> Bool = { false }
     private var showing = false
+    private var snoozeUntil: Date?
+    private var lastTrustCheck = Date.distantPast
+    private var trustCheckInFlight = false
     private var poll: Timer?
 
     init(flagPath: String, extra: ExtraController) {
@@ -49,22 +52,22 @@ final class FirstRunController: @unchecked Sendable {
         }
         if response == .alertFirstButtonReturn {
             openAccessibility()
+        } else {
+            // "Later" means later, not "ask again in half a second".
+            snoozeUntil = Date().addingTimeInterval(3600)
         }
     }
 
     private func startPolling() {
         poll?.invalidate()
-        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             if FileManager.default.fileExists(atPath: self.flagPath) {
                 self.poll?.invalidate()
                 return
             }
-            if self.axTrusted() {
-                self.markDone()
-                self.poll?.invalidate()
-                return
-            }
+            if let until = self.snoozeUntil, Date() < until { return }
+            self.refreshTrustOffMain()
             if !self.showing {
                 self.showing = true
                 self.show()
@@ -72,6 +75,24 @@ final class FirstRunController: @unchecked Sendable {
         }
         poll = timer
         RunLoop.main.add(timer, forMode: .common)
+    }
+
+    /// The trust check is agent IPC; never block the main run loop on it.
+    private func refreshTrustOffMain() {
+        guard !trustCheckInFlight, Date().timeIntervalSince(lastTrustCheck) > 3 else { return }
+        lastTrustCheck = Date()
+        trustCheckInFlight = true
+        DispatchQueue.global().async { [weak self] in
+            guard let self else { return }
+            let trusted = self.axTrusted()
+            DispatchQueue.main.async {
+                self.trustCheckInFlight = false
+                if trusted {
+                    self.markDone()
+                    self.poll?.invalidate()
+                }
+            }
+        }
     }
 
     private func markDone() {

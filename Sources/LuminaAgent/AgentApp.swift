@@ -51,8 +51,12 @@ struct AgentApp {
         signal(SIGTERM, SIG_IGN)
         let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
         term.setEventHandler {
-            runtime.stop()
-            NSApp.terminate(nil)
+            // Serialize the quit restore with in-flight layout work, then
+            // terminate once the restore has actually run.
+            MutationQueue.shared.hop {
+                runtime.stop()
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
         }
         term.resume()
         Self.termSource = term

@@ -152,7 +152,33 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
+    private let stopLock = NSLock()
+    private var stopping = false
+
+    func isStopping() -> Bool {
+        stopLock.lock()
+        defer { stopLock.unlock() }
+        return stopping
+    }
+
+    /// Idempotent and serialized. `.quit` reaches this on the mutation queue
+    /// and the SIGTERM path on main; running the quit restore twice raced with
+    /// itself, and queued layout work used to re-tile windows after the
+    /// restore. Callers that need the restore to finish should be on the
+    /// mutation queue.
     public func stop() {
+        stopLock.lock()
+        if stopping {
+            stopLock.unlock()
+            return
+        }
+        stopping = true
+        stopLock.unlock()
+        pendingRefresh = nil
+        refreshScheduled = false
+        for item in resizeDebounce.values { item.cancel() }
+        resizeDebounce.removeAll()
+        configDebounce?.cancel()
         recenterAllWindows()
         writeSession(stash: [])
         unregisterHotkeys()
@@ -161,7 +187,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         secureTimer?.cancel()
         axPollTimer?.cancel()
         configWatcher?.cancel()
-        configDebounce?.cancel()
     }
 
     /// Carbon hotkeys are main-thread only. Never sync to main from the mutation queue.
@@ -530,6 +555,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     /// Coalesce every discovery event into one session. Mutation queue only.
     func scheduleRefresh(reason: String, delay: TimeInterval = 0.04) {
+        guard !isStopping() else { return }
         let space = pendingRefresh?.space ?? session.focusedSpace
         pendingRefresh = RefreshRequest(reason: reason, space: space)
         guard !refreshScheduled else { return }
@@ -574,7 +600,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// windows that are gone, rebind replaced ids, adopt new ones, then lay
     /// out. Convergence by repetition; no per-event repair.
     func runRefresh(reason: String, space: SpaceId) {
-        guard didBootLayout, isCurrent, !userPaused, !displayGone, let bound else { return }
+        guard !isStopping(), didBootLayout, isCurrent, !userPaused, !displayGone, let bound else { return }
         let refreshInterval = LuminaSignposts.pointsOfInterest.beginInterval("refresh-session")
         defer { LuminaSignposts.pointsOfInterest.endInterval("refresh-session", refreshInterval) }
         let started = Date()
@@ -1359,7 +1385,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func applyFrames() {
-        if userPaused || displayGone || !isCurrent { return }
+        if isStopping() || userPaused || displayGone || !isCurrent { return }
         refreshBound()
         guard let bound else { return }
         let applyInterval = LuminaSignposts.pointsOfInterest.beginInterval("apply-frames")
@@ -1490,6 +1516,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     /// Apply a subset of frames, without the ghost/budget machinery.
     func applyLayout(_ rects: [NodeId: Rect]) {
+        guard !isStopping() else { return }
         let space = session.current
         let fs = space.luminaFullscreen
         for (nodeId, rect) in rects {
@@ -1624,7 +1651,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// No verification and no retry; the next refresh/layout pass re-parks any
     /// window that did not land.
     func stash(ids: Set<UInt32>, space spaceId: SpaceId? = nil) {
-        guard isCurrent, let bound else { return }
+        guard !isStopping(), isCurrent, let bound else { return }
         let spaceId = spaceId ?? session.focusedSpace
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
@@ -2076,8 +2103,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func focusDir(_ dir: Direction) {
-        guard let target = spatialTarget(dir), let el = elements[target.cgWindowId] else { return }
-        adapter.setFocused(el, raise: true)
+        guard let target = spatialTarget(dir),
+              let window = windowAnywhere(target.cgWindowId),
+              let el = resolvedElement(for: window)
+        else { return }
+        // Activate the target's app: AX focus/raise alone leaves keystrokes
+        // with the previous app when the neighbour is in a background app.
+        adapter.nativeFocus(el, pid: window.pid)
         var space = session.current
         space.focusedWindow = target.cgWindowId
         if target.role == .tiled, let leaf = space.leaf(containing: target.cgWindowId) {

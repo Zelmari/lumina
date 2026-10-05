@@ -44,6 +44,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
     var pendingUnstash: String?
     var spawnInFlight = false
     private var startRetryAttempts = 0
+    /// Crash-restart backoff: consecutive fast crashes per instance.
+    private var crashCounts: [UUID: Int] = [:]
+    private var lastCrashAt: [UUID: Date] = [:]
     private let statusQueue = DispatchQueue(label: "com.zelmari.lumina.extra.status")
     private var statusTimer: DispatchSourceTimer?
 
@@ -251,13 +254,41 @@ final class ExtraController: NSObject, @unchecked Sendable {
             if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
             registry.save(reg)
         case .restartCrashRecover:
-            spawner.spawn(
-                instanceId: record.instanceId,
-                socket: record.socket,
-                displayUUID: record.displayUUID.isEmpty ? nil : record.displayUUID,
-                crashRecover: true,
-                runLaunchApps: false
-            ) { [weak self] pid in
+            // A deterministic crash used to respawn forever. Count crashes
+            // inside a minute and back off; give up after a few fast ones.
+            let now = Date()
+            let recent = lastCrashAt[record.instanceId].map { now.timeIntervalSince($0) < 60 } ?? false
+            let count = recent ? (crashCounts[record.instanceId] ?? 1) + 1 : 1
+            lastCrashAt[record.instanceId] = now
+            crashCounts[record.instanceId] = count
+            if count > 5 {
+                log.error("agent \(record.instanceId) crashed \(count) times in a minute; not restarting")
+                var reg = registry.load()
+                reg.agents.removeAll { $0.instanceId == record.instanceId }
+                if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
+                registry.save(reg)
+                crashCounts[record.instanceId] = nil
+                lastCrashAt[record.instanceId] = nil
+                pollStatus()
+                return
+            }
+            let delay = min(0.5 * pow(2.0, Double(count - 1)), 8.0)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.respawnCrashed(record)
+            }
+            return
+        }
+        pollStatus()
+    }
+
+    private func respawnCrashed(_ record: InstanceRecord) {
+        spawner.spawn(
+            instanceId: record.instanceId,
+            socket: record.socket,
+            displayUUID: record.displayUUID.isEmpty ? nil : record.displayUUID,
+            crashRecover: true,
+            runLaunchApps: false
+        ) { [weak self] pid in
                 guard let self else { return }
                 guard let pid else {
                     self.log.error("crash respawn failed")
@@ -277,10 +308,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
                     self?.agentDied(InstanceRecord(instanceId: record.instanceId, pid: pid, displayUUID: record.displayUUID, socket: record.socket))
                 }
                 self.pollStatus()
-            }
-            return
         }
-        pollStatus()
     }
 
     func handleExtra(_ cmd: ExtraCmd, id: String) -> IPCResponse {
@@ -356,7 +384,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
                 }
                 registry.save(next)
             }
-            let spaceCount = st.spaceCount ?? 5
+            let spaceCount = st.spaceCount ?? 10
             let focused = st.space ?? 1
             let paused = st.paused
             let warning = extraWarning(status: st)

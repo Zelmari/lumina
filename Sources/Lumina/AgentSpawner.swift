@@ -69,8 +69,15 @@ final class AgentSpawner: @unchecked Sendable {
         let src = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
         watchers[pid] = src
         src.setEventHandler { [weak self] in
-            self?.watchers.removeValue(forKey: pid)?.cancel()
+            guard let self else { return }
+            // Reap the child: without waitpid a crashed agent stays a zombie
+            // and `kill(pid, 0)` reports it alive forever.
+            var status: Int32 = 0
+            _ = waitpid(pid, &status, WNOHANG)
+            self.watchers.removeValue(forKey: pid)?.cancel()
             onExit()
+            // A recycled pid must not be misread as an earlier user quit.
+            self.quitPids.remove(pid)
         }
         src.resume()
     }
