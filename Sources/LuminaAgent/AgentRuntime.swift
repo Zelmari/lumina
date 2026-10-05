@@ -121,10 +121,17 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Persisted via SessionFile so restarts and drop+re-adopt churn cannot
     /// replace true originals with tile rects.
     var knownOriginals: [UInt32: Rect] = [:]
-    /// New windows parked in the stash corner the moment we hear about them,
-    /// keyed by id, storing the live frame to restore if adoption declines.
-    /// This is what hides the app's own default frame while the refresh runs.
-    var preParked: [UInt32: Rect] = [:]
+    /// New windows parked in the stash corner the moment we hear about them.
+    /// Stores the app's pre-write frame for restore, where we parked it, the
+    /// pasteboard state at park time, and how many times we have re-parked
+    /// after the app moved itself back.
+    struct PrePark {
+        var frame: Rect
+        var parked: Rect
+        var pasteboardCount: Int
+        var attempts: Int
+    }
+    var preParked: [UInt32: PrePark] = [:]
     /// Consecutive-miss and failed-read bookkeeping for refresh removals.
     var removalGate = RemovalGate()
     /// Sizes an app has actually refused to shrink below. Some apps report
@@ -858,7 +865,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let parked = stashFrame(for: frame.h, display: display, dockRight: dockRight, lastWidth: frame.w, inset: inset)
         var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
         if adapter.setStashPosition(Point(x: parked.x, y: parked.y), of: element, tag: &tag) == .ok {
-            preParked[id] = frame
+            preParked[id] = PrePark(
+                frame: frame,
+                parked: parked,
+                pasteboardCount: NSPasteboard.general.changeCount,
+                attempts: 0
+            )
             log.info("pre-park window=\(id) pid=\(pid) from=\(Int(frame.x)),\(Int(frame.y))")
         }
     }
@@ -866,11 +878,42 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Put a pre-parked window back where the app had it. Called when the pass
     /// decides not to manage the window; the marker is consumed either way.
     func undoPrePark(id: UInt32, element: AXUIElement) {
-        guard let frame = preParked.removeValue(forKey: id) else { return }
+        guard let prePark = preParked.removeValue(forKey: id) else { return }
         let pid = adapter.pid(of: element) ?? 0
-        var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: frame)
+        var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: prePark.frame)
         log.info("pre-park restore window=\(id) pid=\(pid)")
-        _ = adapter.setFrame(frame, of: element, tag: &tag)
+        _ = adapter.setFrame(prePark.frame, of: element, tag: &tag)
+    }
+
+    /// The app moved a window we already parked back toward its own frame.
+    /// Re-issue the park a bounded number of times, but never while the user
+    /// is dragging or after a copy changed the pasteboard (the same signals
+    /// the title-bar swap trusts).
+    func reParkIfNeeded(id: UInt32, element: AXUIElement) {
+        guard var prePark = preParked[id], !ownedAnywhere(id) else { return }
+        let mouseDown = NSEvent.pressedMouseButtons != 0
+        let pasteboardChanged = NSPasteboard.general.changeCount != prePark.pasteboardCount
+        guard shouldRePark(
+            mouseDown: mouseDown,
+            pasteboardChanged: pasteboardChanged,
+            generationInFlight: adapter.generationInFlight(for: id),
+            attempts: prePark.attempts,
+            maxAttempts: 3
+        ) else { return }
+        if let live = adapter.frame(of: element), isStashedAway(live) { return }
+        prePark.attempts += 1
+        preParked[id] = prePark
+        // A pending resize debounce or a refusal observation from before the
+        // park must not interfere with the re-park.
+        resizeDebounce[id]?.cancel()
+        resizeDebounce[id] = nil
+        overflowObservations[id] = nil
+        let pid = adapter.pid(of: element) ?? 0
+        var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: prePark.frame)
+        if adapter.setStashPosition(Point(x: prePark.parked.x, y: prePark.parked.y), of: element, tag: &tag) != .ok {
+            return
+        }
+        log.info("pre-park re-park window=\(id) pid=\(pid) attempt=\(prePark.attempts)")
     }
 
     /// Coalesce every discovery event into one session. Mutation queue only.
@@ -1363,7 +1406,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let peekPid = adapter.pid(of: element)
         // A window we parked ourselves is not a stale stash: it must be
         // adopted, and its live frame is the corner, not the user's geometry.
-        let preParkFrame = peekId.flatMap { preParked[$0] }
+        let preParkFrame = peekId.flatMap { preParked[$0]?.frame }
         if preParkFrame == nil, let frame = adapter.frame(of: element), isStashedAway(frame) {
             // A fresh window's first AX read can be an empty frame while it
             // animates in; that is not our park. Our parks always keep height.
@@ -1484,7 +1527,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let liveFrame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
         // A pre-parked window's live frame is the corner; the frame the app
         // chose before we parked it is the one to remember and restore.
-        let frame = preParked[id] ?? liveFrame
+        let frame = preParked[id]?.frame ?? liveFrame
         let usable = bound.usableRect(gaps: config.gaps)
         // A park or engine-tile frame is not the user's geometry; never record
         // it as the original or quit would restore a tile (or a 1px corner).
@@ -1771,6 +1814,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func onMovedOrResized(_ element: AXUIElement, resized: Bool) {
         guard let id = adapter.windowId(for: element) else { return }
+        if preParked[id] != nil, !ownedAnywhere(id) {
+            // The app restored or centered the window we just parked. Put it
+            // back before touching the model; bounded and gesture-gated.
+            reParkIfNeeded(id: id, element: element)
+            return
+        }
         if let w = windowAnywhere(id), adapter.shouldIgnoreAXGeometry(window: w) {
             // A single setFrame emits several Moved/Resized notifications. Keep
             // the tag until its timer expires so the rest of the burst is not

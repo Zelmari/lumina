@@ -743,6 +743,18 @@ struct InputPolicyTests {
         #expect(onMiniaturize(MiniaturizeEvent(tagged: false)) == .deminiaturize)
     }
 
+    @Test func reParkIsGestureGatedAndBounded() {
+        #expect(shouldRePark(mouseDown: false, pasteboardChanged: false, generationInFlight: false, attempts: 0, maxAttempts: 3))
+        // Never fight a drag or a copy.
+        #expect(!shouldRePark(mouseDown: true, pasteboardChanged: false, generationInFlight: false, attempts: 0, maxAttempts: 3))
+        #expect(!shouldRePark(mouseDown: false, pasteboardChanged: true, generationInFlight: false, attempts: 0, maxAttempts: 3))
+        // Never re-issue while our own write is still settling.
+        #expect(!shouldRePark(mouseDown: false, pasteboardChanged: false, generationInFlight: true, attempts: 0, maxAttempts: 3))
+        // Bounded.
+        #expect(shouldRePark(mouseDown: false, pasteboardChanged: false, generationInFlight: false, attempts: 2, maxAttempts: 3))
+        #expect(!shouldRePark(mouseDown: false, pasteboardChanged: false, generationInFlight: false, attempts: 3, maxAttempts: 3))
+    }
+
     @Test func activationFollowsOnlyOnANonEmptyWorkspace() {
         #expect(shouldFollowAppActivation(spaceHasWindows: true, elapsedSinceSpaceChange: 2))
         #expect(!shouldFollowAppActivation(spaceHasWindows: false, elapsedSinceSpaceChange: 2))

@@ -52,6 +52,23 @@ public func shouldIgnoreAXGeometry(windowGeneration: UInt64, inFlight: UInt64?) 
     return windowGeneration == inFlight
 }
 
+/// Whether a window we pre-parked should be put back after the app moved it.
+/// Never fight the user (a drag or a copy changes the pasteboard) and never
+/// re-issue while our own write is still settling; bounded attempts stop an
+/// app that re-centers endlessly from looping.
+public func shouldRePark(
+    mouseDown: Bool,
+    pasteboardChanged: Bool,
+    generationInFlight: Bool,
+    attempts: Int,
+    maxAttempts: Int
+) -> Bool {
+    if mouseDown { return false }
+    if pasteboardChanged { return false }
+    if generationInFlight { return false }
+    return attempts < maxAttempts
+}
+
 public struct MiniaturizeEvent: Equatable, Sendable {
     public var tagged: Bool
     public init(tagged: Bool) { self.tagged = tagged }
