@@ -99,7 +99,8 @@ extension Session {
         }
 
         let removedWindow = node.leaf
-        if space.luminaFullscreen == nodeId {
+        let wasFS = space.luminaFullscreen == nodeId
+        if wasFS {
             space.luminaFullscreen = nil
         }
 
@@ -112,55 +113,54 @@ extension Session {
             if space.lastTiledLeaf == nodeId {
                 space.lastTiledLeaf = nil
             }
-            session.spaces[spaceId] = space
-            return session
-        }
-
-        guard let parentId = node.parent, var parent = space.nodes[parentId] else {
+        } else if let parentId = node.parent, var parent = space.nodes[parentId] {
+            parent.children.removeAll { $0 == nodeId }
             space.nodes.removeValue(forKey: nodeId)
-            session.spaces[spaceId] = space
-            return session
-        }
 
-        parent.children.removeAll { $0 == nodeId }
-        space.nodes.removeValue(forKey: nodeId)
-
-        if parent.children.count == 1, let siblingId = parent.children.first, var sibling = space.nodes[siblingId] {
-            sibling.parent = parent.parent
-            space.setNode(sibling)
-            if let grandId = parent.parent, var grand = space.nodes[grandId] {
-                if let idx = grand.children.firstIndex(of: parentId) {
-                    grand.children[idx] = siblingId
+            if parent.children.count == 1, let siblingId = parent.children.first, var sibling = space.nodes[siblingId] {
+                sibling.parent = parent.parent
+                space.setNode(sibling)
+                if let grandId = parent.parent, var grand = space.nodes[grandId] {
+                    if let idx = grand.children.firstIndex(of: parentId) {
+                        grand.children[idx] = siblingId
+                    }
+                    space.setNode(grand)
+                } else {
+                    space.root = siblingId
                 }
-                space.setNode(grand)
+                space.nodes.removeValue(forKey: parentId)
+            } else if parent.children.isEmpty {
+                space.nodes.removeValue(forKey: parentId)
+                if space.root == parentId {
+                    space.root = nil
+                }
             } else {
-                space.root = siblingId
+                if parent.ratio.count != parent.children.count {
+                    let n = Double(parent.children.count)
+                    parent.ratio = Array(repeating: n == 0 ? 1 : 1.0 / n, count: parent.children.count)
+                }
+                space.setNode(parent)
             }
-            space.nodes.removeValue(forKey: parentId)
-        } else if parent.children.isEmpty {
-            space.nodes.removeValue(forKey: parentId)
-            if space.root == parentId {
-                space.root = nil
+
+            if space.lastTiledLeaf == nodeId {
+                space.lastTiledLeaf = space.firstTiledLeaf()
+            }
+            if space.focusedWindow == removedWindow?.cgWindowId {
+                if let last = space.lastTiledLeaf, let leaf = space.nodes[last]?.leaf {
+                    space.focusedWindow = leaf.cgWindowId
+                } else {
+                    space.focusedWindow = space.floating.first?.cgWindowId
+                }
             }
         } else {
-            if parent.ratio.count != parent.children.count {
-                let n = Double(parent.children.count)
-                parent.ratio = Array(repeating: n == 0 ? 1 : 1.0 / n, count: parent.children.count)
-            }
-            space.setNode(parent)
-        }
-
-        if space.lastTiledLeaf == nodeId {
-            space.lastTiledLeaf = space.firstTiledLeaf()
-        }
-        if space.focusedWindow == removedWindow?.cgWindowId {
-            if let last = space.lastTiledLeaf, let leaf = space.nodes[last]?.leaf {
-                space.focusedWindow = leaf.cgWindowId
-            } else {
-                space.focusedWindow = space.floating.first?.cgWindowId
-            }
+            space.nodes.removeValue(forKey: nodeId)
         }
         session.spaces[spaceId] = space
+        // The removed node owned lumina-fullscreen, so its parked siblings
+        // must return to their normal roles instead of staying `.stashed`.
+        if wasFS {
+            session = session.markUnstashed(space: spaceId)
+        }
         return session
     }
 
@@ -173,7 +173,8 @@ extension Session {
         var s = space
         s.floating.removeAll { $0.cgWindowId == cgWindowId }
         if s.focusedWindow == cgWindowId {
-            s.focusedWindow = s.floating.first?.cgWindowId ?? s.nodes[s.lastTiledLeaf ?? NodeId(raw: 0)]?.leaf?.cgWindowId
+            s.focusedWindow = s.floating.first?.cgWindowId
+                ?? s.lastTiledLeaf.flatMap { s.nodes[$0]?.leaf?.cgWindowId }
         }
         session.spaces[spaceId] = s
         return session

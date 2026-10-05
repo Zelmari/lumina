@@ -588,9 +588,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             for node in space.tiledLeaves() { if let w = node.leaf { modelPids[w.cgWindowId] = w.pid } }
             for w in space.floating {
                 modelPids[w.cgWindowId] = w.pid
-                if w.role == .floating { floatingIds.insert(w.cgWindowId) }
+                if w.role == .floating || w.role == .stashed { floatingIds.insert(w.cgWindowId) }
             }
         }
+        // Native-fullscreen windows are detached from the tree but still live
+        // in `AXWindows`. Without them in the model, a close of any sibling
+        // pairs the dead id with the fullscreen window as a rebind and grafts
+        // a tile onto a window macOS owns.
+        for w in session.nativeFSWindows { modelPids[w.cgWindowId] = w.pid }
         /// Pids whose AX window list did not answer this pass. Their absence
         /// from `live` is not evidence of death; removals are deferred and
         /// the unresolved retry covers newly created windows.
@@ -652,7 +657,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if !failedManaged.isEmpty || unmanagedFailed {
             refreshUnresolved = true
         }
-        let delta = reconcile(model: session.allWindowIds, modelPids: modelPids, live: live)
+        let delta = reconcile(
+            model: session.allWindowIds.union(session.nativeFSWindows.map(\.cgWindowId)),
+            modelPids: modelPids,
+            live: live
+        )
         var removals: (real: [UInt32], deferred: [UInt32]) = (real: [], deferred: [])
         defer {
             recordRefreshSummary(
@@ -703,7 +712,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             rebindOwned(from: pair.from, to: pair.to, element: el, pid: w.pid)
             reclassifyRebound(id: pair.to, pid: w.pid, element: el, onScreen: onScreen)
         }
-        var claimed = session.allWindowIds.union(elements.keys)
+        var claimed = session.allWindowIds.union(elements.keys).union(session.nativeFSWindows.map(\.cgWindowId))
         for id in delta.added + delta.recycled {
             guard let el = elementsById[id] else { continue }
             onCreate(el, claimed: &claimed, apply: false, space: space)
@@ -1009,6 +1018,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let wasFS = session.current.luminaFullscreen != nil
             && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
         forgetWindowState(id)
+        session.nativeFSWindows.removeAll { $0.cgWindowId == id }
         for spaceId in Array(session.spaces.keys) {
             if spaceId == session.focusedSpace {
                 session = session.closeWindow(space: spaceId, cgWindowId: id)
@@ -1071,13 +1081,23 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return
         }
         if onScreen.contains(id), !adapter.isFullscreen(element),
-           session.nativeFSWindows.contains(where: { $0.cgWindowId == id })
+           let parked = session.nativeFSWindows.first(where: { $0.cgWindowId == id })
         {
-            if let parked = session.nativeFSWindows.first(where: { $0.cgWindowId == id }) {
-                session = session.reinsertNativeFS(parked, usableIsWide: usableIsWide(usable))
-                applyFrames()
+            if session.spaceContaining(cgWindowId: id) != nil {
+                // Already grafted back on an earlier pass; just drop the
+                // stale bookmark instead of inserting a second leaf.
+                session.nativeFSWindows.removeAll { $0.cgWindowId == id }
                 return
             }
+            let bookmarkSpace = parked.nativeFSBookmark?.spaceId ?? session.focusedSpace
+            session = session.reinsertNativeFS(parked, usableIsWide: usableIsWide(usable))
+            applyFrames()
+            if bookmarkSpace != session.focusedSpace {
+                // The window's home space is hidden; park it there rather
+                // than leaving it on top of the space the user is viewing.
+                stash(ids: [id], space: bookmarkSpace)
+            }
+            return
         }
         guard session.current.leaf(containing: id) != nil else { return }
         switch classifyInPlaceResize(frame: frame, usable: usable) {
@@ -2215,9 +2235,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             for spaceId in Array(session.spaces.keys) {
                 session = session.removeWindow(space: spaceId, cgWindowId: id)
             }
-            session.nativeFSWindows.removeAll { $0.cgWindowId == id }
             forgetWindowState(id)
         }
+        // A native-fullscreen window has no live element while it is on its
+        // own Space, so it is not in `ids`; drop it by pid as well.
+        session.nativeFSWindows.removeAll { $0.pid == pid }
         applyFrames()
     }
 
