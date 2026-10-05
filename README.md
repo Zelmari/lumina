@@ -28,6 +28,8 @@ Layout and IPC are unit-tested with SwiftPM (186 tests; Linux toolchain is fine)
 
 On macOS, `swift test` needs the Xcode toolchain (`export DEVELOPER_DIR=/Applications/Xcode.app`); Command Line Tools lack the `Testing` module.
 
+For testing the running app, `lumina verify` prints machine-checkable tiling invariants and exits non-zero on any violation (duplicate windows, windows visible on an inactive workspace, tiles overlapping or outside the display, stale focus). `scripts/harness.sh` drives scriptable TextEdit windows through open, focus, swap, float, fullscreen, workspace switch, move, resize, reload and close, calling `verify` after each step; point `LUMINA` at the CLI and run it on the Mac.
+
 See [docs/install.md](docs/install.md) and [docs/compat.md](docs/compat.md). Known issues from a full-repo audit are tracked in [plans/FINDINGS.md](plans/FINDINGS.md).
 
 ## Layout
