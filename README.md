@@ -13,7 +13,7 @@ Lumina is a guest on macOS. Quitting it restores managed windows to their pre-ti
 - Stage Manager: unsupported. Turn it off. Layouts may fight; Lumina must not crash.
 - System Settings → Desktop & Dock → Windows: turn **off** “Drag windows to screen edges to tile”, “Drag windows to menu bar to fill screen”, and “Hold Option key while dragging windows to tile”. Lumina does not write those settings.
 
-v1 manages **one display**. Config lives at `~/.config/lumina/lumina.toml`. `launch-apps` defaults to empty.
+v1 manages **one display**. Config lives at `~/.config/lumina/lumina.toml`. `launch-apps` defaults to empty. The default config has **10 workspaces** (`Option-1` … `Option-0`); a partial config file merges onto the shipped defaults, so keys you omit keep their default values.
 
 ## Known behavior
 
@@ -24,7 +24,7 @@ v1 manages **one display**. Config lives at `~/.config/lumina/lumina.toml`. `lau
 
 ## Status
 
-Layout and IPC are unit-tested with SwiftPM (177 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
+Layout and IPC are unit-tested with SwiftPM (186 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
 
 On macOS, `swift test` needs the Xcode toolchain (`export DEVELOPER_DIR=/Applications/Xcode.app`); Command Line Tools lack the `Testing` module.
 

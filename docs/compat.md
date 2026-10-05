@@ -12,7 +12,7 @@ System UI (Spotlight, Notification Center, Control Center, permission sheets, lo
 
 | App | Bundle id | Symptom | Rule |
 |---|---|---|---|
-| Cursor (Computer Use UI) | `com.todesktop.230313mzl4w4u92` | Computer Use window churn fights the tile tree. The current config tiles Cursor and keeps the `ignore` rule commented out. | Restore `action = "ignore"` while Computer Use drives the app; use `action = "float"` if only the agent panel misbehaves. |
+| Cursor (Computer Use UI) | `com.todesktop.230313mzl4w4u92` | Computer Use window churn fights the tile tree. The shipped config has no Cursor rule, so its windows tile by default. | Add `[[window-rule]]` with `app-id = "com.todesktop.230313mzl4w4u92"` and `action = "ignore"` while Computer Use drives the app; use `action = "float"` if only the agent panel misbehaves. |
 | Zoom | `us.zoom.xos` | Jumps away from the standard 1 px corner park, so a hidden window can come back on screen. | none: the agent parks Zoom with a 0 inset (`stashFrame(inset: 0)`). Add `action = "float"` if meeting windows land on the wrong Space. |
 | Electron/Chromium splash-window apps (Discord, Slack, VS Code) | varies | The splash window and the real window have different `CGWindowID`s, so one refresh pass sees one id replace another. | none in most cases: a one-in/one-out pass rebinds the ids for that pid. Add `action = "float"` for an app whose splash never settles into a tile. |
 

@@ -229,6 +229,31 @@ struct ConfigTests {
         #expect(dest.floating.first?.role == .floating)
     }
 
+    @Test func applySpaceCountStashesPouredWindowsOntoAFullscreenDestination() {
+        var session = Session.empty(spaceCount: 3)
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 11, pid: 1),
+            usableIsWide: true
+        )
+        session = session.insertSpiral(
+            space: SpaceId.require(1),
+            newLeaf: WindowRef(cgWindowId: 12, pid: 1),
+            usableIsWide: true
+        )
+        let fs = session[SpaceId.require(1)]!.leaf(containing: 11)!.id
+        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: fs)
+        session = session.insertSpiral(
+            space: SpaceId.require(3),
+            newLeaf: WindowRef(cgWindowId: 31, pid: 3),
+            usableIsWide: true
+        )
+        session = session.applySpaceCount(1)
+        let after = session[SpaceId.require(1)]!
+        #expect(after.luminaFullscreen == fs)
+        #expect(after.leaf(containing: 31)?.leaf?.role == .stashed)
+    }
+
     @Test func resolveWorkspaceNilIfGreaterThanCount() {
         #expect(resolveWorkspace(id: 3, count: 5)?.raw == 3)
         #expect(resolveWorkspace(id: 99, count: 5) == nil)

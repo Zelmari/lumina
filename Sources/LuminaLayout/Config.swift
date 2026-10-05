@@ -444,6 +444,7 @@ extension Session {
             return session
         }
         let dest = SpaceId.require(1)
+        let destHadFS = session.spaces[dest]?.luminaFullscreen != nil
         for i in stride(from: oldCount, through: count + 1, by: -1) {
             let dropped = SpaceId.require(i)
             guard let space = session.spaces[dropped] else { continue }
@@ -463,6 +464,11 @@ extension Session {
                     destSpace.floating.append(floater)
                 }
                 session.spaces[dest] = destSpace
+            }
+            // Windows poured onto a fullscreen destination stay parked like
+            // any other new leaf while lumina-fullscreen owns the space.
+            if destHadFS {
+                session = session.markStashed(space: dest, ids: Set(tiled.compactMap { $0.leaf?.cgWindowId }))
             }
             session.spaces[dropped] = nil
         }
