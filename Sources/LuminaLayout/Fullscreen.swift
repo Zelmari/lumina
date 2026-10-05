@@ -76,9 +76,8 @@ extension Session {
     public func toggleLuminaFS(space spaceId: SpaceId) -> Session {
         guard let space = spaces[spaceId] else { return self }
         if space.luminaFullscreen != nil {
-            guard let focused = space.focusedWindow,
-                  space.nodes[space.luminaFullscreen!]?.leaf?.cgWindowId == focused
-            else { return self }
+            // Exit even when a floater owns focus; gating on the FS leaf made
+            // the hotkey look dead after a dialog took focus.
             return exitLuminaFS(space: spaceId)
         }
         if let focused = space.focusedWindow, let leaf = space.leaf(containing: focused) {

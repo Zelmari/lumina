@@ -468,6 +468,26 @@ struct SpaceSwitchTests {
         #expect(after.leaf(containing: 2)?.leaf?.role == .stashed)
     }
 
+    @Test func toggleLuminaFSExitsWhenFloaterOwnsFocus() {
+        var session = Session.empty(spaceCount: 1)
+        session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)
+        var space = session[SpaceId.require(1)]!
+        space.floating.append(WindowRef(cgWindowId: 2, pid: 2, role: .floating))
+        session.spaces[SpaceId.require(1)] = space
+        let fsLeaf = session[SpaceId.require(1)]!.leaf(containing: 1)!.id
+        session = session.enterLuminaFS(space: SpaceId.require(1), leaf: fsLeaf)
+        // A floater can take focus while fullscreen is active; the toggle must
+        // still exit instead of looking dead.
+        var fsSpace = session[SpaceId.require(1)]!
+        fsSpace.focusedWindow = 2
+        session.spaces[SpaceId.require(1)] = fsSpace
+        session = session.toggleLuminaFS(space: SpaceId.require(1))
+        let after = session[SpaceId.require(1)]!
+        #expect(after.luminaFullscreen == nil)
+        #expect(after.leaf(containing: 1)?.leaf?.role == .tiled)
+        #expect(after.floating.first(where: { $0.cgWindowId == 2 })?.role == .floating)
+    }
+
     @Test func tileFloaterDuringLuminaFSStashesWindow() {
         var session = Session.empty(spaceCount: 1)
         session = session.insertSpiral(space: SpaceId.require(1), newLeaf: WindowRef(cgWindowId: 1, pid: 1), usableIsWide: true)

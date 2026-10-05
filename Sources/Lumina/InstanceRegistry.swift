@@ -4,8 +4,9 @@ import Foundation
 import LuminaLayout
 
 /// Cross-process agent registry. Load-modify-save runs on the main queue, the
-/// status queue, and spawn callbacks, so both operations take a lock and saves
-/// go through a unique temp file plus rename.
+/// status queue, and spawn callbacks, so compound updates must go through
+/// `mutate`; plain `load`/`save` take the same lock and saves go through a
+/// unique temp file plus rename.
 final class RegistryStore: @unchecked Sendable {
     let path: String
     private let lock = NSLock()
@@ -15,6 +16,28 @@ final class RegistryStore: @unchecked Sendable {
     func load() -> InstanceRegistry {
         lock.lock()
         defer { lock.unlock() }
+        return loadUnlocked()
+    }
+
+    /// Read-modify-write under one lock so a concurrent save cannot erase the
+    /// rows this update just added.
+    @discardableResult
+    func mutate(_ body: (inout InstanceRegistry) -> Void) -> InstanceRegistry {
+        lock.lock()
+        defer { lock.unlock() }
+        var registry = loadUnlocked()
+        body(&registry)
+        saveUnlocked(registry)
+        return registry
+    }
+
+    func save(_ registry: InstanceRegistry) {
+        lock.lock()
+        defer { lock.unlock() }
+        saveUnlocked(registry)
+    }
+
+    private func loadUnlocked() -> InstanceRegistry {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let decoded = try? InstanceRegistry.decode(data)
         else {
@@ -23,9 +46,7 @@ final class RegistryStore: @unchecked Sendable {
         return decoded
     }
 
-    func save(_ registry: InstanceRegistry) {
-        lock.lock()
-        defer { lock.unlock() }
+    private func saveUnlocked(_ registry: InstanceRegistry) {
         let dir = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)

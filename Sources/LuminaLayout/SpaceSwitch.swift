@@ -61,9 +61,15 @@ extension Session {
 
         session = session.switchTo(destId)
         // `switchTo` unstashes the destination; a window arriving on a space
-        // with active luminaFS must stay parked like any other new tiled leaf.
-        if session.spaces[destId]?.luminaFullscreen != nil {
+        // with active luminaFS must stay parked like any other new tiled leaf,
+        // and focus must stay on the fullscreen window.
+        if let fullscreen = session.spaces[destId]?.luminaFullscreen {
             session = session.markStashed(space: destId, ids: [moving.cgWindowId])
+            if var dest = session.spaces[destId] {
+                dest.focusedWindow = dest.nodes[fullscreen]?.leaf?.cgWindowId
+                dest.lastTiledLeaf = fullscreen
+                session.spaces[destId] = dest
+            }
         }
         return session
     }

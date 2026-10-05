@@ -47,6 +47,8 @@ final class ExtraController: NSObject, @unchecked Sendable {
     /// Crash-restart backoff: consecutive fast crashes per instance.
     private var crashCounts: [UUID: Int] = [:]
     private var lastCrashAt: [UUID: Date] = [:]
+    /// Strong refs so a `terminationHandler` survives until the child exits.
+    private var openProcesses: [Process] = []
     private let statusQueue = DispatchQueue(label: "com.zelmari.lumina.extra.status")
     private var statusTimer: DispatchSourceTimer?
 
@@ -155,13 +157,15 @@ final class ExtraController: NSObject, @unchecked Sendable {
             // refusing to spawn left Start permanently dead. Replace it.
             startRetryAttempts = 0
             log.error("agents did not answer status; replacing \(unresponsive.map(\.pid))")
-            var next = current
             for rec in unresponsive {
                 spawner.quitPids.insert(rec.pid)
                 kill(rec.pid, SIGTERM)
-                next.agents.removeAll { $0.instanceId == rec.instanceId }
             }
-            registry.save(next)
+            registry.mutate { reg in
+                for rec in unresponsive {
+                    reg.agents.removeAll { $0.instanceId == rec.instanceId }
+                }
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 self?.spawnAgent(runLaunchApps: runLaunchApps)
             }
@@ -171,15 +175,11 @@ final class ExtraController: NSObject, @unchecked Sendable {
         startRetryAttempts = 0
         switch decision {
         case .alreadyCurrent(let id):
-            var next = current
-            next.lastCurrentInstanceId = id
-            registry.save(next)
+            registry.mutate { $0.lastCurrentInstanceId = id }
             claimCurrent(id, among: live)
             pollStatus()
         case .attach(let id):
-            var next = current
-            next.lastCurrentInstanceId = id
-            registry.save(next)
+            registry.mutate { $0.lastCurrentInstanceId = id }
             claimCurrent(id, among: live)
             pollStatus()
         case .spawn:
@@ -224,10 +224,10 @@ final class ExtraController: NSObject, @unchecked Sendable {
                 if self.pendingUnstash == nil { self.pendingUnstash = unstashFrom }
                 return
             }
-            var next = self.registry.load()
-            next.agents.append(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
-            next.lastCurrentInstanceId = id
-            self.registry.save(next)
+            self.registry.mutate { reg in
+                reg.agents.append(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
+                reg.lastCurrentInstanceId = id
+            }
             self.spawner.watch(pid: pid) { [weak self] in
                 self?.agentDied(InstanceRecord(instanceId: id, pid: pid, displayUUID: display ?? "", socket: socket))
             }
@@ -268,10 +268,10 @@ final class ExtraController: NSObject, @unchecked Sendable {
         let followedQuit = spawner.quitPids.contains(record.pid)
         switch pidDeathAction(followedQuit: followedQuit) {
         case .removeNoRestart:
-            var reg = registry.load()
-            reg.agents.removeAll { $0.instanceId == record.instanceId }
-            if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
-            registry.save(reg)
+            registry.mutate { reg in
+                reg.agents.removeAll { $0.instanceId == record.instanceId }
+                if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
+            }
         case .restartCrashRecover:
             // A deterministic crash used to respawn forever. Count crashes
             // inside a minute and back off; give up after a few fast ones.
@@ -282,10 +282,10 @@ final class ExtraController: NSObject, @unchecked Sendable {
             crashCounts[record.instanceId] = count
             if count > 5 {
                 log.error("agent \(record.instanceId) crashed \(count) times in a minute; not restarting")
-                var reg = registry.load()
-                reg.agents.removeAll { $0.instanceId == record.instanceId }
-                if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
-                registry.save(reg)
+                registry.mutate { reg in
+                    reg.agents.removeAll { $0.instanceId == record.instanceId }
+                    if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
+                }
                 crashCounts[record.instanceId] = nil
                 lastCrashAt[record.instanceId] = nil
                 pollStatus()
@@ -311,18 +311,18 @@ final class ExtraController: NSObject, @unchecked Sendable {
                 guard let self else { return }
                 guard let pid else {
                     self.log.error("crash respawn failed")
-                    var reg = self.registry.load()
-                    reg.agents.removeAll { $0.instanceId == record.instanceId }
-                    if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
-                    self.registry.save(reg)
+                    self.registry.mutate { reg in
+                        reg.agents.removeAll { $0.instanceId == record.instanceId }
+                        if reg.lastCurrentInstanceId == record.instanceId { reg.lastCurrentInstanceId = nil }
+                    }
                     self.pollStatus()
                     return
                 }
-                var reg = self.registry.load()
-                if let idx = reg.agents.firstIndex(where: { $0.instanceId == record.instanceId }) {
-                    reg.agents[idx].pid = pid
+                self.registry.mutate { reg in
+                    if let idx = reg.agents.firstIndex(where: { $0.instanceId == record.instanceId }) {
+                        reg.agents[idx].pid = pid
+                    }
                 }
-                self.registry.save(reg)
                 self.spawner.watch(pid: pid) { [weak self] in
                     self?.agentDied(InstanceRecord(instanceId: record.instanceId, pid: pid, displayUUID: record.displayUUID, socket: record.socket))
                 }
@@ -396,12 +396,14 @@ final class ExtraController: NSObject, @unchecked Sendable {
             let rec = pair.0
             let st = pair.1
             if reg.lastCurrentInstanceId != rec.instanceId {
-                var next = reg
-                next.lastCurrentInstanceId = rec.instanceId
-                if let sky = st.skylightSpaceId, let idx = next.agents.firstIndex(where: { $0.instanceId == rec.instanceId }) {
-                    next.agents[idx].skylightSpaceId = sky
+                registry.mutate { next in
+                    next.lastCurrentInstanceId = rec.instanceId
+                    if let sky = st.skylightSpaceId,
+                       let idx = next.agents.firstIndex(where: { $0.instanceId == rec.instanceId })
+                    {
+                        next.agents[idx].skylightSpaceId = sky
+                    }
                 }
-                registry.save(next)
             }
             let spaceCount = st.spaceCount ?? 10
             let focused = st.space ?? 1
@@ -444,9 +446,10 @@ final class ExtraController: NSObject, @unchecked Sendable {
         sendTo(instance: rec.instanceId, socket: rec.socket, .quit)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             if kill(rec.pid, 0) == 0 { kill(rec.pid, SIGTERM) }
-            var reg = self?.registry.load() ?? InstanceRegistry(bootSessionUUID: "")
-            reg.agents.removeAll { $0.instanceId == rec.instanceId }
-            self?.registry.save(reg)
+            self?.registry.mutate { reg in
+                reg.agents.removeAll { $0.instanceId == rec.instanceId }
+                if reg.lastCurrentInstanceId == rec.instanceId { reg.lastCurrentInstanceId = nil }
+            }
             self?.pollStatus()
         }
     }
@@ -477,7 +480,12 @@ final class ExtraController: NSObject, @unchecked Sendable {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         proc.arguments = ["-t", path]
-        proc.terminationHandler = { finished in
+        openProcesses.append(proc)
+        proc.terminationHandler = { [weak self, weak proc] finished in
+            guard let proc else { return }
+            DispatchQueue.main.async {
+                self?.openProcesses.removeAll { $0 === proc }
+            }
             guard finished.terminationStatus != 0 else { return }
             let p2 = Process()
             p2.executableURL = URL(fileURLWithPath: "/usr/bin/open")

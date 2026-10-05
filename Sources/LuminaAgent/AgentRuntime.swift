@@ -736,10 +736,29 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             nativeFocus(winner)
         }
         for pair in delta.rebinds {
-            guard let el = elementsById[pair.to], let w = windowAnywhere(pair.from) else { continue }
-            log.info("refresh rebind \(pair.from) -> \(pair.to) bundle=\(w.bundleId ?? "?")")
-            rebindOwned(from: pair.from, to: pair.to, element: el, pid: w.pid)
-            reclassifyRebound(id: pair.to, pid: w.pid, element: el, onScreen: onScreen)
+            guard let el = elementsById[pair.to] else { continue }
+            if let w = windowAnywhere(pair.from) {
+                log.info("refresh rebind \(pair.from) -> \(pair.to) bundle=\(w.bundleId ?? "?")")
+                rebindOwned(from: pair.from, to: pair.to, element: el, pid: w.pid)
+                reclassifyRebound(id: pair.to, pid: w.pid, element: el, onScreen: onScreen)
+            } else if let idx = session.nativeFSWindows.firstIndex(where: { $0.cgWindowId == pair.from }) {
+                // A native-fullscreen window is detached from every space, so
+                // `windowAnywhere` cannot find it; move the bookmark instead
+                // of leaving the old id and an unmanaged new window behind.
+                var w = session.nativeFSWindows[idx]
+                log.info("refresh rebind nativeFS \(pair.from) -> \(pair.to) bundle=\(w.bundleId ?? "?")")
+                w.cgWindowId = pair.to
+                session.nativeFSWindows[idx] = w
+                if let original = knownOriginals[pair.from] {
+                    knownOriginals[pair.to] = original
+                    knownOriginals[pair.from] = nil
+                }
+                elements[pair.from] = nil
+                adapter.forgetWindowId(pair.from)
+                adapter.rememberWindowId(pair.to, for: el)
+                elements[pair.to] = el
+                if let pid = adapter.pid(of: el) { observers.watchWindow(el, pid: pid) }
+            }
         }
         var claimed = session.allWindowIds.union(elements.keys).union(session.nativeFSWindows.map(\.cgWindowId))
         for id in delta.added + delta.recycled {
@@ -1121,7 +1140,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             skyLightIdChanged: skyLightChanged()
         )
         if isNativeFullscreen(signals), let leaf = session.current.leaf(containing: id) {
+            let wasFS = session.current.luminaFullscreen == leaf.id
             session = session.detachNativeFS(space: session.focusedSpace, nodeId: leaf.id)
+            // Detaching the lumina-FS leaf restores sibling roles; their
+            // frames still need unstashing.
+            if wasFS { unstashSpace(session.focusedSpace) }
             applyFrames()
             return
         }
@@ -1231,7 +1254,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func handleBound(_ command: BoundCommand) {
-        if userPaused || displayGone || !isCurrent { return }
+        if isStopping() || userPaused || displayGone || !isCurrent { return }
         log.info("command \(command.commandString)")
         switch command {
         case .focus(let dir):
@@ -1311,7 +1334,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
         case .floatToggle:
             let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)
+            let toggledId = focusedId()
+            let wasFS = session.current.luminaFullscreen != nil
             session = session.floatToggle(space: session.focusedSpace, usableIsWide: usableIsWide(usable))
+            if session.current.luminaFullscreen != nil, let toggledId,
+               session.current.leaf(containing: toggledId) != nil
+            {
+                // Retiling a floater while lumina-fullscreen is active only
+                // marks it stashed; park it or it stays on top of the FS window.
+                stash(ids: [toggledId])
+            } else if wasFS {
+                // Floating the FS leaf exits fullscreen: bring its parked
+                // floaters and siblings back on screen.
+                unstashSpace(session.focusedSpace)
+            }
             applyFrames()
         case .close:
             if let id = focusedId(), let window = windowAnywhere(id),
@@ -1324,6 +1360,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     func handleAgent(_ cmd: AgentCmd, id: String) -> IPCResponse {
         if case .debugWindows = cmd { return .success(id: id, data: debugWindowsJSON()) }
+        if isStopping(), case .status = cmd {
+            // Let a poll during shutdown answer instead of wedging the caller.
+        } else if isStopping() {
+            return .failure(id: id, error: "agent is quitting")
+        }
         switch cmd {
         case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces:
             break
@@ -1473,17 +1514,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 writeWindow(window)
             }
         }
-        if let fs, let node = space.nodes[fs], var window = node.leaf, let el = resolvedElement(for: window) {
-            if let live = adapter.frame(of: el), !framesClose(live, usable, slop: 2) {
-                _ = adapter.setFrame(usable, of: el, tag: &window)
-                if let retryLive = adapter.frame(of: el),
-                   abs(retryLive.x - usable.x) > 24 || abs(retryLive.y - usable.y) > 24
-                {
+        if let fs, let node = space.nodes[fs], let fsWindow = node.leaf {
+            if var window = node.leaf, let el = resolvedElement(for: window) {
+                if let live = adapter.frame(of: el), !framesClose(live, usable, slop: 2) {
                     _ = adapter.setFrame(usable, of: el, tag: &window)
+                    if let retryLive = adapter.frame(of: el),
+                       abs(retryLive.x - usable.x) > 24 || abs(retryLive.y - usable.y) > 24
+                    {
+                        _ = adapter.setFrame(usable, of: el, tag: &window)
+                    }
                 }
+                window.lastOnscreenFrame = usable
+                writeWindow(window)
+            } else if !liveIds.contains(fsWindow.cgWindowId), !isYoung(fsWindow.cgWindowId) {
+                // The fullscreen window died without a destroy note; the main
+                // loop no longer sees it, so record the ghost here.
+                log.info("applyFrames missing fullscreen window=\(fsWindow.cgWindowId)")
+                ghosts.append(fsWindow.cgWindowId)
             }
-            window.lastOnscreenFrame = usable
-            writeWindow(window)
         }
         if var s = session.spaces[session.focusedSpace] {
             for i in s.floating.indices where s.floating[i].role == .floating {
@@ -2187,7 +2235,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// on the focused (newest) leaf, like the insert path.
     @discardableResult
     func clampOverflowOn(_ spaceId: SpaceId) -> Bool {
-        guard let bound, session.spaces[spaceId] != nil else { return false }
+        // Only the focused space is on screen, and a lumina-fullscreen space
+        // must not have its parked siblings floated back into view.
+        guard spaceId == session.focusedSpace,
+              session.spaces[spaceId]?.luminaFullscreen == nil,
+              let bound else { return false }
         let usable = bound.usableRect(gaps: config.gaps)
         let (clamped, floated) = session.clampOverflow(
             space: spaceId,
@@ -2310,6 +2362,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func dropPid(_ pid: pid_t) {
+        let fsBefore = session.current.luminaFullscreen
         let ids = elements.filter { adapter.pid(of: $0.value) == pid }.map(\.key)
         for id in ids {
             for spaceId in Array(session.spaces.keys) {
@@ -2320,6 +2373,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // A native-fullscreen window has no live element while it is on its
         // own Space, so it is not in `ids`; drop it by pid as well.
         session.nativeFSWindows.removeAll { $0.pid == pid }
+        if fsBefore != nil, session.current.luminaFullscreen == nil {
+            unstashSpace(session.focusedSpace)
+        }
         applyFrames()
     }
 
