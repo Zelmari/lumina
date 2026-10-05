@@ -170,6 +170,21 @@ struct ConfigTests {
         #expect(!config.diagnostics.contains(where: { $0.contains("speculative-tile") }))
     }
 
+    @Test func hideUntilTiledAppsDefaultsEmptyAndParsesAList() throws {
+        let bundled = try parseConfig(text: Config.bundledDefaultTOML).get()
+        #expect(bundled.hideUntilTiledApps.isEmpty)
+        let listed = try parseConfig(
+            text: #"hide-until-tiled-apps = ["com.apple.Safari", "com.apple.TextEdit"]"#,
+            defaults: bundled
+        ).get()
+        #expect(listed.hideUntilTiledApps == ["com.apple.Safari", "com.apple.TextEdit"])
+        let config = try parseConfig(
+            text: "hide-until-tiled-apps = []",
+            defaults: Config.bundledDefault
+        ).get()
+        #expect(!config.diagnostics.contains(where: { $0.contains("hide-until-tiled-apps") }))
+    }
+
     @Test func bindingTableHeaderWithCommentStillCollapsesDuplicates() throws {
         let text = """
         [bindings] # main modifier is alt

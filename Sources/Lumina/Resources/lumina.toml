@@ -6,6 +6,8 @@ pre-park-new-windows = true
 # Write a new standard window straight to its predicted tile instead of the
 # corner. Off by default; falls back to the corner on any doubt.
 speculative-tile = false
+# Bundle ids hidden from launch until their first window is tiled.
+hide-until-tiled-apps = []
 # z-order, float-existing, or new-only
 launch-tiling = "z-order"
 launch-apps = []                       # e.g. ["com.apple.Terminal"]
