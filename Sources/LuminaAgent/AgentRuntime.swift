@@ -588,6 +588,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             observers.watch(pid: app.processIdentifier)
             MutationQueue.shared.hop {
                 self.scheduleRefresh(reason: "appActivated")
+                // Lay out the known tree before the refresh discovers the
+                // activating app's window: siblings are settled when it
+                // appears instead of shifting around it.
+                self.applyFrames()
                 if self.ownedWindows(pid: app.processIdentifier).isEmpty {
                     self.launchPollsRemaining = max(self.launchPollsRemaining, 3)
                     self.launchPollDelay = 0.25
