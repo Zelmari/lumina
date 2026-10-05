@@ -1371,7 +1371,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return .failure(id: id, error: "agent is quitting")
         }
         switch cmd {
-        case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces:
+        case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces, .verify:
             break
         default:
             if userPaused || displayGone || !isCurrent { return .success(id: id) }
@@ -1432,6 +1432,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return .success(id: id, data: listWindowsJSON())
         case .listWorkspaces:
             return .success(id: id, data: listWorkspacesJSON())
+        case .verify:
+            return .success(id: id, data: verifyWindowsJSON())
         case .status:
             return .success(id: id, data: statusJSON())
         case .markCurrent:
@@ -2688,6 +2690,26 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "focused": .int(session.focusedSpace.raw),
             "count": .int(session.spaceCount),
             "spaces": .array(spaces),
+        ])
+    }
+
+    /// Machine-checkable invariants over the live model. An agent can run
+    /// `lumina verify` after any command and fail on a non-empty list.
+    func verifyWindowsJSON() -> JSONValue {
+        guard let bound else {
+            return .object([
+                "ok": .bool(false),
+                "issues": .array([.object(["kind": .string("no-display"), "detail": .string("agent has no bound display")])]),
+            ])
+        }
+        let issues = verifySession(session, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
+        return .object([
+            "ok": .bool(issues.isEmpty),
+            "focusedSpace": .int(session.focusedSpace.raw),
+            "windowCount": .int(session.allWindowIds.count),
+            "issues": .array(issues.map {
+                .object(["kind": .string($0.kind), "detail": .string($0.detail)])
+            }),
         ])
     }
 

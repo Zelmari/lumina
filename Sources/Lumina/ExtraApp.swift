@@ -571,6 +571,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .quit: return "quit"
     case .listWindows: return "list-windows"
     case .listWorkspaces: return "list-workspaces"
+    case .verify: return "verify"
     case .status: return "status"
     case .markCurrent: return "mark-current"
     case .yield: return "yield"

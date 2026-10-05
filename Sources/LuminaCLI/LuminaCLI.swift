@@ -76,6 +76,12 @@ enum LuminaCLI {
             exit(writeDebugDump(resp, log: log))
         }
         printResponse(resp, log: log)
+        if request.cmd == "verify" {
+            // `lumina verify` is a test primitive: a clean report is exit 0,
+            // any invariant violation is exit 1, even though the IPC succeeded.
+            let clean = resp.data?.object?["ok"]?.bool ?? false
+            exit(resp.ok && clean ? 0 : 1)
+        }
         exit(resp.ok ? 0 : 1)
     }
 

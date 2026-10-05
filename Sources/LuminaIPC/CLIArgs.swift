@@ -21,6 +21,7 @@ public enum CLIArgs {
     move-node-to-workspace 1..10 move the focused window and follow
     list-windows                 print managed windows as JSON
     list-workspaces              print workspaces as JSON
+    verify                       check tiling invariants; exit 1 on issues
     status                       print agent status as JSON
     debug-windows                write a debug dump
     reload                       reload ~/.config/lumina/lumina.toml
@@ -78,7 +79,7 @@ public enum CLIArgs {
             }
             return IPCRequest(id: id, cmd: "fullscreen")
         case "float-toggle", "balance", "close", "pause", "resume", "reload",
-             "list-windows", "list-workspaces", "status", "debug-windows",
+             "list-windows", "list-workspaces", "verify", "status", "debug-windows",
              "start", "quit-all", "open-config", "current-token":
             return IPCRequest(id: id, cmd: head)
         case "quit", "exit":

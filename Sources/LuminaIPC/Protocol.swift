@@ -86,6 +86,7 @@ public enum AgentCmd: Equatable, Sendable {
     case quit
     case listWindows
     case listWorkspaces
+    case verify
     case status
     /// Extra-only: swipe-back attach without SkyLight (reason `start`).
     case markCurrent
