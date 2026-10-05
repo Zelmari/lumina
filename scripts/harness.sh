@@ -16,6 +16,10 @@
 #   LUMINA       path to the CLI (default: bundled app, PATH, then .build/debug)
 #   WINDOW_COUNT how many test windows to open (default 3)
 #   KEEP_WINDOWS set to 1 to leave the documents open for inspection
+#   QUIT_TEST    set to 1 to finish by quitting Lumina and checking that every
+#                managed window was restored to a usable size (Lumina stays
+#                quit afterwards; relaunch it yourself)
+#   LUMINA_LOG   agent log path (default ~/Library/Logs/Lumina.log)
 
 set -uo pipefail
 
@@ -59,7 +63,7 @@ run() {
   printf '%s\n' "$out"
 }
 
-# Check invariants. Any issue is a failure with the raw report.
+# Check invariants and that no tracked window silently left the model.
 verify() {
   local label="${1:-verify}"
   STEP=$((STEP + 1))
@@ -71,6 +75,13 @@ verify() {
   else
     pass "$label: verify clean"
   fi
+  if [[ -n "${TRACKED_IDS:-}" ]]; then
+    local missing
+    missing="$(missing_ids "$TRACKED_IDS")"
+    if [[ -n "$missing" ]]; then
+      fail "$label: windows left the model: $missing"
+    fi
+  fi
 }
 
 managed_count() {
@@ -78,18 +89,43 @@ managed_count() {
     python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("windows", [])))' 2>/dev/null || echo 0
 }
 
+window_ids() {
+  "$LUMINA" list-windows 2>/dev/null |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(str(w["cgWindowId"]) for w in d.get("windows", [])))' 2>/dev/null || true
+}
+
+count_on_space() {
+  "$LUMINA" list-windows 2>/dev/null |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); s=int(sys.argv[1]); print(sum(1 for w in d.get("windows", []) if w.get("space") == s))' "$1" 2>/dev/null || echo 0
+}
+
+# Ids that were in the model before but are gone now. Catches the reported
+# "opening on a new workspace empties the others" bug directly.
+missing_ids() {
+  "$LUMINA" list-windows 2>/dev/null |
+    python3 -c '
+import json, sys
+current = {w["cgWindowId"] for w in json.load(sys.stdin).get("windows", [])}
+expected = {int(x) for x in sys.argv[1].split()}
+print(" ".join(str(i) for i in sorted(expected - current)))
+' "$1" 2>/dev/null || true
+}
+
+# `open -n` needs no Automation permission, unlike osascript-driven TextEdit.
 open_windows() {
   local n="$1"
   for ((i = 0; i < n; i++)); do
-    osascript -e 'tell application "TextEdit" to make new document' >/dev/null 2>&1 ||
-      { fail "could not create TextEdit document $((i + 1))"; return 1; }
-    sleep 0.35
+    open -n -a TextEdit >/dev/null 2>&1 ||
+      { fail "could not launch TextEdit window $((i + 1))"; return 1; }
+    sleep 0.4
   done
 }
 
+# The harness owns every TextEdit instance it launched; the header warns the
+# user not to have documents open.
 close_windows() {
-  osascript -e 'tell application "TextEdit" to close every document saving no' >/dev/null 2>&1 || true
-  sleep 0.6
+  pkill -x TextEdit >/dev/null 2>&1 || true
+  sleep 0.8
 }
 
 wait_for_count() {
@@ -119,6 +155,31 @@ else
   fail "windows were not adopted: still $(managed_count) managed (wanted $((baseline + WINDOW_COUNT)))"
 fi
 verify "after open"
+TRACKED_IDS="$(window_ids)"
+
+# Regression for "swapped to a new workspace and opened something, all the
+# other workspaces got emptied". Opening on a fresh workspace must not remove
+# a single tracked window from any other workspace.
+say "open on a fresh workspace keeps the other workspaces intact"
+space1_before="$(count_on_space 1)"
+run workspace 2 >/dev/null
+verify "on empty workspace 2"
+open_windows 1
+sleep 1
+TRACKED_IDS="$TRACKED_IDS $(window_ids)"
+if [[ "$(count_on_space 1)" -ge "$space1_before" ]]; then
+  pass "workspace 1 kept its $space1_before windows"
+else
+  fail "workspace 1 lost windows: had $space1_before, now $(count_on_space 1)"
+fi
+if [[ "$(count_on_space 2)" -ge 1 ]]; then
+  pass "the new window landed on workspace 2"
+else
+  fail "the new window did not land on workspace 2 (found on another workspace)"
+fi
+verify "after opening on workspace 2"
+run workspace 1 >/dev/null
+verify "back on workspace 1"
 
 say "focus movement"
 run focus right >/dev/null
@@ -169,17 +230,49 @@ say "reload config"
 run reload >/dev/null
 verify "after reload"
 
-if [[ "$KEEP_WINDOWS" != "1" ]]; then
-  say "closing test windows"
-  close_windows
-  if wait_for_count "$baseline"; then
-    pass "baseline restored"
+if [[ "${QUIT_TEST:-0}" == "1" ]]; then
+  # Quit restore is the other reported failure: windows left parked
+  # off-screen or at sliver sizes. The agent logs one restore per managed
+  # window; check every target is a usable size, then confirm it exited.
+  say "quit restore leaves windows usable (QUIT_TEST=1)"
+  log_file="${LUMINA_LOG:-$HOME/Library/Logs/Lumina.log}"
+  managed_before="$(managed_count)"
+  marker="$(wc -l < "$log_file" 2>/dev/null | tr -d ' ' || echo 0)"
+  "$LUMINA" quit >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    pgrep -f lumina-agent >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  sleep 1
+  new_lines="$(tail -n "+$((marker + 1))" "$log_file" 2>/dev/null || true)"
+  restored="$(printf '%s\n' "$new_lines" | grep -c 'quit restore' || true)"
+  if [[ "$restored" -ge "$managed_before" ]]; then
+    pass "logged $restored restores for $managed_before managed windows"
   else
-    fail "windows did not close: $(managed_count) managed (baseline $baseline)"
+    fail "only $restored restore logs for $managed_before managed windows"
   fi
-  verify "after close"
+  slivers="$(printf '%s\n' "$new_lines" | grep 'quit restore' | grep -Ev 'target=[0-9]{3,}x[0-9]{3,}' | wc -l | tr -d ' ')"
+  if [[ "$slivers" == "0" ]]; then
+    pass "every restore target is a usable size"
+  else
+    fail "$slivers restore targets are slivers or tiny"
+  fi
+  TRACKED_IDS=""
+  pkill -x TextEdit >/dev/null 2>&1 || true
 else
-  say "KEEP_WINDOWS=1: leaving documents open"
+  if [[ "$KEEP_WINDOWS" != "1" ]]; then
+    say "closing test windows"
+    TRACKED_IDS=""
+    close_windows
+    if wait_for_count "$baseline"; then
+      pass "baseline restored"
+    else
+      fail "windows did not close: $(managed_count) managed (baseline $baseline)"
+    fi
+    verify "after close"
+  else
+    say "KEEP_WINDOWS=1: leaving documents open"
+  fi
 fi
 
 if [[ $FAILURES -eq 0 ]]; then
