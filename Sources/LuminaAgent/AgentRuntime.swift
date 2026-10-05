@@ -322,8 +322,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         return classify(input, rules: config.windowRules)
     }
 
+    /// The frame to remember as a window's pre-tiling geometry. A stored
+    /// original is trusted unless it looks like an engine tile (stale tiles
+    /// from earlier sessions must not become "originals"); a live frame is
+    /// only captured when it is on screen and not tile-shaped.
+    func trustedOriginal(id: UInt32, liveFrame: Rect, usable: Rect) -> Rect? {
+        if let known = knownOriginals[id],
+           !looksLikeEngineFrame(known, usable: usable, gaps: config.gaps)
+        {
+            return known
+        }
+        if isStashedAway(liveFrame) { return nil }
+        if looksLikeEngineFrame(liveFrame, usable: usable, gaps: config.gaps) { return nil }
+        return liveFrame
+    }
+
     func collectManagedWindows() -> [(WindowRef)] {
         guard let bound else { return [] }
+        let usable = bound.usableRect(gaps: config.gaps)
         let started = Date()
         var out: [WindowRef] = []
         let cg = onScreenCGWindows(intersecting: bound.axFrame)
@@ -379,12 +395,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 adapter.rememberWindowId(id, for: el)
                 elements[id] = el
                 let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                let known = knownOriginals[id]
-                let original: Rect? = (known != nil || !isStashedAway(frame))
-                    ? resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals)
-                    : nil
+                let original = trustedOriginal(id: id, liveFrame: frame, usable: usable)
                 let w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: original)
-                if let original { knownOriginals[id] = original }
+                knownOriginals[id] = original
                 markBorn(id)
                 out.append(w)
             }
@@ -410,12 +423,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 adapter.rememberWindowId(id, for: focusedEl)
                 elements[id] = focusedEl
                 let frame = adapter.frame(of: focusedEl) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                let known = knownOriginals[id]
-                let original: Rect? = (known != nil || !isStashedAway(frame))
-                    ? resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals)
-                    : nil
+                let original = trustedOriginal(id: id, liveFrame: frame, usable: usable)
                 let w = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: original)
-                if let original { knownOriginals[id] = original }
+                knownOriginals[id] = original
                 markBorn(id)
                 out.append(w)
                 log.info("adopt focused window at boot pid=\(pid) id=\(id) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
@@ -1020,15 +1030,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(id, for: element)
         elements[id] = element
         let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-        // A park frame is not the user's geometry; never record it as the
-        // original or quit would restore a window to a 1px corner.
-        let known = knownOriginals[id]
-        let original: Rect? = (known != nil || !isStashedAway(frame))
-            ? resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals)
-            : nil
-        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: original)
-        if let original { knownOriginals[id] = original }
         let usable = bound.usableRect(gaps: config.gaps)
+        // A park or engine-tile frame is not the user's geometry; never record
+        // it as the original or quit would restore a tile (or a 1px corner).
+        let original = trustedOriginal(id: id, liveFrame: frame, usable: usable)
+        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: original)
+        knownOriginals[id] = original
         let target = session.spaces[targetId] ?? session.current
         if target.luminaFullscreen != nil {
             session = session.insertWhileLuminaFS(space: targetId, window: window, result: result, usableIsWide: usableIsWide(usable))
@@ -2008,6 +2015,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             w.originalFrame = nil
             hadOriginal = false
         }
+        if let original = w.originalFrame, let bound,
+           looksLikeEngineFrame(original, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
+        {
+            // A tile-shaped frame from any earlier layout (not just the
+            // current one) is not the user's geometry.
+            knownOriginals[w.cgWindowId] = nil
+            w.originalFrame = nil
+            hadOriginal = false
+        }
         w.lastOnscreenFrame = w.originalFrame ?? fallbackRestoreRect()
         let t = w.lastOnscreenFrame
         log.info("quit restore window=\(w.cgWindowId) bundle=\(w.bundleId ?? "?") original=\(hadOriginal) target=\(Int(t.w))x\(Int(t.h)) @\(Int(t.x)),\(Int(t.y))")
@@ -2046,12 +2062,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func refreshOriginalsFromLive() {
         guard let bound else { return }
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        let usable = bound.usableRect(gaps: config.gaps)
         for spaceId in session.spaces.keys {
             guard var space = session.spaces[spaceId] else { continue }
             for (nodeId, var node) in space.nodes {
                 guard var leaf = node.leaf, let el = elements[leaf.cgWindowId],
                       let live = adapter.frame(of: el),
-                      !isFrameStashedAway(live, display: display)
+                      !isFrameStashedAway(live, display: display),
+                      !looksLikeEngineFrame(live, usable: usable, gaps: config.gaps)
                 else { continue }
                 leaf.originalFrame = live
                 node.leaf = leaf
@@ -2061,7 +2079,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             for i in space.floating.indices {
                 let w = space.floating[i]
                 guard let el = elements[w.cgWindowId], let live = adapter.frame(of: el),
-                      !isFrameStashedAway(live, display: display)
+                      !isFrameStashedAway(live, display: display),
+                      !looksLikeEngineFrame(live, usable: usable, gaps: config.gaps)
                 else { continue }
                 space.floating[i].originalFrame = live
                 knownOriginals[w.cgWindowId] = live
