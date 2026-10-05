@@ -832,6 +832,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // a sibling remains there.
             nativeFocus(winner)
         }
+        // Native-tab apps keep one logical window across several backing
+        // NSWindows; resolve that before adopting anything.
+        reconcileNativeTabs(live: live, elementsById: elementsById)
         for pair in delta.rebinds {
             guard let el = elementsById[pair.to] else { continue }
             if let w = windowAnywhere(pair.from) {
@@ -931,16 +934,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             return
         }
+        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         if let frame = adapter.frame(of: element), isStashedAway(frame) {
             // A fresh window's first AX read can be an empty frame while it
             // animates in; that is not our park. Our parks always keep height.
-            // Only skip when the app already owns model windows: an app whose
-            // saved window position is a park corner (macOS restores the last
-            // frame) has none yet and must be adopted and tiled, or it is
+            // Only skip when the app already has an on-screen model window:
+            // an app whose saved window position is a park corner (macOS
+            // restores the last frame) must be adopted and tiled, or it is
             // never managed.
             let empty = frame.w < 8 && frame.h < 8
-            let pidOwnsModelWindow = adapter.pid(of: element).map { !ownedWindows(pid: $0).isEmpty } ?? false
-            if !empty, pidOwnsModelWindow {
+            let pidHasOnScreenModelWindow = adapter.pid(of: element).map { pid in
+                ownedWindows(pid: pid).contains { onScreen.contains($0.1.cgWindowId) }
+            } ?? false
+            if !empty, pidHasOnScreenModelWindow {
                 log.info("onCreate skip stashed-away role=\(adapter.role(of: element) ?? "?")")
                 return
             }
@@ -955,7 +961,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             restashPid(peekPid, on: sid)
             return
         }
-        let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
         guard let (input, id, pid) = classifyInput(
             from: element,
             adapter: adapter,
@@ -1229,6 +1234,71 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
         }
         if wasFS { unstashSpace(session.focusedSpace) }
+    }
+
+    /// Native-tab apps (Terminal, Ghostty) implement tabs as separate
+    /// NSWindows in one NSWindowTabGroup; exactly one backing window is
+    /// on-screen at a time. Keep one model entry per app window: rebind the
+    /// slot to the active backing window on a tab switch, and drop the other
+    /// backing windows from the model. CG keeps listing them, so the removal
+    /// gate would otherwise defer them forever as invisible tiles.
+    func reconcileNativeTabs(live: [LiveWindow], elementsById: [UInt32: AXUIElement]) {
+        guard !config.nativeTabs.isEmpty else { return }
+        let apps = Set(config.nativeTabs)
+        var modelByPid: [pid_t: [WindowRef]] = [:]
+        for space in session.spaces.values {
+            for w in space.tiledLeaves().compactMap(\.leaf) + space.floating where apps.contains(w.bundleId ?? "") {
+                modelByPid[w.pid, default: []].append(w)
+            }
+        }
+        for (pid, entries) in modelByPid {
+            let liveForPid = live.filter { $0.pid == pid }
+            let onScreen = liveForPid.filter(\.onScreen)
+            // Two on-screen windows are genuinely separate windows, not tabs.
+            guard onScreen.count == 1, let active = onScreen.first else { continue }
+            let activeId = active.cgWindowId
+            if entries.contains(where: { $0.cgWindowId == activeId }) {
+                for w in entries where w.cgWindowId != activeId {
+                    removeNativeTabWindow(w)
+                }
+                continue
+            }
+            // Tab switch: the active backing window is not the model entry.
+            // Keep the best existing slot and rebind it; drop the rest.
+            let candidates = entries.filter { !isMinimizedEntry($0) }
+            guard let keeper = bestTabSlot(candidates, active: active),
+                  let element = elementsById[activeId]
+            else { continue }
+            log.info("native tabs rebind \(keeper.cgWindowId) -> \(activeId) pid=\(pid) bundle=\(keeper.bundleId ?? "?")")
+            rebindOwned(from: keeper.cgWindowId, to: activeId, element: element, pid: pid)
+            for w in entries where w.cgWindowId != keeper.cgWindowId {
+                removeNativeTabWindow(w)
+            }
+        }
+    }
+
+    func isMinimizedEntry(_ window: WindowRef) -> Bool {
+        guard let el = elements[window.cgWindowId] else { return false }
+        return adapter.isMinimized(el)
+    }
+
+    /// Prefer the slot the model considers focused, then the closest frame.
+    func bestTabSlot(_ entries: [WindowRef], active: LiveWindow) -> WindowRef? {
+        if let focused = entries.first(where: { w in
+            session.spaces.values.contains { $0.focusedWindow == w.cgWindowId }
+        }) {
+            return focused
+        }
+        return entries.min { a, b in
+            a.lastOnscreenFrame.center.distance(to: active.frame.center)
+                < b.lastOnscreenFrame.center.distance(to: active.frame.center)
+        }
+    }
+
+    func removeNativeTabWindow(_ window: WindowRef) {
+        if isMinimizedEntry(window) { return }
+        log.info("native tabs drop inactive window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?")")
+        removeDestroyedWindow(window.cgWindowId)
     }
 
     func isOffEveryDisplay(_ rect: Rect) -> Bool {
