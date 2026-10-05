@@ -103,6 +103,18 @@ public final class AXAdapter {
         return fallbackWindowId(for: element, excluding: excluding)
     }
 
+    /// The window id only when it resolves without the frame-matching
+    /// fallback. Used to filter generic AXCreated noise cheaply: a non-window
+    /// element costs no AX server round trip here (the private id call and the
+    /// cache are local).
+    public func windowIdIfKnown(for element: AXUIElement) -> UInt32? {
+        if let cached = cachedWindowId(for: element) { return cached }
+        guard let axGetWindow else { return nil }
+        var id: UInt32 = 0
+        let err = axGetWindow(element, &id)
+        return err == 0 && id != 0 ? id : nil
+    }
+
     /// Pointer-keyed lookup. AXUIElement pointers are reused after the AX
     /// server destroys an element, so a cache hit is only trusted when the
     /// tracked element at that id is still the same object; otherwise the
