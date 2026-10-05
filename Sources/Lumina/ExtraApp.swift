@@ -51,6 +51,11 @@ final class ExtraController: NSObject, @unchecked Sendable {
     private var openProcesses: [Process] = []
     private let statusQueue = DispatchQueue(label: "com.zelmari.lumina.extra.status")
     private var statusTimer: DispatchSourceTimer?
+    /// `LoginService.enabled` is an SMAppService XPC query. It used to run on
+    /// the main thread on every status tick; a short TTL still notices an
+    /// external System Settings change.
+    private var cachedLoginEnabled: Bool?
+    private var cachedLoginEnabledAt = Date.distantPast
 
     override init() {
         uid = getuid()
@@ -431,6 +436,18 @@ final class ExtraController: NSObject, @unchecked Sendable {
         statusQueue.async { [weak self] in self?.pollStatusBody() }
     }
 
+    /// Cached LoginService status; see `cachedLoginEnabled`.
+    func loginEnabled() -> Bool {
+        let now = Date()
+        if let cachedLoginEnabled, now.timeIntervalSince(cachedLoginEnabledAt) < 30 {
+            return cachedLoginEnabled
+        }
+        let value = LoginService.enabled
+        cachedLoginEnabled = value
+        cachedLoginEnabledAt = now
+        return value
+    }
+
     func pollStatusBody() {
         let reg = registry.load()
         let live = reg.agents.filter { kill($0.pid, 0) == 0 }
@@ -441,12 +458,6 @@ final class ExtraController: NSObject, @unchecked Sendable {
             }
         }
         let winnerId = pickCurrentAgent(claimants: claimants.map(\.0.instanceId), lastCurrent: reg.lastCurrentInstanceId)
-        if let winnerId {
-            for pair in claimants where pair.0.instanceId != winnerId {
-                // Only one agent may hold current; losers must drop hotkeys/frames.
-                sendTo(instance: pair.0.instanceId, socket: pair.0.socket, .yield)
-            }
-        }
         if let winnerId, let pair = claimants.first(where: { $0.0.instanceId == winnerId }) {
             let rec = pair.0
             let st = pair.1
@@ -472,13 +483,25 @@ final class ExtraController: NSObject, @unchecked Sendable {
                     spaceCount: spaceCount,
                     focused: focused,
                     paused: paused,
-                    loginEnabled: LoginService.enabled,
+                    loginEnabled: self.loginEnabled(),
                     warning: warning
                 )
             }
+            // Yield losers off the poll path: an unresponsive agent used to
+            // hold up the strip and the next poll for up to its socket timeout.
+            let losers = claimants.filter { $0.0.instanceId != rec.instanceId }
+            if !losers.isEmpty {
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    for pair in losers {
+                        // Only one agent may hold current; losers must drop
+                        // hotkeys/frames.
+                        self?.sendTo(instance: pair.0.instanceId, socket: pair.0.socket, .yield)
+                    }
+                }
+            }
         } else {
             DispatchQueue.main.async { [weak self] in
-                self?.status.updateEmpty(loginEnabled: LoginService.enabled)
+                self?.status.updateEmpty(loginEnabled: self?.loginEnabled() ?? false)
             }
         }
     }
@@ -562,6 +585,8 @@ final class ExtraController: NSObject, @unchecked Sendable {
         #if os(macOS)
         if #available(macOS 13.0, *) {
             status.loginNote = LoginService.toggle()
+            cachedLoginEnabled = LoginService.enabled
+            cachedLoginEnabledAt = Date()
             pollStatus()
         }
         #endif
