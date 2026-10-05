@@ -49,6 +49,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
     var pendingRefresh: RefreshRequest?
     var refreshScheduled = false
+    /// Pids launched since the agent started. An app launched hidden (or via
+    /// AppleScript) has no on-screen window, so it would otherwise never be
+    /// enumerated; its main window is adopted and the app unhidden.
+    var recentlyLaunchedPids: Set<pid_t> = []
     /// Bounded follow-up passes when a window was not resolvable yet.
     var unresolvedRefreshPasses = 0
     var refreshUnresolved = false
@@ -66,6 +70,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     var knownOriginals: [UInt32: Rect] = [:]
     /// Consecutive-miss and failed-read bookkeeping for refresh removals.
     var removalGate = RemovalGate()
+    /// Sizes an app has actually refused to shrink below. Some apps report
+    /// AXMinSize 0 but clamp in practice; without this they overlap the
+    /// neighbour whose tile they overflow. A read that still shows the
+    /// previous target is treated as "not applied yet", not as a minimum.
+    var observedMinSizes: [UInt32: Size] = [:]
+    var clampingOverflow = false
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
     /// Cascade offset for quit restore when the saved original is really the
@@ -348,6 +358,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     "classify \(app.bundleIdentifier ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
                 )
                 if result == .unmanaged || result == .ignored { continue }
+                if input.appHidden {
+                    // Adopted main window of a hidden app: show the app.
+                    adapter.unhide(pid: pid)
+                }
                 observers.watchWindow(el, pid: pid)
                 adapter.rememberWindowId(id, for: el)
                 elements[id] = el
@@ -378,6 +392,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         {
             let result = classify(input, rules: config.windowRules)
             if result != .unmanaged && result != .ignored {
+                if input.appHidden { adapter.unhide(pid: pid) }
                 observers.watchWindow(focusedEl, pid: pid)
                 adapter.rememberWindowId(id, for: focusedEl)
                 elements[id] = focusedEl
@@ -430,6 +445,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             DispatchQueue.main.async { self.observers.watch(pid: pid) }
             MutationQueue.shared.hop { [weak self] in
                 guard let self else { return }
+                self.recentlyLaunchedPids.insert(pid)
                 self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
                 self.scheduleRefresh(reason: "appLaunched")
             }
@@ -439,6 +455,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     @objc func appTerminated(_ n: Notification) {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
+                self.recentlyLaunchedPids.remove(app.processIdentifier)
                 self.observers.unwatch(pid: app.processIdentifier)
                 self.adapter.forgetAccessibility(pid: app.processIdentifier)
                 self.dropPid(app.processIdentifier)
@@ -855,6 +872,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let front = NSWorkspace.shared.frontmostApplication?.processIdentifier, !isOurProcess(front) {
             pids.insert(front)
         }
+        // A just-launched hidden app has no on-screen window yet.
+        pids.formUnion(recentlyLaunchedPids.filter { !isOurProcess($0) })
         return pids.sorted()
     }
 
@@ -947,6 +966,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         log.info(
             "onCreate \(input.bundleId ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
         )
+        if input.appHidden, result == .tiled || result == .floating {
+            // Adopted main window of a hidden app: show the app.
+            adapter.unhide(pid: pid)
+        }
         if result == .unmanaged || result == .ignored {
             // Classified from a placeholder frame (or before appearing
             // on-screen): resolve it on a later session.
@@ -990,6 +1013,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             var space = target
             space.floating.append(window)
             session.spaces[targetId] = space
+            // An app can restore a floater at a corner park (macOS saved the
+            // frame while it was hidden). Pull it into view instead of
+            // leaving a 1px sliver the user cannot reach.
+            if isStashedAway(frame) {
+                placeFloated([window], space: targetId)
+            }
         } else {
             session = session.insertSpiral(space: targetId, newLeaf: window, usableIsWide: usableIsWide(usable))
             let mins = minSizes()
@@ -1131,6 +1160,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.forgetWindowId(id)
         forgetBorn(id)
         knownOriginals[id] = nil
+        observedMinSizes[id] = nil
     }
 
     /// Drop a window that is really gone: close it on the focused space, remove
@@ -1520,6 +1550,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var ghosts: [UInt32] = []
         var budgetBroke = false
         var visited: Set<NodeId> = []
+        var overflowed = false
         for (nodeId, rect) in rects {
             if MutationQueue.shared.shouldSkip(started: started) {
                 budgetBroke = true
@@ -1552,6 +1583,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 session.spaces[session.focusedSpace] = s
                 continue
             }
+            let previous = window.lastOnscreenFrame
             window.lastOnscreenFrame = rect
             let result = adapter.setFrame(rect, of: el, tag: &window)
             node.leaf = window
@@ -1567,15 +1599,44 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     log.info("setFrame timeout window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?"); will retry next pass")
                 }
             }
-            // A busy app can land the size but drop the position, leaving the
-            // window overlapping its neighbours. Re-issue once when the
-            // position is wrong. Size clamps are left alone on purpose:
-            // read-back size checks retried forever on apps like Ghostty.
-            if let live = adapter.frame(of: el), abs(live.x - rect.x) > 24 || abs(live.y - rect.y) > 24 {
-                log.info("layout retry window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?") live=\(Int(live.x)),\(Int(live.y)) target=\(Int(rect.x)),\(Int(rect.y))")
-                _ = adapter.setFrame(rect, of: el, tag: &window)
-                writeWindow(window)
+            if let live = adapter.frame(of: el) {
+                // An app that refuses to shrink below its real minimum keeps
+                // the larger frame and overlaps its neighbour. Only a write
+                // that actually asked to shrink counts: a read still matching
+                // the previous target is "not applied yet", and a user-dragged
+                // frame is handled by the title-bar path.
+                let askedToShrink = previous.w > rect.w + 4 || previous.h > rect.h + 4
+                let stillOverflows = live.w > rect.w + 4 || live.h > rect.h + 4
+                if askedToShrink, stillOverflows, !framesClose(live, previous, slop: 4) {
+                    let prior = observedMinSizes[window.cgWindowId] ?? .unknown
+                    observedMinSizes[window.cgWindowId] = Size(
+                        w: max(prior.w, live.w),
+                        h: max(prior.h, live.h)
+                    )
+                    overflowed = true
+                }
+                // A busy app can land the size but drop the position, leaving
+                // the window overlapping its neighbours. Re-issue once when
+                // the position is wrong. Size clamps are left alone on
+                // purpose: read-back size checks retried forever on apps like
+                // Ghostty.
+                if abs(live.x - rect.x) > 24 || abs(live.y - rect.y) > 24 {
+                    log.info("layout retry window=\(window.cgWindowId) bundle=\(window.bundleId ?? "?") live=\(Int(live.x)),\(Int(live.y)) target=\(Int(rect.x)),\(Int(rect.y))")
+                    _ = adapter.setFrame(rect, of: el, tag: &window)
+                    writeWindow(window)
+                }
             }
+        }
+        if overflowed, !clampingOverflow {
+            // Re-clamp with the observed minimums so the offender floats
+            // instead of overlapping. The flag stops a window whose minimum
+            // cannot fit at all from looping.
+            clampingOverflow = true
+            defer { clampingOverflow = false }
+            log.info("layout overflow: clamping with observed minimum sizes")
+            clampOverflowOn(session.focusedSpace)
+            applyFrames()
+            return
         }
         if let fs, let node = space.nodes[fs], let fsWindow = node.leaf {
             if var window = node.leaf, let el = resolvedElement(for: window) {
@@ -2324,6 +2385,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let size = adapter.minSize(of: el)
             if size != .unknown { out[id] = size }
         }
+        for (id, size) in observedMinSizes {
+            if let existing = out[id] {
+                out[id] = Size(w: max(existing.w, size.w), h: max(existing.h, size.h))
+            } else {
+                out[id] = size
+            }
+        }
         return out
     }
 
@@ -2758,7 +2826,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 "issues": .array([.object(["kind": .string("no-display"), "detail": .string("agent has no bound display")])]),
             ])
         }
-        var issues = verifySession(session, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
+        let usable = bound.usableRect(gaps: config.gaps)
+        var issues = verifySession(session, usable: usable, gaps: config.gaps)
         // A retained element that no longer answers is the pre-removal shape:
         // report it without enumerating every app (a busy app's failed read
         // would otherwise look like a dead window).
@@ -2769,6 +2838,39 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     issues.append(VerifyIssue(
                         "dead-element-window",
                         "window \(w.cgWindowId) (\(w.bundleId ?? "?")) has a dead AX element but is still in the model"
+                    ))
+                }
+            }
+        }
+        // Occupancy: every tiled window on the focused space must actually be
+        // sitting at its computed tile. A live window elsewhere means an
+        // invisible leaf is occupying the tile.
+        if session.current.luminaFullscreen == nil {
+            let rects = frames(space: session.current, usable: usable, gaps: config.gaps)
+            for node in session.current.tiledLeaves() where node.leaf?.role == .tiled {
+                guard let w = node.leaf, let rect = rects[node.id],
+                      let el = elements[w.cgWindowId], adapter.pid(of: el) == w.pid,
+                      adapter.isAliveElement(el), let live = adapter.frame(of: el)
+                else { continue }
+                if !framesClose(live, rect, slop: 8) {
+                    issues.append(VerifyIssue(
+                        "tile-frame-mismatch",
+                        "window \(w.cgWindowId) (\(w.bundleId ?? "?")) is at \(Int(live.x)),\(Int(live.y)) \(Int(live.w))x\(Int(live.h)) but its tile is \(Int(rect.x)),\(Int(rect.y)) \(Int(rect.w))x\(Int(rect.h))"
+                    ))
+                }
+            }
+        }
+        // Hidden workspaces: every window must be physically parked. A role
+        // of `.stashed` is not enough if the park write was dropped.
+        for (sid, space) in session.spaces where sid != session.focusedSpace {
+            for w in space.tiledLeaves().compactMap(\.leaf) + space.floating {
+                guard let el = elements[w.cgWindowId], adapter.pid(of: el) == w.pid,
+                      let live = adapter.frame(of: el)
+                else { continue }
+                if !isStashedAway(live) {
+                    issues.append(VerifyIssue(
+                        "hidden-window-onscreen",
+                        "window \(w.cgWindowId) (\(w.bundleId ?? "?")) on workspace \(sid.raw) is on screen at \(Int(live.x)),\(Int(live.y))"
                     ))
                 }
             }

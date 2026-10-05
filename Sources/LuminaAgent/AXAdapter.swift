@@ -481,6 +481,10 @@ public final class AXAdapter {
         NSRunningApplication(processIdentifier: pid)?.bundleIdentifier
     }
 
+    public func isMainWindow(_ element: AXUIElement) -> Bool {
+        boolAttribute(element, kAXMainAttribute as CFString)
+    }
+
     public func isFullscreen(_ element: AXUIElement) -> Bool {
         var ref: CFTypeRef?
         let attr = "AXFullScreen" as CFString
@@ -700,6 +704,9 @@ public func classifyInput(
         width: frame.w,
         height: frame.h,
         isOnScreen: idOnScreen,
+        isMinimized: adapter.isMinimized(element),
+        appHidden: NSRunningApplication(processIdentifier: pid)?.isHidden ?? false,
+        isMainWindow: adapter.isMainWindow(element),
         pidAlreadyHasOnScreenWindow: !pidOnScreenFrames.isEmpty,
         layerOrIsHUD: layer >= 3,
         isPiP: adapter.subrole(of: element) == "AXPictureInPictureWindow",

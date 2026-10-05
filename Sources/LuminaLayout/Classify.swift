@@ -36,6 +36,11 @@ public struct ClassifyInput: Equatable, Sendable {
     public var width: Double
     public var height: Double
     public var isOnScreen: Bool
+    public var isMinimized: Bool
+    /// The owning app is hidden. Its main window is still adopted (and the
+    /// app unhidden); its other windows are hidden tabs/twins.
+    public var appHidden: Bool
+    public var isMainWindow: Bool
     public var pidAlreadyHasOnScreenWindow: Bool
     public var layerOrIsHUD: Bool
     public var isPiP: Bool
@@ -51,6 +56,9 @@ public struct ClassifyInput: Equatable, Sendable {
         width: Double = 800,
         height: Double = 600,
         isOnScreen: Bool = true,
+        isMinimized: Bool = false,
+        appHidden: Bool = false,
+        isMainWindow: Bool = false,
         pidAlreadyHasOnScreenWindow: Bool = false,
         layerOrIsHUD: Bool = false,
         isPiP: Bool = false,
@@ -65,6 +73,9 @@ public struct ClassifyInput: Equatable, Sendable {
         self.width = width
         self.height = height
         self.isOnScreen = isOnScreen
+        self.isMinimized = isMinimized
+        self.appHidden = appHidden
+        self.isMainWindow = isMainWindow
         self.pidAlreadyHasOnScreenWindow = pidAlreadyHasOnScreenWindow
         self.layerOrIsHUD = layerOrIsHUD
         self.isPiP = isPiP
@@ -160,8 +171,16 @@ public func classify(_ input: ClassifyInput, rules: [WindowRule]) -> ClassifyRes
     if let role = input.role, Classify.nonWindowRoles.contains(role) {
         return .unmanaged
     }
-    if !input.isOnScreen && input.pidAlreadyHasOnScreenWindow {
-        return .ignored
+    // An off-screen window that is not minimized is a hidden tab, a twin on
+    // another native Space, or a stale AX entry. Adopting it tiles a window
+    // nobody can see and leaves a hole where a real window should be. The
+    // one exception is the main window of a hidden app: Lumina unhides the
+    // app and adopts it, which is how a background `open`/AppleScript
+    // document is brought on screen.
+    if !input.isOnScreen && !input.isMinimized {
+        if !(input.appHidden && input.isMainWindow) {
+            return .ignored
+        }
     }
 
     var allowTiled = false

@@ -90,6 +90,28 @@ struct ClassifyTests {
         #expect(classify(input, rules: []) == .ignored)
     }
 
+    @Test func offScreenTwinIgnoredEvenWithoutAnOnScreenSibling() {
+        // The AX enumeration can omit the app's visible window; the hidden
+        // twin must not be adopted as a tile in its place.
+        let input = ClassifyInput(isOnScreen: false, pidAlreadyHasOnScreenWindow: false)
+        #expect(classify(input, rules: []) == .ignored)
+    }
+
+    @Test func minimizedWindowIsStillManaged() {
+        let input = ClassifyInput(isOnScreen: false, isMinimized: true)
+        #expect(classify(input, rules: []) == .tiled)
+    }
+
+    @Test func hiddenAppMainWindowIsManaged() {
+        let input = ClassifyInput(isOnScreen: false, appHidden: true, isMainWindow: true)
+        #expect(classify(input, rules: []) == .tiled)
+    }
+
+    @Test func hiddenAppNonMainWindowIgnored() {
+        let input = ClassifyInput(isOnScreen: false, appHidden: true, isMainWindow: false)
+        #expect(classify(input, rules: []) == .ignored)
+    }
+
     @Test func siriAppTilesUnlessDialog() {
         let siri = ClassifyInput(bundleId: "com.apple.siri", role: AXRoleName.standardWindow)
         #expect(classify(siri, rules: []) == .tiled)
