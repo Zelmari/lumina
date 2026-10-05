@@ -139,6 +139,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// pasteboard state at park time, and how many times we have re-parked
     /// after the app moved itself back.
     struct PrePark {
+        var pid: pid_t
         var frame: Rect
         var parked: Rect
         var pasteboardCount: Int
@@ -330,6 +331,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let rebuild = rebuildSpaceId(crashRecover: crashRecover, sessionFocused: focusedFromFile, spaceCount: config.spaceCount)
         session.focusedSpace = rebuild
         session.paused = false
+        // Observers first, so a launch that races the rest of boot is caught,
+        // then reveal any app a previous agent left hidden.
+        watchRunningApps()
+        unhideShieldedAppsAtBoot()
         if runLaunchApps {
             launchConfiguredApps()
         }
@@ -372,7 +377,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         clampOverflowOn(rebuild)
         applyFrames()
-        watchRunningApps()
+        if !pendingShieldReveal.isEmpty {
+            for pid in Array(pendingShieldReveal) {
+                unshield(pid: pid, reason: "tiled")
+            }
+        }
         startOrStopFFM()
         // Apps can drop or delay the first frame write; one cheap settle pass
         // converges the layout without waiting for the user to click.
@@ -605,6 +614,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Hide a launching app until its first window is tiled, when its bundle
     /// is in `hide-until-tiled-apps`. Never called unless the user opted in.
     func shieldAppIfConfigured(pid: pid_t) {
+        guard !isStopping(), !isOurProcess(pid) else { return }
         guard !shieldedOnce.contains(pid) else { return }
         guard let bundle = adapter.bundleId(pid: pid), config.hideUntilTiledApps.contains(bundle) else { return }
         guard shieldedPids.insert(pid).inserted else { return }
@@ -626,6 +636,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
+    /// A crash or force-quit leaves a hide-until-tiled app hidden with no
+    /// in-memory shield state to reveal it. Boot is the recovery point.
+    func unhideShieldedAppsAtBoot() {
+        guard !config.hideUntilTiledApps.isEmpty else { return }
+        for app in NSWorkspace.shared.runningApplications {
+            guard let bundle = app.bundleIdentifier, config.hideUntilTiledApps.contains(bundle) else { continue }
+            if app.isHidden {
+                app.unhide()
+                log.info("launch shield boot reveal pid=\(app.processIdentifier) bundle=\(bundle)")
+            }
+        }
+    }
+
     /// Reveal a shielded app and schedule a settle pass; unhiding changes what
     /// CG lists on screen, and the app may repaint or reposition.
     func unshield(pid: pid_t, reason: String) {
@@ -633,7 +656,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         shieldTimeouts.removeValue(forKey: pid)?.cancel()
         pendingShieldReveal.remove(pid)
         adapter.unhide(pid: pid)
-        adapter.activate(pid: pid)
+        // Focus follows the reveal only for a user-driven launch; a
+        // launch-apps entry or a timeout reveal must not steal focus.
+        if reason == "tiled", let bundle = adapter.bundleId(pid: pid), !config.launchApps.contains(bundle) {
+            adapter.activate(pid: pid)
+        }
         log.info("launch shield reveal pid=\(pid) reason=\(reason)")
         scheduleRefresh(reason: "shieldUnhide", delay: 0.05, eventDriven: false)
     }
@@ -654,10 +681,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func startLaunchWatch(pid: pid_t, reason: String) {
         launchWatchQueue.async { [weak self] in
             guard let self, self.launchWatches[pid] == nil, !self.isOurProcess(pid) else { return }
+            // Bound the concurrent pollers; the newest launches matter most.
+            guard self.launchWatches.count < 6 else { return }
             let timer = DispatchSource.makeTimerSource(queue: self.launchWatchQueue)
             timer.schedule(deadline: .now() + 0.02, repeating: self.launchWatchInterval, leeway: .milliseconds(2))
             self.launchWatches[pid] = LaunchWatch(timer: timer)
-            self.log.info("launch watch start pid=\(pid) reason=\(reason)")
+            self.log.debug("launch watch start pid=\(pid) reason=\(reason)")
             timer.setEventHandler { [weak self] in self?.launchWatchTick(pid: pid) }
             timer.resume()
         }
@@ -681,6 +710,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// touched, never the session.
     private func launchWatchTick(pid: pid_t) {
         guard var watch = launchWatches[pid] else { return }
+        // Never poll while the agent is stopping, paused, or has no bound
+        // display; the normal discovery paths resume on resume/reveal.
+        guard !isStopping(), !userPaused, isCurrent, !displayGone else {
+            launchWatches.removeValue(forKey: pid)?.timer?.cancel()
+            return
+        }
+        // A background helper or updater never becomes a regular app; once it
+        // has finished launching, drop the watch instead of polling for 2s.
+        if let app = NSRunningApplication(processIdentifier: pid),
+           app.isFinishedLaunching, app.activationPolicy != .regular
+        {
+            launchWatches.removeValue(forKey: pid)?.timer?.cancel()
+            return
+        }
         let elapsed = Date().timeIntervalSince(watch.startedAt)
         if elapsed > launchWatchMaxSeconds || kill(pid, 0) != 0 {
             launchWatches.removeValue(forKey: pid)?.timer?.cancel()
@@ -708,8 +751,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let attempts = watch.attempts
         launchWatches.removeValue(forKey: pid)?.timer?.cancel()
         MutationQueue.shared.hop { [weak self] in
-            guard let self else { return }
+            // Consume the retained element before any early return so the +1
+            // from passRetained is always balanced.
             let element = Unmanaged<AXUIElement>.fromOpaque(token).takeRetainedValue()
+            guard let self, !self.isStopping() else { return }
             if let id, self.ownedAnywhere(id) { return }
             let idText = id.map(String.init) ?? "?"
             let frameText = seenFrame.map { "\(Int($0.w))x\(Int($0.h))@\(Int($0.x)),\(Int($0.y))" } ?? "?"
@@ -725,12 +770,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
 
     /// First AXWindow element for a pid, if any. Runs on `launchWatchQueue`.
     private func firstWindowElement(pid: pid_t) -> AXUIElement? {
+        // A resolvable window id is the signal. An element whose id is not
+        // ready yet is retried on the next tick; a role read here could block
+        // on the app's unchecked AX timeout and delay every other watcher.
         guard case .list(let elements) = adapter.enumerateWindows(pid: pid) else { return nil }
-        for element in elements {
-            // A resolvable window id is proof without an AX read; fall back to
-            // the role for a just-created element whose id is not ready.
-            if adapter.windowIdIfKnown(for: element) != nil { return element }
-            if adapter.role(of: element) == "AXWindow" { return element }
+        for element in elements where adapter.windowIdIfKnown(for: element) != nil {
+            return element
         }
         return nil
     }
@@ -739,9 +784,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// its first window exists (the userInfo carries the NSRunningApplication,
     /// per the AppKit header contract for all application notifications).
     @objc func appWillLaunch(_ n: Notification) {
-        guard isCurrent, !userPaused else { return }
         guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         let pid = app.processIdentifier
+        guard isCurrent, !userPaused, !displayGone, !isOurProcess(pid) else { return }
         if Thread.isMainThread {
             observers.watch(pid: pid)
         } else {
@@ -759,7 +804,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     @objc func appLaunched(_ n: Notification) {
-        guard isCurrent, !userPaused else { return }
+        guard isCurrent, !userPaused, !displayGone else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             let pid = app.processIdentifier
             // Watch on this turn, not one main-queue hop later: a window the
@@ -883,21 +928,25 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         case kAXWindowCreatedNotification, kAXCreatedNotification, kAXUIElementDestroyedNotification:
             if name == kAXUIElementDestroyedNotification {
                 lastWindowClosedAt = Date()
-            }
-            if name == kAXWindowCreatedNotification {
-                preParkNewWindow(element)
-            } else if name == kAXCreatedNotification {
-                // Generic element creation fires for every AX element. Filter
-                // to window elements with a local id lookup before any AX read,
-                // so tree churn never pays for a role probe.
-                if adapter.windowIdIfKnown(for: element) != nil {
+                if let id = adapter.windowIdIfKnown(for: element) {
+                    preParked[id] = nil
+                }
+                scheduleRefresh(reason: name, delay: 0.015)
+            } else {
+                // AXCreated is generic: treat it as a window only when it
+                // resolves to one, otherwise ignore the churn instead of
+                // running a full pass per accessibility element. The id lookup
+                // is local; the role read runs only when the id is not ready.
+                let isWindow = name == kAXWindowCreatedNotification
+                    || adapter.windowIdIfKnown(for: element) != nil
+                    || adapter.role(of: element) == "AXWindow"
+                if isWindow {
                     preParkNewWindow(element)
+                    // A created window is the visible path: no coalescing
+                    // delay, so the pass starts as soon as the queue is free.
+                    scheduleRefresh(reason: name, delay: 0)
                 }
             }
-            // A created window is the visible path: no coalescing delay, so
-            // the pass starts as soon as the queue is free.
-            let created = name != kAXUIElementDestroyedNotification
-            scheduleRefresh(reason: name, delay: created ? 0 : 0.015)
         case kAXFocusedWindowChangedNotification:
             let win = adapter.focusedWindow(of: element)
                 ?? adapter.focusedWindow(of: AXUIElementCreateApplication(pid))
@@ -956,15 +1005,23 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// its windows usually have no id yet and are skipped here; they still get
     /// the fast retry ladder instead.
     func preParkNewWindow(_ element: AXUIElement) {
+        guard !isStopping() else { return }
         guard config.preParkNewWindows, !userPaused, isCurrent, !displayGone, let bound else { return }
         guard let pid = adapter.pid(of: element), !isOurProcess(pid) else { return }
         guard let id = adapter.windowId(for: element), !ownedAnywhere(id) else { return }
+        // A second created note for the same window (AXCreated +
+        // AXWindowCreated + the launch watch) must not re-read the already
+        // parked frame and overwrite the app's real original with it.
+        guard preParked[id] == nil else { return }
         guard adapter.role(of: element) == "AXWindow" else { return }
         guard adapter.subrole(of: element) == "AXStandardWindow" else { return }
         let bundle = adapter.bundleId(pid: pid)
         if let bundle, Classify.hardFloatBundleIds.contains(bundle) { return }
+        // Native-tab apps: a menu-bar tab's inactive backing window must stay
+        // invisible to CG, or it looks like a window and gets adopted as a
+        // second tile. reconcileNativeTabs owns those windows.
+        if let bundle, config.nativeTabs.contains(bundle) { return }
         guard let frame = adapter.frame(of: element), frame.w >= 8, frame.h >= 8, !isStashedAway(frame) else { return }
-        let pasteboardCount = NSPasteboard.general.changeCount
         // Speculative tile: write a standard window straight to the spiral
         // rect it will occupy, so even a late write lands at the tile with no
         // corner state. Any doubt falls back to the corner park.
@@ -974,12 +1031,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
             if adapter.setFrame(tile, of: element, tag: &tag) == .ok {
                 preParked[id] = PrePark(
+                    pid: pid,
                     frame: frame,
                     parked: tile,
-                    pasteboardCount: pasteboardCount,
+                    pasteboardCount: -1,
                     attempts: 0,
                     wroteTile: true
                 )
+                // Watch the unadopted element: without this a self-centering
+                // app's move note never reaches reParkIfNeeded.
+                observers.watchWindow(element, pid: pid)
                 log.info("pre-park tile window=\(id) pid=\(pid) rect=\(Int(tile.x)),\(Int(tile.y)) \(Int(tile.w))x\(Int(tile.h))")
                 return
             }
@@ -991,12 +1052,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
         if adapter.setStashPosition(Point(x: parked.x, y: parked.y), of: element, tag: &tag) == .ok {
             preParked[id] = PrePark(
+                pid: pid,
                 frame: frame,
                 parked: parked,
-                pasteboardCount: pasteboardCount,
+                pasteboardCount: -1,
                 attempts: 0,
                 wroteTile: false
             )
+            // Watch the unadopted element so a counter-move reaches
+            // reParkIfNeeded; adoption de-duplicates the registration.
+            observers.watchWindow(element, pid: pid)
             log.info("pre-park window=\(id) pid=\(pid) from=\(Int(frame.x)),\(Int(frame.y))")
         }
     }
@@ -1065,8 +1130,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Put a pre-parked window back where the app had it. Called when the pass
     /// decides not to manage the window; the marker is consumed either way.
     func undoPrePark(id: UInt32, element: AXUIElement) {
-        guard let prePark = preParked.removeValue(forKey: id) else { return }
+        guard let prePark = preParked[id] else { return }
+        preParked[id] = nil
         let pid = adapter.pid(of: element) ?? 0
+        // A recycled id or a replaced element must not be moved to the old
+        // window's frame.
+        guard prePark.pid == pid else { return }
+        observers.forgetWindow(element)
         var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: prePark.frame)
         log.info("pre-park restore window=\(id) pid=\(pid)")
         _ = adapter.setFrame(prePark.frame, of: element, tag: &tag)
@@ -1077,8 +1147,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// is dragging or after a copy changed the pasteboard (the same signals
     /// the title-bar swap trusts).
     func reParkIfNeeded(id: UInt32, element: AXUIElement) {
+        guard !isStopping() else { return }
         guard var prePark = preParked[id], !ownedAnywhere(id) else { return }
+        guard prePark.pid == (adapter.pid(of: element) ?? -1) else {
+            preParked[id] = nil
+            return
+        }
         let mouseDown = NSEvent.pressedMouseButtons != 0
+        if prePark.pasteboardCount < 0 {
+            // Captured lazily: a window that is never moved must not pay the
+            // synchronous pasteboard-server IPC at park time.
+            prePark.pasteboardCount = NSPasteboard.general.changeCount
+            preParked[id] = prePark
+        }
         let pasteboardChanged = NSPasteboard.general.changeCount != prePark.pasteboardCount
         guard shouldRePark(
             mouseDown: mouseDown,
@@ -1091,8 +1172,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if prePark.wroteTile, framesClose(live, prePark.parked, slop: 2) { return }
             if !prePark.wroteTile, isStashedAway(live) { return }
         }
-        prePark.attempts += 1
-        preParked[id] = prePark
         // A pending resize debounce or a refusal observation from before the
         // park must not interfere with the re-park.
         resizeDebounce[id]?.cancel()
@@ -1107,6 +1186,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             result = adapter.setStashPosition(Point(x: prePark.parked.x, y: prePark.parked.y), of: element, tag: &tag)
         }
         guard result == .ok else { return }
+        prePark.attempts += 1
+        preParked[id] = prePark
         log.info("pre-park re-park window=\(id) pid=\(pid) attempt=\(prePark.attempts)")
     }
 
@@ -1464,6 +1545,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 log.info("refresh rebind nativeFS \(pair.from) -> \(pair.to) bundle=\(w.bundleId ?? "?")")
                 w.cgWindowId = pair.to
                 session.nativeFSWindows[idx] = w
+                if let marker = preParked[pair.from] {
+                    preParked[pair.to] = marker
+                    preParked[pair.from] = nil
+                }
                 if let original = knownOriginals[pair.from] {
                     knownOriginals[pair.to] = original
                     knownOriginals[pair.from] = nil
@@ -1609,7 +1694,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let peekPid = adapter.pid(of: element)
         // A window we parked ourselves is not a stale stash: it must be
         // adopted, and its live frame is the corner, not the user's geometry.
-        let preParkFrame = peekId.flatMap { preParked[$0]?.frame }
+        let preParkFrame = peekId
+            .flatMap { preParked[$0] }
+            .flatMap { $0.pid == peekPid ? $0.frame : nil }
         if preParkFrame == nil, let frame = adapter.frame(of: element), isStashedAway(frame) {
             // A fresh window's first AX read can be an empty frame while it
             // animates in; that is not our park. Our parks always keep height.
@@ -1733,7 +1820,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let liveFrame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
         // A pre-parked window's live frame is the corner; the frame the app
         // chose before we parked it is the one to remember and restore.
-        let frame = preParked[id]?.frame ?? liveFrame
+        let preParkFrameForId = preParked[id].flatMap { $0.pid == pid ? $0.frame : nil }
+        let frame = preParkFrameForId ?? liveFrame
         let usable = bound.usableRect(gaps: config.gaps)
         // A park or engine-tile frame is not the user's geometry; never record
         // it as the original or quit would restore a tile (or a 1px corner).
@@ -1755,7 +1843,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // frame while it was hidden). Pull it into view instead of
             // leaving a 1px sliver the user cannot reach. A window on an
             // inactive space is parked by the branch below instead.
-            if preParked[id] != nil, targetId == session.focusedSpace {
+            if preParkFrameForId != nil, targetId == session.focusedSpace {
                 // We parked it; put the floater back at the app's own frame.
                 preParked[id] = nil
                 restoreWindow(window)
@@ -1844,6 +1932,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func rebindOwned(from: UInt32, to: UInt32, element: AXUIElement, pid: pid_t) {
+        if let marker = preParked[from], marker.pid == pid {
+            preParked[to] = marker
+        } else {
+            preParked[to] = nil
+        }
+        preParked[from] = nil
         session = session.rebindWindowId(from: from, to: to)
         if let original = knownOriginals[from] {
             knownOriginals[to] = original
@@ -3473,7 +3567,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // A pre-parked window of a terminating app must not leave its marker
         // behind: CGWindowIDs are recycled and the next owner would inherit
         // the old frame as its "original".
-        for id in Array(preParked.keys) where ids.contains(id) || elements[id].flatMap({ adapter.pid(of: $0) }) == pid {
+        for (id, prePark) in preParked where prePark.pid == pid {
+            preParked[id] = nil
+        }
+        for id in Array(preParked.keys) where ids.contains(id) {
             preParked[id] = nil
         }
         for (_, window) in ownedWindows(pid: pid) {
