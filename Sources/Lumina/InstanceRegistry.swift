@@ -10,6 +10,10 @@ import LuminaLayout
 final class RegistryStore: @unchecked Sendable {
     let path: String
     private let lock = NSLock()
+    /// Decoded registry, kept in memory: every poll and click used to read and
+    /// JSON-decode the file. The extra is the only writer, and all writes go
+    /// through this store, so the cache cannot go stale in normal operation.
+    private var cache: InstanceRegistry?
 
     init(path: String) { self.path = path }
 
@@ -38,15 +42,20 @@ final class RegistryStore: @unchecked Sendable {
     }
 
     private func loadUnlocked() -> InstanceRegistry {
+        if let cache { return cache }
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let decoded = try? InstanceRegistry.decode(data)
         else {
-            return InstanceRegistry(bootSessionUUID: "")
+            let empty = InstanceRegistry(bootSessionUUID: "")
+            cache = empty
+            return empty
         }
+        cache = decoded
         return decoded
     }
 
     private func saveUnlocked(_ registry: InstanceRegistry) {
+        cache = registry
         let dir = (path as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir)
