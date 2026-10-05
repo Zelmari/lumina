@@ -85,14 +85,14 @@ final class StatusItemController {
     }
 
     private func apply(_ model: StatusStripModel, tooltip: String?) {
-        stripView?.model = model
         stripView?.warningTooltip = warning.tooltip
         stripView?.inactiveTooltip = loginNote
         item?.button?.toolTip = tooltip
-        resizeToFit()
         let state = RenderState(model: model, tooltip: tooltip, loginEnabled: loginEnabled)
         guard state != rendered else { return }
         rendered = state
+        stripView?.model = model
+        resizeToFit()
         rebuildMenu()
     }
 
@@ -225,6 +225,7 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
         didSet {
             guard model != oldValue else { return }
             hoveredIndex = nil
+            cachedSegmentWidths = nil
             invalidateIntrinsicContentSize()
             needsLayout = true
             needsDisplay = true
@@ -241,6 +242,13 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
     private var segmentTrackingAreas: [NSTrackingArea] = []
     private var tooltipTagIndices: [NSView.ToolTipTag: Int] = [:]
     private var accessibilitySegments: [StatusSegmentAccessibilityElement] = []
+    /// Geometry the accessibility elements were built for; rebuilding for an
+    /// identical state only posts a spurious .layoutChanged.
+    private var accessibilityState: (model: StatusStripModel, rects: [NSRect])?
+    /// Per-segment widths, recomputed only when the model changes.
+    private var cachedSegmentWidths: [CGFloat]?
+    /// Resolved symbol images keyed by name and color.
+    private var symbolCache: [String: NSImage] = [:]
 
     override var intrinsicContentSize: NSSize {
         NSSize(width: stripWidth, height: NSView.noIntrinsicMetric)
@@ -355,7 +363,8 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
     }
 
     private var stripWidth: CGFloat {
-        let widths = model.segments.map(segmentWidth)
+        let widths = cachedSegmentWidths ?? model.segments.map(segmentWidth)
+        if cachedSegmentWidths == nil { cachedSegmentWidths = widths }
         guard !widths.isEmpty else { return 0 }
         return ceil(widths.reduce(0, +) + CGFloat(widths.count - 1) * Self.segmentSpacing)
     }
@@ -394,7 +403,8 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
 
     private func computeSegmentRects() -> [NSRect] {
         guard !model.segments.isEmpty else { return [] }
-        let widths = model.segments.map(segmentWidth)
+        let widths = cachedSegmentWidths ?? model.segments.map(segmentWidth)
+        if cachedSegmentWidths == nil { cachedSegmentWidths = widths }
         let total = widths.reduce(0, +) + CGFloat(widths.count - 1) * Self.segmentSpacing
         let height = min(max(bounds.height - 4, 14), 20)
         let y = bounds.midY - height / 2
@@ -478,6 +488,8 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
     }
 
     private func symbolImage(named name: String, color: NSColor) -> NSImage? {
+        let key = "\(name)|\(color.hashValue)"
+        if let cached = symbolCache[key] { return cached }
         guard let base = NSImage(systemSymbolName: name, accessibilityDescription: nil) else {
             return nil
         }
@@ -485,6 +497,7 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
             .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
         let image = base.withSymbolConfiguration(configuration) ?? base
         image.isTemplate = false
+        symbolCache[key] = image
         return image
     }
 
@@ -527,6 +540,12 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
     }
 
     private func rebuildAccessibility() {
+        // Rebuilding identical elements posts .layoutChanged on every poll,
+        // waking the accessibility stack for nothing.
+        if let accessibilityState, accessibilityState.model == model, accessibilityState.rects == segmentRects {
+            return
+        }
+        accessibilityState = (model, segmentRects)
         accessibilitySegments = model.segments.enumerated().compactMap { index, segment -> StatusSegmentAccessibilityElement? in
             guard index < segmentRects.count else { return nil }
             let element = StatusSegmentAccessibilityElement()
