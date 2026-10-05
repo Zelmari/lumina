@@ -109,6 +109,16 @@ struct CodecTests {
         #expect(id == "d")
     }
 
+    @Test func pingParses() {
+        let line = #"{"v":1,"id":"p","cmd":"ping","args":{}}"#
+        let parsed = parseLine(line)
+        guard case .request(.ping, let id) = parsed else {
+            Issue.record("expected ping, got \(parsed)")
+            return
+        }
+        #expect(id == "p")
+    }
+
     @Test func requestWithoutArgsDecodes() throws {
         let line = #"{"v":1,"id":"x","cmd":"status"}"#
         let parsed = parseLine(line)
@@ -285,6 +295,7 @@ struct ArgvTests {
         #expect(CLIArgs.parse(["lumina", "debug"]) == nil)
         #expect(CLIArgs.earlyExit(["lumina", "debug-windows"]) == nil)
         #expect(CLIArgs.parse(["lumina", "debug-windows"])?.cmd == "debug-windows")
+        #expect(CLIArgs.parse(["lumina", "ping"])?.cmd == "ping")
         let zero = #"{"v":1,"id":"z","cmd":"workspace","args":{"id":0}}"#
         guard case .request(.workspace(let zeroId), _) = parseLine(zero) else {
             Issue.record("expected workspace 0, got \(parseLine(zero))")
@@ -302,5 +313,36 @@ struct ArgvTests {
             return
         }
         #expect(id == "m")
+    }
+}
+
+struct BenchOptionsTests {
+    @Test func defaults() {
+        let options = CLIArgs.parseBench(["lumina", "bench"])
+        #expect(options?.count == 50)
+        #expect(options?.warmup == 5)
+        #expect(options?.maxP95Ms == nil)
+    }
+
+    @Test func flagsParse() {
+        let options = CLIArgs.parseBench([
+            "lumina", "bench", "--count", "200", "--warmup", "10", "--max-p95-ms", "25",
+        ])
+        #expect(options?.count == 200)
+        #expect(options?.warmup == 10)
+        #expect(options?.maxP95Ms == 25)
+    }
+
+    @Test func zeroWarmupAllowed() {
+        #expect(CLIArgs.parseBench(["lumina", "bench", "--warmup", "0"])?.warmup == 0)
+    }
+
+    @Test func rejectsMalformed() {
+        #expect(CLIArgs.parseBench(["lumina", "bench", "--count"]) == nil)
+        #expect(CLIArgs.parseBench(["lumina", "bench", "--count", "0"]) == nil)
+        #expect(CLIArgs.parseBench(["lumina", "bench", "--count", "nope"]) == nil)
+        #expect(CLIArgs.parseBench(["lumina", "bench", "--warmup", "-1"]) == nil)
+        #expect(CLIArgs.parseBench(["lumina", "bench", "--max-p95-ms", "0"]) == nil)
+        #expect(CLIArgs.parseBench(["lumina", "bench", "--unknown"]) == nil)
     }
 }

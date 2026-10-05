@@ -10,6 +10,7 @@ public final class AgentSocketServer {
     public var onCommand: ((AgentCmd, String) -> IPCResponse)?
     private let log: LuminaLog
     public let path: String
+    private let startedAt = Date()
 
     public init(path: String, log: LuminaLog) {
         self.path = path
@@ -126,14 +127,24 @@ public final class AgentSocketServer {
                 case .error(let err):
                     response = err
                 case .request(let cmd, let id):
-                    if let onCommand {
+                    if case .ping = cmd {
+                        // Answer on the socket queue: a ping must not wait for
+                        // a layout pass and must work while paused or when AX
+                        // is not trusted.
+                        response = IPCResponse.success(id: id, data: .object([
+                            "pong": .bool(true),
+                            "uptimeMs": .double(Date().timeIntervalSince(startedAt) * 1000),
+                        ]))
+                    } else if let onCommand {
                         var captured: IPCResponse?
                         let sem = DispatchSemaphore(value: 0)
                         MutationQueue.shared.hop {
                             captured = onCommand(cmd, id)
                             sem.signal()
                         }
-                        sem.wait()
+                        // A handler regression must not wedge the connection
+                        // (and with it every later accept) forever.
+                        _ = sem.wait(timeout: .now() + 30)
                         response = captured ?? IPCResponse.failure(id: id, error: "internal")
                     } else {
                         response = IPCResponse.failure(id: id, error: "no handler")

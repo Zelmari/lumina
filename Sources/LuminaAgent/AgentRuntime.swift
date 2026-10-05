@@ -1637,7 +1637,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         switch cmd {
         case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces, .verify,
-             .accessibilityPrompt, .debugAX:
+             .accessibilityPrompt, .debugAX, .ping:
             break
         default:
             if userPaused || displayGone || !isCurrent { return .success(id: id) }
@@ -1702,6 +1702,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return .success(id: id, data: verifyWindowsJSON())
         case .status:
             return .success(id: id, data: statusJSON())
+        case .ping:
+            // The socket server normally answers pings without reaching the
+            // mutation queue; this keeps direct callers working.
+            return .success(id: id, data: .object(["pong": .bool(true)]))
         case .markCurrent:
             recomputeCurrentToken(reason: .start)
             return .success(id: id)

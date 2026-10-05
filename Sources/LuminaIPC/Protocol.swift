@@ -88,6 +88,9 @@ public enum AgentCmd: Equatable, Sendable {
     case listWorkspaces
     case verify
     case status
+    /// Transport-only liveness probe. The socket server answers it without
+    /// hopping onto the mutation queue, so it measures raw IPC round trips.
+    case ping
     /// Extra-only: swipe-back attach without SkyLight (reason `start`).
     case markCurrent
     /// This agent is no longer the current Space. Drop hotkeys and stop mutating.

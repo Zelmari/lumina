@@ -602,6 +602,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .listWorkspaces: return "list-workspaces"
     case .verify: return "verify"
     case .status: return "status"
+    case .ping: return "ping"
     case .markCurrent: return "mark-current"
     case .yield: return "yield"
     case .accessibilityPrompt: return "accessibility-prompt"
