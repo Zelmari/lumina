@@ -128,6 +128,10 @@ public struct Config: Equatable, Sendable {
     /// Park a new window in the stash corner the moment it is created, so the
     /// app's own default frame is not visible until the tile lands.
     public var preParkNewWindows: Bool
+    /// Write a new standard window straight to its predicted spiral tile
+    /// instead of the stash corner. Falls back to the corner whenever the
+    /// prediction could be wrong (dialogs, rules, native tabs, fullscreen).
+    public var speculativeTile: Bool
     public var unknownTopLevelKeys: [String]
     public var diagnostics: [String]
 
@@ -141,6 +145,7 @@ public struct Config: Equatable, Sendable {
         windowRules: [WindowRule] = [],
         nativeTabs: [String] = [],
         preParkNewWindows: Bool = true,
+        speculativeTile: Bool = false,
         unknownTopLevelKeys: [String] = [],
         diagnostics: [String] = []
     ) {
@@ -153,6 +158,7 @@ public struct Config: Equatable, Sendable {
         self.windowRules = windowRules
         self.nativeTabs = nativeTabs
         self.preParkNewWindows = preParkNewWindows
+        self.speculativeTile = speculativeTile
         self.unknownTopLevelKeys = unknownTopLevelKeys
         self.diagnostics = diagnostics
     }
@@ -232,6 +238,7 @@ private struct RawConfig: Decodable {
     var windowRule: [RawWindowRule]?
     var nativeTabs: RawNativeTabs?
     var preParkNewWindows: Bool?
+    var speculativeTile: Bool?
 
     enum CodingKeys: String, CodingKey {
         case spaceCount = "space-count"
@@ -243,6 +250,7 @@ private struct RawConfig: Decodable {
         case windowRule = "window-rule"
         case nativeTabs = "native-tabs"
         case preParkNewWindows = "pre-park-new-windows"
+        case speculativeTile = "speculative-tile"
     }
 }
 
@@ -277,6 +285,7 @@ public let knownTopLevelKeys: Set<String> = [
     "window-rule",
     "native-tabs",
     "pre-park-new-windows",
+    "speculative-tile",
 ]
 
 public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config, ConfigError> {
@@ -398,6 +407,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
 
     let nativeTabs = raw.nativeTabs?.apps ?? base.nativeTabs
     let prePark = raw.preParkNewWindows ?? base.preParkNewWindows
+    let speculative = raw.speculativeTile ?? base.speculativeTile
 
     return .success(
         Config(
@@ -410,6 +420,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
             windowRules: rules,
             nativeTabs: nativeTabs,
             preParkNewWindows: prePark,
+            speculativeTile: speculative,
             unknownTopLevelKeys: unknown,
             diagnostics: diagnostics
         )
@@ -582,6 +593,9 @@ extension Config {
     # Park a new window in the stash corner until its tile lands, so the app's
     # own default frame is not visible.
     pre-park-new-windows = true
+    # Write a new standard window straight to its predicted tile instead of the
+    # corner. Off by default; falls back to the corner on any doubt.
+    speculative-tile = false
     # z-order, float-existing, or new-only
     launch-tiling = "z-order"
     launch-apps = []                       # e.g. ["com.apple.Terminal"]

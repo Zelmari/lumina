@@ -130,6 +130,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var parked: Rect
         var pasteboardCount: Int
         var attempts: Int
+        /// True when `parked` is the predicted tile (a size+position write)
+        /// rather than the size-preserving corner park.
+        var wroteTile: Bool
     }
     var preParked: [UInt32: PrePark] = [:]
     /// Consecutive-miss and failed-read bookkeeping for refresh removals.
@@ -882,6 +885,26 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let bundle = adapter.bundleId(pid: pid)
         if let bundle, Classify.hardFloatBundleIds.contains(bundle) { return }
         guard let frame = adapter.frame(of: element), frame.w >= 8, frame.h >= 8, !isStashedAway(frame) else { return }
+        let pasteboardCount = NSPasteboard.general.changeCount
+        // Speculative tile: write a standard window straight to the spiral
+        // rect it will occupy, so even a late write lands at the tile with no
+        // corner state. Any doubt falls back to the corner park.
+        if config.speculativeTile,
+           let tile = predictedTileFor(element: element, id: id, pid: pid, bundle: bundle, frame: frame, bound: bound)
+        {
+            var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
+            if adapter.setFrame(tile, of: element, tag: &tag) == .ok {
+                preParked[id] = PrePark(
+                    frame: frame,
+                    parked: tile,
+                    pasteboardCount: pasteboardCount,
+                    attempts: 0,
+                    wroteTile: true
+                )
+                log.info("pre-park tile window=\(id) pid=\(pid) rect=\(Int(tile.x)),\(Int(tile.y)) \(Int(tile.w))x\(Int(tile.h))")
+                return
+            }
+        }
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
         let inset: Double = bundle == "us.zoom.xos" ? 0 : 1
@@ -891,11 +914,56 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             preParked[id] = PrePark(
                 frame: frame,
                 parked: parked,
-                pasteboardCount: NSPasteboard.general.changeCount,
-                attempts: 0
+                pasteboardCount: pasteboardCount,
+                attempts: 0,
+                wroteTile: false
             )
             log.info("pre-park window=\(id) pid=\(pid) from=\(Int(frame.x)),\(Int(frame.y))")
         }
+    }
+
+    /// The rect this standard window would occupy as a tiled leaf, or nil when
+    /// anything about the prediction is uncertain. Runs only when
+    /// `speculative-tile` is on; it performs its own classification so callers
+    /// never park a window that would float or be ignored.
+    func predictedTileFor(
+        element: AXUIElement,
+        id: UInt32,
+        pid: pid_t,
+        bundle: String?,
+        frame: Rect,
+        bound: BoundDisplay
+    ) -> Rect? {
+        if let bundle {
+            if config.nativeTabs.contains(bundle) { return nil }
+            // A float/ignore rule for the app (even a title-regex one we cannot
+            // evaluate yet) makes the predicted tile untrustworthy.
+            if config.windowRules.contains(where: {
+                $0.appId == bundle && ($0.action == .float || $0.action == .ignore)
+            }) { return nil }
+        }
+        let rows = onScreenCGWindows(intersecting: bound.axFrame)
+        let onScreen = Set(rows.compactMap(cgWindowID))
+        guard let (input, _, _) = classifyInput(
+            from: element,
+            adapter: adapter,
+            bound: bound,
+            onScreenIds: onScreen,
+            onScreenRows: rows
+        ) else { return nil }
+        guard classify(input, rules: config.windowRules, ignoringOnScreen: true) == .tiled else { return nil }
+        let usable = bound.usableRect(gaps: config.gaps)
+        let probe = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
+        let measured = adapter.minSize(of: element)
+        let minSizes: [UInt32: Size] = measured == .unknown ? [:] : [id: measured]
+        return session.predictedTile(
+            space: session.focusedSpace,
+            window: probe,
+            usable: usable,
+            gaps: config.gaps,
+            usableIsWide: usableIsWide(usable),
+            minSizes: minSizes
+        )
     }
 
     /// Put a pre-parked window back where the app had it. Called when the pass
@@ -923,7 +991,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             attempts: prePark.attempts,
             maxAttempts: 3
         ) else { return }
-        if let live = adapter.frame(of: element), isStashedAway(live) { return }
+        if let live = adapter.frame(of: element) {
+            if prePark.wroteTile, framesClose(live, prePark.parked, slop: 2) { return }
+            if !prePark.wroteTile, isStashedAway(live) { return }
+        }
         prePark.attempts += 1
         preParked[id] = prePark
         // A pending resize debounce or a refusal observation from before the
@@ -933,9 +1004,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         overflowObservations[id] = nil
         let pid = adapter.pid(of: element) ?? 0
         var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: prePark.frame)
-        if adapter.setStashPosition(Point(x: prePark.parked.x, y: prePark.parked.y), of: element, tag: &tag) != .ok {
-            return
+        let result: SetFrameResult
+        if prePark.wroteTile {
+            result = adapter.setFrame(prePark.parked, of: element, tag: &tag)
+        } else {
+            result = adapter.setStashPosition(Point(x: prePark.parked.x, y: prePark.parked.y), of: element, tag: &tag)
         }
+        guard result == .ok else { return }
         log.info("pre-park re-park window=\(id) pid=\(pid) attempt=\(prePark.attempts)")
     }
 
