@@ -100,6 +100,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Persisted via SessionFile so restarts and drop+re-adopt churn cannot
     /// replace true originals with tile rects.
     var knownOriginals: [UInt32: Rect] = [:]
+    /// New windows parked in the stash corner the moment we hear about them,
+    /// keyed by id, storing the live frame to restore if adoption declines.
+    /// This is what hides the app's own default frame while the refresh runs.
+    var preParked: [UInt32: Rect] = [:]
     /// Consecutive-miss and failed-read bookkeeping for refresh removals.
     var removalGate = RemovalGate()
     /// Sizes an app has actually refused to shrink below. Some apps report
@@ -649,6 +653,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if name == kAXUIElementDestroyedNotification {
                 lastWindowClosedAt = Date()
             }
+            if name == kAXWindowCreatedNotification {
+                preParkNewWindow(element)
+            }
             // A created window is the visible path: no coalescing delay, so
             // the pass starts as soon as the queue is free.
             scheduleRefresh(reason: name, delay: name == kAXWindowCreatedNotification ? 0 : 0.015)
@@ -697,6 +704,46 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         default:
             break
         }
+    }
+
+    /// Park a just-created window in the stash corner before the refresh runs,
+    /// so the app's own default frame is replaced by a 1px sliver instead of
+    /// being visible until the tile lands. The live frame is remembered and
+    /// restored if classification declines to adopt the window.
+    ///
+    /// Only standard windows are parked: dialogs, sheets, panels and popups
+    /// may classify as floating/unmanaged, and moving them would be visible
+    /// and surprising. Chromium's accessibility tree is only woken later, so
+    /// its windows usually have no id yet and are skipped here; they still get
+    /// the fast retry ladder instead.
+    func preParkNewWindow(_ element: AXUIElement) {
+        guard config.preParkNewWindows, !userPaused, isCurrent, !displayGone, let bound else { return }
+        guard let pid = adapter.pid(of: element), !isOurProcess(pid) else { return }
+        guard let id = adapter.windowId(for: element), !ownedAnywhere(id) else { return }
+        guard adapter.role(of: element) == "AXWindow" else { return }
+        guard adapter.subrole(of: element) == "AXStandardWindow" else { return }
+        let bundle = adapter.bundleId(pid: pid)
+        if let bundle, Classify.hardFloatBundleIds.contains(bundle) { return }
+        guard let frame = adapter.frame(of: element), frame.w >= 8, frame.h >= 8, !isStashedAway(frame) else { return }
+        let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
+        let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
+        let inset: Double = bundle == "us.zoom.xos" ? 0 : 1
+        let parked = stashFrame(for: frame.h, display: display, dockRight: dockRight, lastWidth: frame.w, inset: inset)
+        var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
+        if adapter.setStashPosition(Point(x: parked.x, y: parked.y), of: element, tag: &tag) == .ok {
+            preParked[id] = frame
+            log.info("pre-park window=\(id) pid=\(pid) from=\(Int(frame.x)),\(Int(frame.y))")
+        }
+    }
+
+    /// Put a pre-parked window back where the app had it. Called when the pass
+    /// decides not to manage the window; the marker is consumed either way.
+    func undoPrePark(id: UInt32, element: AXUIElement) {
+        guard let frame = preParked.removeValue(forKey: id) else { return }
+        let pid = adapter.pid(of: element) ?? 0
+        var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), lastOnscreenFrame: frame)
+        log.info("pre-park restore window=\(id) pid=\(pid)")
+        _ = adapter.setFrame(frame, of: element, tag: &tag)
     }
 
     /// Coalesce every discovery event into one session. Mutation queue only.
@@ -1163,6 +1210,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard let bound else { return }
         let targetId = preferredSpace.flatMap { session.spaces[$0] != nil ? $0 : nil } ?? session.focusedSpace
         if let existing = trackedId(matching: element), ownedAnywhere(existing) {
+            preParked[existing] = nil
             claimed.insert(existing)
             if let pid = adapter.pid(of: element) {
                 observers.watchWindow(element, pid: pid)
@@ -1178,7 +1226,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // is for direct callers.
         let rows = cgRows ?? onScreenCGWindows(intersecting: bound.axFrame)
         let onScreen = Set(rows.compactMap(cgWindowID))
-        if let frame = adapter.frame(of: element), isStashedAway(frame) {
+        let peekId = adapter.windowId(for: element, excluding: claimed)
+        let peekPid = adapter.pid(of: element)
+        // A window we parked ourselves is not a stale stash: it must be
+        // adopted, and its live frame is the corner, not the user's geometry.
+        let preParkFrame = peekId.flatMap { preParked[$0] }
+        if preParkFrame == nil, let frame = adapter.frame(of: element), isStashedAway(frame) {
             // A fresh window's first AX read can be an empty frame while it
             // animates in; that is not our park. Our parks always keep height.
             // Only skip when the app already has an on-screen model window:
@@ -1194,8 +1247,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 return
             }
         }
-        let peekId = adapter.windowId(for: element, excluding: claimed)
-        let peekPid = adapter.pid(of: element)
         if let peekId, let peekPid, let sid = otherSpace(pid: peekPid, id: peekId, element: element) {
             claimed.insert(peekId)
             observers.watchWindow(element, pid: peekPid)
@@ -1212,6 +1263,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             onScreenRows: rows,
             excludingWindowIds: claimed
         ) else {
+            if let peekId { undoPrePark(id: peekId, element: element) }
             log.info("onCreate skip (no window id) role=\(adapter.role(of: element) ?? "?")")
             refreshUnresolved = true
             return
@@ -1238,6 +1290,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // CGWindowIDs get recycled. If the previous owner is dead, forget
             // the stale binding and adopt this as a new window.
             if let current = windowAnywhere(id), hasAXElement(current) {
+                preParked[id] = nil
                 claimed.insert(id)
                 observers.watchWindow(element, pid: pid)
                 adapter.rememberWindowId(id, for: element)
@@ -1250,6 +1303,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         if let stale = staleOwnedWindow(pid: pid, liveId: id, element: element) {
             log.info("rebind onCreate \(stale) -> \(id) bundle=\(input.bundleId ?? "?")")
+            preParked[stale] = nil
+            preParked[id] = nil
             rebindOwned(from: stale, to: id, element: element, pid: pid)
             claimed.insert(id)
             if apply { applyFrames() }
@@ -1269,9 +1324,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // on-screen): resolve it on a later session. A just-created
             // window gets the fast ladder instead of the 1.0s retry, because
             // it is the visible path between "app opened" and "tile lands".
+            // A pre-parked window we will not manage goes back to the app.
             if input.width < 50 || input.height < 50 || !input.isOnScreen {
                 refreshUnresolved = true
                 fastRetryRequested = true
+            } else {
+                undoPrePark(id: id, element: element)
             }
             return
         }
@@ -1290,7 +1348,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         observers.watchWindow(element, pid: pid)
         adapter.rememberWindowId(id, for: element)
         elements[id] = element
-        let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
+        let liveFrame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
+        // A pre-parked window's live frame is the corner; the frame the app
+        // chose before we parked it is the one to remember and restore.
+        let frame = preParked[id] ?? liveFrame
         let usable = bound.usableRect(gaps: config.gaps)
         // A park or engine-tile frame is not the user's geometry; never record
         // it as the original or quit would restore a tile (or a 1px corner).
@@ -1312,7 +1373,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // frame while it was hidden). Pull it into view instead of
             // leaving a 1px sliver the user cannot reach. A window on an
             // inactive space is parked by the branch below instead.
-            if isStashedAway(frame), targetId == session.focusedSpace {
+            if preParked[id] != nil, targetId == session.focusedSpace {
+                // We parked it; put the floater back at the app's own frame.
+                preParked[id] = nil
+                restoreWindow(window)
+            } else if isStashedAway(frame), targetId == session.focusedSpace {
                 placeFloated([window], space: targetId)
             }
         } else {
@@ -1323,6 +1388,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             placeFloated(floated, space: targetId)
         }
         markBorn(id)
+        preParked[id] = nil
         // Adopted; stop treating the pid as a pending launch.
         recentlyLaunchedPids[pid] = nil
         if targetId != session.focusedSpace {
@@ -1470,6 +1536,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Drop a window that is really gone: close it on the focused space, remove
     /// it elsewhere, and forget every per-window map entry.
     func removeDestroyedWindow(_ id: UInt32) {
+        preParked[id] = nil
         let wasFS = session.current.luminaFullscreen != nil
             && session.current.nodes[session.current.luminaFullscreen!]?.leaf?.cgWindowId == id
         forgetWindowState(id)

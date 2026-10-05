@@ -125,6 +125,9 @@ public struct Config: Equatable, Sendable {
     /// Apps whose tabs are separate NSWindows (macOS native tabbing). Lumina
     /// keeps one tile per tab group and swaps the backing window on switch.
     public var nativeTabs: [String]
+    /// Park a new window in the stash corner the moment it is created, so the
+    /// app's own default frame is not visible until the tile lands.
+    public var preParkNewWindows: Bool
     public var unknownTopLevelKeys: [String]
     public var diagnostics: [String]
 
@@ -137,6 +140,7 @@ public struct Config: Equatable, Sendable {
         bindings: [Binding] = [],
         windowRules: [WindowRule] = [],
         nativeTabs: [String] = [],
+        preParkNewWindows: Bool = true,
         unknownTopLevelKeys: [String] = [],
         diagnostics: [String] = []
     ) {
@@ -148,6 +152,7 @@ public struct Config: Equatable, Sendable {
         self.bindings = bindings
         self.windowRules = windowRules
         self.nativeTabs = nativeTabs
+        self.preParkNewWindows = preParkNewWindows
         self.unknownTopLevelKeys = unknownTopLevelKeys
         self.diagnostics = diagnostics
     }
@@ -226,6 +231,7 @@ private struct RawConfig: Decodable {
     var bindings: [String: String]?
     var windowRule: [RawWindowRule]?
     var nativeTabs: RawNativeTabs?
+    var preParkNewWindows: Bool?
 
     enum CodingKeys: String, CodingKey {
         case spaceCount = "space-count"
@@ -236,6 +242,7 @@ private struct RawConfig: Decodable {
         case bindings
         case windowRule = "window-rule"
         case nativeTabs = "native-tabs"
+        case preParkNewWindows = "pre-park-new-windows"
     }
 }
 
@@ -269,6 +276,7 @@ public let knownTopLevelKeys: Set<String> = [
     "bindings",
     "window-rule",
     "native-tabs",
+    "pre-park-new-windows",
 ]
 
 public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config, ConfigError> {
@@ -389,6 +397,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
     }
 
     let nativeTabs = raw.nativeTabs?.apps ?? base.nativeTabs
+    let prePark = raw.preParkNewWindows ?? base.preParkNewWindows
 
     return .success(
         Config(
@@ -400,6 +409,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
             bindings: bindings,
             windowRules: rules,
             nativeTabs: nativeTabs,
+            preParkNewWindows: prePark,
             unknownTopLevelKeys: unknown,
             diagnostics: diagnostics
         )
@@ -569,6 +579,9 @@ extension Config {
     public static let bundledDefaultTOML: String = """
     space-count = 10
     focus-follows-mouse = false
+    # Park a new window in the stash corner until its tile lands, so the app's
+    # own default frame is not visible.
+    pre-park-new-windows = true
     # z-order, float-existing, or new-only
     launch-tiling = "z-order"
     launch-apps = []                       # e.g. ["com.apple.Terminal"]
