@@ -146,8 +146,8 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 | `BENCH=0` | Skip the latency section |
 | `BENCH_COUNT` / `BENCH_WARMUP` | Pings and warmup for `lumina bench` (default 50 / 5) |
 | `BENCH_MAX_P95_MS` | Fail when IPC round-trip p95 exceeds this (default 25) |
-| `BENCH_STRICT=1` / `BENCH_FRAME_MAX_MS` | Also gate on created-path refresh p95 (default 100) |
-| `BENCH_LAUNCH_MAX_MS` / `BENCH_MENU_MAX_MS` | With `BENCH_STRICT=1`, gate launch-to-frame (default 500) and menu-push latency (default 250) |
+| `BENCH_STRICT=1` | Gate on launch-to-frame (default 500ms) and menu-push latency (default 250ms) |
+| `BENCH_LAUNCH_MAX_MS` / `BENCH_MENU_MAX_MS` | Thresholds for the strict gates |
 | `LUMINA_LOG` | Agent log path (default `~/Library/Logs/Lumina.log`) |
 
 ## Known behavior
