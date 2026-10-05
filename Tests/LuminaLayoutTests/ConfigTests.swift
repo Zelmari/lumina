@@ -158,6 +158,18 @@ struct ConfigTests {
         #expect(!config.diagnostics.contains(where: { $0.contains("pre-park-new-windows") }))
     }
 
+    @Test func speculativeTileDefaultsOffAndParsesOn() throws {
+        let bundled = try parseConfig(text: Config.bundledDefaultTOML).get()
+        #expect(!bundled.speculativeTile)
+        let on = try parseConfig(text: "speculative-tile = true", defaults: bundled).get()
+        #expect(on.speculativeTile)
+        let config = try parseConfig(
+            text: "speculative-tile = true",
+            defaults: Config.bundledDefault
+        ).get()
+        #expect(!config.diagnostics.contains(where: { $0.contains("speculative-tile") }))
+    }
+
     @Test func bindingTableHeaderWithCommentStillCollapsesDuplicates() throws {
         let text = """
         [bindings] # main modifier is alt
