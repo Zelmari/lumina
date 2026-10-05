@@ -179,16 +179,71 @@ iterating, and include it in the default run.
   window; list Terminal/Ghostty; link the upstream Ghostty page; note the
   config flag and the harness coverage.
 
+### T8 — Dwindle-preserving minimum-size policy
+
+Problem: boot builds a uniform dwindle, then the observed-minimum path
+rebalances split ratios to satisfy AXMinSize/practical minimums, so the
+layout is visibly not 50/50 (Ghostty narrower, Safari/Discord wider), and
+sometimes a window is floated instead. Log evidence: `layout overflow:
+clamping with observed minimum sizes` ~1 s after every boot and on
+workspace returns; `floated overflow window=15918` in one session.
+
+Decision: dwindle splits are the product. A window whose real minimum
+cannot fit its tile is **floated**, not accommodated by distorting its
+siblings. `clampOverflow` ratio rebalancing is removed from the launch /
+insert / observed paths (or reduced to a hard-floor case), and the
+observed-minimum path floats the offender.
+
+Test-first: unit tests for the float-vs-fit decision; harness assertion
+that a boot with N fitting windows yields uniform ratios, and that a
+deliberately oversized-minimum window floats rather than changing sibling
+geometry. Include AXMinSize and observed minimums in `debug-windows`.
+
+### T9 — Trusted originals for quit restore
+
+Problem: originals are polluted with engine frames captured when a window
+was adopted while already tiled. Session evidence: Ghostty `15918`
+original `723x449 @8,499` (tile quadrant), twin `14817` `1454x907` (full
+usable), VSCode `15452` `723x449 @739,499`. `isEngineTile` only rejects a
+frame equal to the *current* layout's tile, so stale tiles from earlier
+sessions are restored as if they were the user's geometry; windows that
+never had a trusted original restore to a stale tile or a cascade.
+
+Design:
+- Pure `looksLikeEngineFrame(rect, usable)`: edges aligned to the usable
+  rect and size close to usable or usable/2, /3, /4 on either axis
+  (within gap slop).
+- Never store an engine-shaped frame as `originalFrame`/`knownOriginals`.
+- At quit, treat an engine-shaped original as untrusted and recenter to a
+  sane size instead of restoring the tile.
+- Preserve the earliest trusted original across sessions; never overwrite
+  a trusted original with an untrusted one.
+
+Test-first: unit tests for the detector (full/half/quarter, gaps, normal
+frames, off-display frames); harness quit check uses the independent
+oracle to assert live bounds equal the pre-tiling bounds for a controlled
+scenario, instead of grepping the agent log.
+
+Note: a window that was already tiled before Lumina ever saw it untrusted
+has no recoverable original; it will recenter once, after which the user's
+first manual resize while paused (or the next clean adoption) becomes the
+trusted original.
+
 ## Test plan
 
 - Unit (CI, Linux): tab detector pure logic — tab switch, two real windows
   of the same app, closing one tab, tab dragged out to its own window, app
   without tabs, floating windows excluded.
+- Unit (CI, Linux): `looksLikeEngineFrame` and the dwindle float-vs-fit
+  decision (T8/T9).
 - Harness (macOS): existing suite + Terminal tab section; assert no tile is
-  added per switch, count returns to one when tabs close; run
-  `QUIT_TEST=1` and `RECORD=1` variants.
+  added per switch, count returns to one when tabs close; uniform dwindle
+  ratios when windows fit; a real minimum floats instead of distorting
+  siblings; quit restore checked with live bounds via the independent
+  oracle. Run `QUIT_TEST=1` and `RECORD=1` variants.
 - Manual matrix for the user: Terminal.app and Ghostty, forward/back tab
-  switches, new/closed tabs, `lumina verify` + `artifacts/` geometry.
+  switches, new/closed tabs, 3-window launch sizing, quit-all restore;
+  `lumina verify` + `artifacts/` geometry.
 - CI: Linux layout/IPC tests green; macOS bundle builds and signs.
 
 ## Risks and rollback
