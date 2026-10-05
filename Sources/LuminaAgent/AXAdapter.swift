@@ -146,6 +146,15 @@ public final class AXAdapter {
         return err != .invalidUIElement
     }
 
+    /// Strict proof of life: the role read succeeded. Used where a false
+    /// "alive" would pin a model entry forever (removal veto); a timeout must
+    /// not count as alive there.
+    public func isAliveElement(_ element: AXUIElement) -> Bool {
+        var ref: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &ref)
+        return err == .success
+    }
+
     public func forgetWindowId(_ id: UInt32) {
         lock.lock()
         defer { lock.unlock() }
@@ -210,12 +219,14 @@ public final class AXAdapter {
 
     /// The app answered an AX window read with an empty list even though it
     /// has windows. Its accessibility tree was torn down after we marked it
-    /// healthy; forget the wake state so the next resolve asks again.
+    /// healthy; forget the wake state so the next resolve asks again. The
+    /// wake timestamp is kept so `wakeAccessibility`'s retry throttle still
+    /// applies: re-setting AXManualAccessibility while Chromium rebuilds the
+    /// tree keeps tearing it down.
     public func markAccessibilityUnhealthy(pid: pid_t) {
         lock.lock()
         accessibilityHealthy.remove(pid)
         accessibilityDelivered.remove(pid)
-        accessibilityWakeAt[pid] = nil
         lock.unlock()
     }
 

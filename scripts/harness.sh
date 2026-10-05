@@ -68,6 +68,10 @@ verify() {
   local label="${1:-verify}"
   STEP=$((STEP + 1))
   local out rc
+  if ! "$LUMINA" list-windows >/dev/null 2>&1; then
+    fail "$label: lumina list-windows failed (agent down?)"
+    return
+  fi
   out="$("$LUMINA" verify 2>&1)"
   rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -137,6 +141,15 @@ wait_for_count() {
   return 1
 }
 
+wait_for_space_count() {
+  local space="$1" want="$2" deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    if [[ "$(count_on_space "$space")" -ge "$want" ]]; then return 0; fi
+    sleep 0.4
+  done
+  return 1
+}
+
 say "Lumina at $LUMINA"
 if ! "$LUMINA" status >/dev/null 2>&1; then
   echo "agent is not answering; start Lumina on this Space first." >&2
@@ -165,17 +178,16 @@ space1_before="$(count_on_space 1)"
 run workspace 2 >/dev/null
 verify "on empty workspace 2"
 open_windows 1
-sleep 1
+if wait_for_space_count 2 1; then
+  pass "the new window landed on workspace 2"
+else
+  fail "the new window did not land on workspace 2 (found on another workspace)"
+fi
 TRACKED_IDS="$TRACKED_IDS $(window_ids)"
 if [[ "$(count_on_space 1)" -ge "$space1_before" ]]; then
   pass "workspace 1 kept its $space1_before windows"
 else
   fail "workspace 1 lost windows: had $space1_before, now $(count_on_space 1)"
-fi
-if [[ "$(count_on_space 2)" -ge 1 ]]; then
-  pass "the new window landed on workspace 2"
-else
-  fail "the new window did not land on workspace 2 (found on another workspace)"
 fi
 verify "after opening on workspace 2"
 run workspace 1 >/dev/null
@@ -237,12 +249,23 @@ if [[ "${QUIT_TEST:-0}" == "1" ]]; then
   say "quit restore leaves windows usable (QUIT_TEST=1)"
   log_file="${LUMINA_LOG:-$HOME/Library/Logs/Lumina.log}"
   managed_before="$(managed_count)"
-  marker="$(wc -l < "$log_file" 2>/dev/null | tr -d ' ' || echo 0)"
+  marker="$(wc -l < "$log_file" 2>/dev/null | tr -d ' ')"
+  if [[ -z "$marker" ]]; then
+    fail "cannot read agent log at $log_file"
+    marker=0
+  fi
   "$LUMINA" quit >/dev/null 2>&1 || true
+  exited=1
   for _ in $(seq 1 30); do
-    pgrep -f lumina-agent >/dev/null 2>&1 || break
+    if ! pgrep -f lumina-agent >/dev/null 2>&1; then
+      exited=0
+      break
+    fi
     sleep 0.5
   done
+  if [[ $exited -ne 0 ]]; then
+    fail "lumina-agent did not exit after quit"
+  fi
   sleep 1
   new_lines="$(tail -n "+$((marker + 1))" "$log_file" 2>/dev/null || true)"
   restored="$(printf '%s\n' "$new_lines" | grep -c 'quit restore' || true)"

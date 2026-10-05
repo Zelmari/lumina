@@ -41,7 +41,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     public var moveStart: (UInt32, Point, Int)?
     /// A coalesced refresh session. Events only carry a reason; the session
     /// re-reads the world. `space` is where new windows land: the focused
-    /// space when the event burst started.
+    /// space at the most recent scheduling event (a switch before the pass
+    /// runs means the window appears where the user is).
     struct RefreshRequest {
         var reason: String
         var space: SpaceId
@@ -677,6 +678,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                         log.info("refresh ax empty pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?"); will re-wake")
                         axFailedPids.insert(pid)
                         adapter.markAccessibilityUnhealthy(pid: pid)
+                        // Ask directly; `resolvedElement` short-circuits on a
+                        // retained element and would never re-wake.
+                        adapter.wakeAccessibility(pid: pid)
                         refreshUnresolved = true
                     } else if hasUnmanagedOnScreen(pid) {
                         log.info("refresh ax empty unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
@@ -748,13 +752,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             scheduleRefresh(reason: "massLossSuspended", delay: 2.0)
             return
         }
-        // A live retained AX element vetoes removal: CG's list can omit a
-        // parked window transiently, and deleting one buries it off-screen
-        // with no path back into the model.
+        // A retained AX element that still answers a role read vetoes removal:
+        // CG's list can omit a parked window transiently, and deleting one
+        // buries it off-screen with no path back into the model. Only strict
+        // success counts; a timed-out read must not pin an entry forever.
         var elementLive: Set<UInt32> = []
         for id in delta.removed {
             guard let el = elements[id], let pid = modelPids[id], adapter.pid(of: el) == pid else { continue }
-            if adapter.isLiveElement(el) { elementLive.insert(id) }
+            if adapter.isAliveElement(el) { elementLive.insert(id) }
         }
         removals = removalGate.classify(
             removed: delta.removed,
@@ -853,17 +858,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         return pids.sorted()
     }
 
-    func onCreate(_ element: AXUIElement, space: SpaceId? = nil, forceRegisterPlaceholder: Bool = false) {
-        var claimed = session.allWindowIds.union(elements.keys)
-        onCreate(element, claimed: &claimed, apply: true, space: space, forceRegisterPlaceholder: forceRegisterPlaceholder)
-    }
-
     func onCreate(
         _ element: AXUIElement,
         claimed: inout Set<UInt32>,
         apply: Bool = true,
-        space preferredSpace: SpaceId? = nil,
-        forceRegisterPlaceholder: Bool = false
+        space preferredSpace: SpaceId? = nil
     ) {
         guard let bound else { return }
         let targetId = preferredSpace.flatMap { session.spaces[$0] != nil ? $0 : nil } ?? session.focusedSpace
@@ -956,7 +955,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             return
         }
-        if result == .floating, !forceRegisterPlaceholder, isPlaceholderFloat(input),
+        if result == .floating, isPlaceholderFloat(input),
            input.width < 50 || input.height < 50 || !input.isOnScreen
         {
             // A tiny or not-yet-on-screen frame with no explicit float signal
@@ -2760,16 +2759,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             ])
         }
         var issues = verifySession(session, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
-        // A model window CG still lists but we cannot resolve is about to be
-        // churned out of the model (and left buried off-screen). Surface it.
-        let cgLive = cgWindowIds()
+        // A retained element that no longer answers is the pre-removal shape:
+        // report it without enumerating every app (a busy app's failed read
+        // would otherwise look like a dead window).
         for space in session.spaces.values {
             for w in space.tiledLeaves().compactMap(\.leaf) + space.floating {
-                guard cgLive.contains(w.cgWindowId) else { continue }
-                if !hasAXElement(w) {
+                guard let el = elements[w.cgWindowId], adapter.pid(of: el) == w.pid else { continue }
+                if !adapter.isAliveElement(el) {
                     issues.append(VerifyIssue(
-                        "unresolvable-window",
-                        "window \(w.cgWindowId) (\(w.bundleId ?? "?")) is listed but has no live AX element"
+                        "dead-element-window",
+                        "window \(w.cgWindowId) (\(w.bundleId ?? "?")) has a dead AX element but is still in the model"
                     ))
                 }
             }
