@@ -46,9 +46,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     struct RefreshRequest {
         var reason: String
         var space: SpaceId
+        /// When the first event of this coalesced burst arrived. The delta to
+        /// the end of `applyFrames` is the latency users feel.
+        var receivedAt: Date
     }
     var pendingRefresh: RefreshRequest?
     var refreshScheduled = false
+    /// Event-to-frame latency of completed refresh sessions. Exposed in
+    /// `debug-windows` and `status` so the harness can assert on it.
+    var refreshLatency = LatencyStats(capacity: 256)
     /// Pids launched recently. An app launched hidden (or via AppleScript)
     /// has no on-screen window, so it would otherwise never be enumerated;
     /// it is unhidden and re-checked. Entries expire so every background app
@@ -619,7 +625,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // Keeping an older request's space let a launch poll scheduled before
         // a workspace switch claim a window the user opened after it, so the
         // window appeared on the workspace they had left.
-        pendingRefresh = RefreshRequest(reason: reason, space: session.focusedSpace)
+        // Keep the first event's timestamp across coalesced bursts so the
+        // recorded latency covers the whole wait, not just the last event.
+        let receivedAt = pendingRefresh?.receivedAt ?? Date()
+        pendingRefresh = RefreshRequest(reason: reason, space: session.focusedSpace, receivedAt: receivedAt)
         guard !refreshScheduled else { return }
         refreshScheduled = true
         MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -627,7 +636,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             self.refreshScheduled = false
             guard let request = self.pendingRefresh else { return }
             self.pendingRefresh = nil
-            self.runRefresh(reason: request.reason, space: request.space)
+            self.runRefresh(reason: request.reason, space: request.space, receivedAt: request.receivedAt)
         }
     }
 
@@ -661,7 +670,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// One declarative pass: re-read every relevant app's AX window list, GC
     /// windows that are gone, rebind replaced ids, adopt new ones, then lay
     /// out. Convergence by repetition; no per-event repair.
-    func runRefresh(reason: String, space: SpaceId) {
+    func runRefresh(reason: String, space: SpaceId, receivedAt: Date? = nil) {
         guard !isStopping(), didBootLayout, isCurrent, !userPaused, !displayGone, let bound else { return }
         let refreshInterval = LuminaSignposts.pointsOfInterest.beginInterval("refresh-session")
         defer { LuminaSignposts.pointsOfInterest.endInterval("refresh-session", refreshInterval) }
@@ -902,6 +911,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             onCreate(el, claimed: &claimed, apply: false, space: space)
         }
         applyFrames()
+        if let receivedAt {
+            refreshLatency.record(milliseconds: Date().timeIntervalSince(receivedAt) * 1000)
+        }
         restashOffspace()
         if !delta.isEmpty || refreshUnresolved || !removals.deferred.isEmpty {
             let ms = Int(Date().timeIntervalSince(started) * 1000)
@@ -3185,6 +3197,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "visibleSpaceCount": .int(visible),
             "isCurrent": .bool(isCurrent),
             "hasOnScreenIncludingSlivers": .bool(hasOnScreenIncludingSlivers()),
+            "lastRefreshMs": lastRefreshSummary.map { .int($0.durationMs) } ?? .null,
+            "refreshLatencyMs": refreshLatency.last.map { .double($0) } ?? .null,
+            "refreshLatencyP95Ms": refreshLatency.p95.map { .double($0) } ?? .null,
             "hotkeyError": hotkeys.hotkeyError.map { .string($0) } ?? .null,
             "skylightSpaceId": boundSkyLightId.map { .int(Int($0)) } ?? .null,
         ])
@@ -3200,6 +3215,20 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     var lastRefreshSummary: RefreshSummary?
+
+    func latencyJSON() -> JSONValue {
+        func number(_ value: Double?) -> JSONValue {
+            value.map { .double($0) } ?? .null
+        }
+        return .object([
+            "samples": .int(refreshLatency.count),
+            "total": .int(refreshLatency.totalRecorded),
+            "lastMs": number(refreshLatency.last),
+            "p50Ms": number(refreshLatency.p50),
+            "p95Ms": number(refreshLatency.p95),
+            "maxMs": number(refreshLatency.max),
+        ])
+    }
 
     func recordRefreshSummary(
         reason: String,
@@ -3248,6 +3277,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             "spaceCount": .int(session.spaceCount),
             "windowCount": .int(windows.count),
             "lastRefresh": lastRefresh,
+            "refreshLatency": latencyJSON(),
             "windows": .array(windows),
         ])
     }
