@@ -82,6 +82,23 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// ever launched is not re-read on every refresh forever.
     var recentlyLaunchedPids: [pid_t: Date] = [:]
     let recentlyLaunchedWindow: TimeInterval = 20
+    /// A bounded tight poll of a just-launched pid. Cold launches frequently
+    /// miss the created notification because the window exists before the
+    /// observer is installed; this catches it in the first frames instead of
+    /// waiting for the launch-poll ladder. All state is owned by
+    /// `launchWatchQueue`; only this file's launch-watch methods touch it.
+    struct LaunchWatch {
+        var startedAt = Date()
+        var attempts = 0
+        var phase: Int = 0
+        var timer: DispatchSourceTimer?
+    }
+    var launchWatches: [pid_t: LaunchWatch] = [:]
+    let launchWatchQueue = DispatchQueue(label: "com.zelmari.lumina.launch-watch")
+    let launchWatchInterval: TimeInterval = 0.01
+    let launchWatchSlowInterval: TimeInterval = 0.05
+    let launchWatchFirstPhaseSeconds: TimeInterval = 0.4
+    let launchWatchMaxSeconds: TimeInterval = 2.0
     /// Bounded follow-up passes when a window was not resolvable yet.
     var unresolvedRefreshPasses = 0
     var refreshUnresolved = false
@@ -239,6 +256,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         refreshScheduled = false
         refreshWorkItem?.cancel()
         refreshWorkItem = nil
+        cancelAllLaunchWatches()
         for item in resizeDebounce.values { item.cancel() }
         resizeDebounce.removeAll()
         configDebounce?.cancel()
@@ -546,6 +564,93 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged(_:)), name: NSApplication.didChangeScreenParametersNotification, object: nil)
     }
 
+    // MARK: - Launch watch
+
+    /// Watch a just-launched pid with a bounded tight poll. All watch state is
+    /// owned by `launchWatchQueue`; AX reads happen there and the result hops
+    /// to the mutation queue.
+    func startLaunchWatch(pid: pid_t, reason: String) {
+        launchWatchQueue.async { [weak self] in
+            guard let self, self.launchWatches[pid] == nil, !self.isOurProcess(pid) else { return }
+            let timer = DispatchSource.makeTimerSource(queue: self.launchWatchQueue)
+            timer.schedule(deadline: .now() + 0.02, repeating: self.launchWatchInterval, leeway: .milliseconds(2))
+            self.launchWatches[pid] = LaunchWatch(timer: timer)
+            self.log.info("launch watch start pid=\(pid) reason=\(reason)")
+            timer.setEventHandler { [weak self] in self?.launchWatchTick(pid: pid) }
+            timer.resume()
+        }
+    }
+
+    func cancelLaunchWatch(pid: pid_t) {
+        launchWatchQueue.async { [weak self] in
+            self?.launchWatches.removeValue(forKey: pid)?.timer?.cancel()
+        }
+    }
+
+    func cancelAllLaunchWatches() {
+        launchWatchQueue.async { [weak self] in
+            guard let self else { return }
+            for (_, watch) in self.launchWatches { watch.timer?.cancel() }
+            self.launchWatches.removeAll()
+        }
+    }
+
+    /// Runs on `launchWatchQueue`: only the adapter and pure helpers are
+    /// touched, never the session.
+    private func launchWatchTick(pid: pid_t) {
+        guard var watch = launchWatches[pid] else { return }
+        let elapsed = Date().timeIntervalSince(watch.startedAt)
+        if elapsed > launchWatchMaxSeconds || kill(pid, 0) != 0 {
+            launchWatches.removeValue(forKey: pid)?.timer?.cancel()
+            return
+        }
+        watch.attempts += 1
+        // Tight for the first frames, then a cheaper tail until the deadline.
+        let phase = elapsed < launchWatchFirstPhaseSeconds ? 0 : 1
+        if phase != watch.phase {
+            watch.phase = phase
+            watch.timer?.schedule(
+                deadline: .now() + launchWatchSlowInterval,
+                repeating: launchWatchSlowInterval,
+                leeway: .milliseconds(5)
+            )
+        }
+        launchWatches[pid] = watch
+        guard let element = firstWindowElement(pid: pid) else { return }
+        // A window exists. Stop polling and hand it to the mutation queue; if
+        // the id is not resolvable yet, the fast retry ladder takes over.
+        let id = adapter.windowIdIfKnown(for: element)
+        nonisolated(unsafe) let token = Unmanaged.passRetained(element).toOpaque()
+        let seenAfter = Int(elapsed * 1000)
+        let attempts = watch.attempts
+        launchWatches.removeValue(forKey: pid)?.timer?.cancel()
+        MutationQueue.shared.hop { [weak self] in
+            guard let self else { return }
+            let element = Unmanaged<AXUIElement>.fromOpaque(token).takeRetainedValue()
+            if let id, self.ownedAnywhere(id) { return }
+            let idText = id.map(String.init) ?? "?"
+            self.log.info("launch watch sighting pid=\(pid) id=\(idText) after=\(seenAfter)ms attempts=\(attempts)")
+            self.preParkNewWindow(element)
+            // Hard preemption: a pending coalesced timer must not delay the
+            // pass that adopts this window.
+            self.refreshWorkItem?.cancel()
+            self.refreshScheduled = false
+            self.scheduleRefresh(reason: "launchWatch", delay: 0)
+        }
+    }
+
+    /// First AXWindow element for a pid, if any. Runs on `launchWatchQueue`.
+    private func firstWindowElement(pid: pid_t) -> AXUIElement? {
+        guard case .list(let elements) = adapter.enumerateWindows(pid: pid) else { return nil }
+        for element in elements {
+            // A resolvable window id is proof without an AX read; fall back to
+            // the role for a just-created element whose id is not ready.
+            if adapter.windowIdIfKnown(for: element) != nil { return element }
+            if adapter.role(of: element) == "AXWindow" { return element }
+        }
+        return nil
+    }
+
     @objc func appLaunched(_ n: Notification) {
         guard isCurrent, !userPaused else { return }
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
@@ -563,6 +668,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 self.recentlyLaunchedPids[pid] = Date()
                 self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
                 self.launchPollDelay = 0.25
+                self.startLaunchWatch(pid: pid, reason: "appLaunched")
                 self.scheduleRefresh(reason: "appLaunched")
             }
         }
@@ -572,6 +678,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
                 self.recentlyLaunchedPids[app.processIdentifier] = nil
+                self.cancelLaunchWatch(pid: app.processIdentifier)
                 self.observers.unwatch(pid: app.processIdentifier)
                 self.adapter.forgetAccessibility(pid: app.processIdentifier)
                 self.dropPid(app.processIdentifier)
@@ -603,6 +710,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 if self.ownedWindows(pid: app.processIdentifier).isEmpty {
                     self.launchPollsRemaining = max(self.launchPollsRemaining, 3)
                     self.launchPollDelay = 0.25
+                    // Activation is usually too late to beat first paint, but
+                    // for an app launched in the last few seconds it is still
+                    // worth catching a late window in the first frames.
+                    if let launchedAt = self.recentlyLaunchedPids[app.processIdentifier],
+                       Date().timeIntervalSince(launchedAt) < 3
+                    {
+                        self.startLaunchWatch(pid: app.processIdentifier, reason: "appActivated")
+                    }
                 }
                 // A model window may already be dead (Electron AX churn). A
                 // space full of ghosts must not count as occupied, or macOS
@@ -1409,6 +1524,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         preParked[id] = nil
         // Adopted; stop treating the pid as a pending launch.
         recentlyLaunchedPids[pid] = nil
+        cancelLaunchWatch(pid: pid)
         if targetId != session.focusedSpace {
             // The user moved on before this window settled. It belongs to the
             // space that was focused when it appeared; stash its role and
@@ -3090,6 +3206,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func dropPid(_ pid: pid_t) {
+        cancelLaunchWatch(pid: pid)
         let fsBefore = session.current.luminaFullscreen
         // The element map can already be empty for a closed window (the
         // liveness probe cleared it), so union with the model's own ids.
