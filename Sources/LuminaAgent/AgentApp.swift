@@ -62,7 +62,14 @@ struct AgentApp {
         Self.termSource = term
         runtime.start()
         app.run()
-        runtime.stop()
+        // Serialize the final stop with in-flight layout work; runtime state
+        // is mutation-queue owned.
+        let stopped = DispatchSemaphore(value: 0)
+        MutationQueue.shared.hop {
+            runtime.stop()
+            stopped.signal()
+        }
+        _ = stopped.wait(timeout: .now() + 3)
     }
 
     nonisolated(unsafe) private static var termSource: DispatchSourceSignal?
