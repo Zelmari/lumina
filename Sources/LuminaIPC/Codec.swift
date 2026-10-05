@@ -166,6 +166,12 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
     case "mark-current": return .ok(.markCurrent)
     case "yield": return .ok(.yield)
     case "accessibility-prompt": return .ok(.accessibilityPrompt)
+    case "debug-ax":
+        guard let raw = args["pid"] else { return .failure("missing args: pid") }
+        guard let pid = raw.int else {
+            return .failure("invalid args: pid=\(argValueDescription(raw))")
+        }
+        return .ok(.debugAX(pid: Int32(pid)))
     case "debug-windows": return .ok(.debugWindows)
     default: return .unknown
     }

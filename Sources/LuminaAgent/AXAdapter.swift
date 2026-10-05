@@ -485,6 +485,91 @@ public final class AXAdapter {
         NSRunningApplication(processIdentifier: pid)?.isHidden ?? false
     }
 
+    // MARK: - Debug probe
+
+    /// Attribute names exposed by an element, for the `debug-ax` probe.
+    public func attributeNames(of element: AXUIElement) -> [String]? {
+        var ref: CFArray?
+        guard AXUIElementCopyAttributeNames(element, &ref) == .success,
+              let names = ref as? [String]
+        else { return nil }
+        return names
+    }
+
+    public func children(of element: AXUIElement) -> [AXUIElement]? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &ref) == .success else {
+            return nil
+        }
+        return ref as? [AXUIElement]
+    }
+
+    private func copyAttribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &ref) == .success else { return nil }
+        return ref
+    }
+
+    private static let debugTabAttributes = [
+        "AXTabs", "AXSelectedChildren", "AXTabGroup", "AXMain", "AXFocused",
+        "AXIdentifier", "AXDescription",
+    ]
+
+    /// A JSON view of an AX element and its children, focused on the
+    /// attributes needed to detect native tab groups (`AXTabGroup`, `AXTabs`,
+    /// `AXSelectedChildren`) and map tabs to windows.
+    public func debugElementJSON(_ element: AXUIElement, depth: Int = 0, maxDepth: Int = 2) -> JSONValue {
+        let names = attributeNames(of: element) ?? []
+        var tabValues: [String: JSONValue] = [:]
+        for name in Self.debugTabAttributes where names.contains(name) {
+            tabValues[name] = copyAttribute(element, name).map { describeAXValue($0) } ?? .null
+        }
+        var object: [String: JSONValue] = [
+            "role": .string(role(of: element) ?? ""),
+            "subrole": .string(subrole(of: element) ?? ""),
+            "title": .string(title(of: element) ?? ""),
+            "attributeNames": .array(names.sorted().map { .string($0) }),
+            "tabAttributes": .object(tabValues),
+        ]
+        if let id = windowId(for: element) { object["cgWindowId"] = .int(Int(id)) }
+        if let frame = frame(of: element) {
+            object["frame"] = .object([
+                "x": .double(frame.x), "y": .double(frame.y),
+                "w": .double(frame.w), "h": .double(frame.h),
+            ])
+        }
+        if depth < maxDepth, let kids = children(of: element), !kids.isEmpty {
+            object["children"] = .array(kids.prefix(24).map {
+                debugElementJSON($0, depth: depth + 1, maxDepth: maxDepth)
+            })
+        }
+        return .object(object)
+    }
+
+    private func describeAXValue(_ value: CFTypeRef) -> JSONValue {
+        if let s = value as? String { return .string(s) }
+        if let b = value as? Bool { return .bool(b) }
+        if let n = value as? NSNumber { return .double(n.doubleValue) }
+        if CFGetTypeID(value) == AXUIElementGetTypeID() {
+            let element = value as! AXUIElement
+            return .object([
+                "elementRole": .string(role(of: element) ?? "?"),
+                "elementTitle": .string(title(of: element) ?? ""),
+                "cgWindowId": windowId(for: element).map { .int(Int($0)) } ?? .null,
+            ])
+        }
+        if let array = value as? [Any] {
+            return .array(array.prefix(24).map { item -> JSONValue in
+                let itemRef = item as CFTypeRef
+                if CFGetTypeID(itemRef) == AXUIElementGetTypeID() {
+                    return describeAXValue(itemRef)
+                }
+                return .string(String(describing: item))
+            })
+        }
+        return .string(String(describing: type(of: value)))
+    }
+
     public func isFullscreen(_ element: AXUIElement) -> Bool {
         var ref: CFTypeRef?
         let attr = "AXFullScreen" as CFString
