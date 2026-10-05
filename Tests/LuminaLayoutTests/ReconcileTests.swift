@@ -177,6 +177,36 @@ struct ReconcileTests {
         }
     }
 
+    @Test func liveElementVetoesRemovalEvenWhenCGMissesIt() {
+        // CG transiently omitting a live parked window must not delete it
+        // from the model; the retained AX element is the tie-breaker.
+        var gate = RemovalGate()
+        let result = gate.classify(
+            removed: [7],
+            cgLive: [],
+            pidOf: [7: 10],
+            axFailedPids: [],
+            floatingIds: [],
+            elementLive: [7]
+        )
+        #expect(result.real.isEmpty)
+        #expect(result.deferred == [7])
+    }
+
+    @Test func deadElementStillRemovedWhenCGMissesIt() {
+        var gate = RemovalGate()
+        let result = gate.classify(
+            removed: [7],
+            cgLive: [],
+            pidOf: [7: 10],
+            axFailedPids: [],
+            floatingIds: [],
+            elementLive: []
+        )
+        #expect(result.real == [7])
+        #expect(result.deferred.isEmpty)
+    }
+
     @Test func removalDeferredWhileAxReadFails() {
         var gate = RemovalGate()
         for _ in 0..<10 {

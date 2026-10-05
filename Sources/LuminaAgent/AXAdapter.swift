@@ -74,14 +74,18 @@ public final class AXAdapter {
     }
 
     public func windowId(for element: AXUIElement, excluding: Set<UInt32> = []) -> UInt32? {
-        if let cached = cachedWindowId(for: element), !excluding.contains(cached) {
-            return cached
+        if let cached = cachedWindowId(for: element) {
+            // The element resolves to a known id. If that id is claimed by
+            // another element, this is the same window seen twice, not a new
+            // one: falling through to the frame matcher would mint a phantom
+            // id for it (and adopt a chrome window as a tile).
+            return excluding.contains(cached) ? nil : cached
         }
         if let axGetWindow {
             var id: UInt32 = 0
             let err = axGetWindow(element, &id)
-            if err == 0, id != 0, !excluding.contains(id) {
-                return id
+            if err == 0, id != 0 {
+                return excluding.contains(id) ? nil : id
             }
             if err != 0 && !loggedMissingPrivateAPI {
                 loggedMissingPrivateAPI = true
@@ -94,11 +98,21 @@ public final class AXAdapter {
         return fallbackWindowId(for: element, excluding: excluding)
     }
 
+    /// Pointer-keyed lookup. AXUIElement pointers are reused after the AX
+    /// server destroys an element, so a cache hit is only trusted when the
+    /// tracked element at that id is still the same object; otherwise the
+    /// stale entries are dropped and the caller re-resolves.
     public func cachedWindowId(for element: AXUIElement) -> UInt32? {
         let key = elementKey(element)
         lock.lock()
         defer { lock.unlock() }
-        if let cached = idCache[key] { return cached }
+        if let cached = idCache[key] {
+            if let trackedElement = tracked[cached], CFEqual(trackedElement, element) {
+                return cached
+            }
+            idCache[key] = nil
+            minSizeCache[key] = nil
+        }
         for (id, el) in tracked where CFEqual(el, element) {
             idCache[key] = id
             return id
@@ -191,6 +205,17 @@ public final class AXAdapter {
     public func markAccessibilityHealthy(pid: pid_t) {
         lock.lock()
         accessibilityHealthy.insert(pid)
+        lock.unlock()
+    }
+
+    /// The app answered an AX window read with an empty list even though it
+    /// has windows. Its accessibility tree was torn down after we marked it
+    /// healthy; forget the wake state so the next resolve asks again.
+    public func markAccessibilityUnhealthy(pid: pid_t) {
+        lock.lock()
+        accessibilityHealthy.remove(pid)
+        accessibilityDelivered.remove(pid)
+        accessibilityWakeAt[pid] = nil
         lock.unlock()
     }
 

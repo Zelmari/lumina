@@ -351,8 +351,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 adapter.rememberWindowId(id, for: el)
                 elements[id] = el
                 let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                let w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
-                knownOriginals[id] = w.originalFrame ?? frame
+                let known = knownOriginals[id]
+                let original: Rect? = (known != nil || !isStashedAway(frame))
+                    ? resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals)
+                    : nil
+                let w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: original)
+                if let original { knownOriginals[id] = original }
                 markBorn(id)
                 out.append(w)
             }
@@ -377,8 +381,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 adapter.rememberWindowId(id, for: focusedEl)
                 elements[id] = focusedEl
                 let frame = adapter.frame(of: focusedEl) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-                let w = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
-                knownOriginals[id] = w.originalFrame ?? frame
+                let known = knownOriginals[id]
+                let original: Rect? = (known != nil || !isStashedAway(frame))
+                    ? resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals)
+                    : nil
+                let w = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: original)
+                if let original { knownOriginals[id] = original }
                 markBorn(id)
                 out.append(w)
                 log.info("adopt focused window at boot pid=\(pid) id=\(id) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
@@ -558,8 +566,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Coalesce every discovery event into one session. Mutation queue only.
     func scheduleRefresh(reason: String, delay: TimeInterval = 0.04) {
         guard !isStopping() else { return }
-        let space = pendingRefresh?.space ?? session.focusedSpace
-        pendingRefresh = RefreshRequest(reason: reason, space: space)
+        // New windows land on the space focused when their event arrives.
+        // Keeping an older request's space let a launch poll scheduled before
+        // a workspace switch claim a window the user opened after it, so the
+        // window appeared on the workspace they had left.
+        pendingRefresh = RefreshRequest(reason: reason, space: session.focusedSpace)
         guard !refreshScheduled else { return }
         refreshScheduled = true
         MutationQueue.shared.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
@@ -583,7 +594,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     ) -> Bool {
         let app = AXUIElementCreateApplication(pid)
         guard let el = adapter.focusedWindow(of: app), let id = adapter.windowId(for: el) else { return false }
-        guard !elementsById.keys.contains(id) else { return false }
+        guard !elementsById.keys.contains(id), !ownedAnywhere(id) else { return false }
         let frame = adapter.frame(of: el) ?? Rect(x: 0, y: 0, w: 0, h: 0)
         live.append(LiveWindow(
             cgWindowId: id,
@@ -640,6 +651,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     && cgWindowID(row).map { unmanagedLayeredIds.contains($0) } == true
             }
         }
+        func hasAnyOnScreenWindow(_ pid: pid_t) -> Bool {
+            onScreenRows.contains { row in
+                guard let rect = cgWindowRect(row), rect.w >= 50, rect.h >= 50 else { return false }
+                return cgOwnerPID(row) == pid && cgWindowLayer(row) == 0
+            }
+        }
+        let modelPidSet = Set(modelPids.values)
         for pid in refreshPids() {
             switch adapter.enumerateWindows(pid: pid) {
             case .failed:
@@ -649,9 +667,21 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     refreshUnresolved = true
                 }
             case .list(let elements):
-                if elements.isEmpty, hasUnmanagedOnScreen(pid) {
-                    log.info("refresh ax empty unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
-                    refreshUnresolved = true
+                if elements.isEmpty {
+                    // An app that owns on-screen or model windows but answers
+                    // an empty AXWindows list has torn its accessibility tree
+                    // down (Ghostty/Electron do this). Treat the read as
+                    // failed for removal purposes and forget the wake state
+                    // so it is woken again instead of looking windowless.
+                    if hasAnyOnScreenWindow(pid) || modelPidSet.contains(pid) {
+                        log.info("refresh ax empty pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?"); will re-wake")
+                        axFailedPids.insert(pid)
+                        adapter.markAccessibilityUnhealthy(pid: pid)
+                        refreshUnresolved = true
+                    } else if hasUnmanagedOnScreen(pid) {
+                        log.info("refresh ax empty unmanaged pid=\(pid) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
+                        refreshUnresolved = true
+                    }
                 }
                 for el in elements {
                     guard let id = adapter.windowId(for: el) else {
@@ -718,15 +748,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             scheduleRefresh(reason: "massLossSuspended", delay: 2.0)
             return
         }
+        // A live retained AX element vetoes removal: CG's list can omit a
+        // parked window transiently, and deleting one buries it off-screen
+        // with no path back into the model.
+        var elementLive: Set<UInt32> = []
+        for id in delta.removed {
+            guard let el = elements[id], let pid = modelPids[id], adapter.pid(of: el) == pid else { continue }
+            if adapter.isLiveElement(el) { elementLive.insert(id) }
+        }
         removals = removalGate.classify(
             removed: delta.removed,
             cgLive: cgWindowIds(),
             pidOf: modelPids,
             axFailedPids: failedManaged,
-            floatingIds: floatingIds
+            floatingIds: floatingIds,
+            elementLive: elementLive
         )
         if !removals.deferred.isEmpty {
-            log.info("refresh deferring removal ids=\(removals.deferred) (cg still lists them)")
+            log.info("refresh deferring removal ids=\(removals.deferred) (alive or cg still lists them)")
             refreshUnresolved = true
         }
         let focusedBefore = session.current.focusedWindow
@@ -843,8 +882,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         if let frame = adapter.frame(of: element), isStashedAway(frame) {
             // A fresh window's first AX read can be an empty frame while it
             // animates in; that is not our park. Our parks always keep height.
+            // Only skip when the app already owns model windows: an app whose
+            // saved window position is a park corner (macOS restores the last
+            // frame) has none yet and must be adopted and tiled, or it is
+            // never managed.
             let empty = frame.w < 8 && frame.h < 8
-            if !empty {
+            let pidOwnsModelWindow = adapter.pid(of: element).map { !ownedWindows(pid: $0).isEmpty } ?? false
+            if !empty, pidOwnsModelWindow {
                 log.info("onCreate skip stashed-away role=\(adapter.role(of: element) ?? "?")")
                 return
             }
@@ -927,8 +971,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         adapter.rememberWindowId(id, for: element)
         elements[id] = element
         let frame = adapter.frame(of: element) ?? Rect(x: 0, y: 0, w: 0, h: 0)
-        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals))
-        knownOriginals[id] = window.originalFrame ?? frame
+        // A park frame is not the user's geometry; never record it as the
+        // original or quit would restore a window to a 1px corner.
+        let known = knownOriginals[id]
+        let original: Rect? = (known != nil || !isStashedAway(frame))
+            ? resolveOriginal(cgWindowId: id, liveFrame: frame, knownOriginals: knownOriginals)
+            : nil
+        var window = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: .tiled, lastOnscreenFrame: frame, originalFrame: original)
+        if let original { knownOriginals[id] = original }
         let usable = bound.usableRect(gaps: config.gaps)
         let target = session.spaces[targetId] ?? session.current
         if target.luminaFullscreen != nil {
@@ -951,7 +1001,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         markBorn(id)
         if targetId != session.focusedSpace {
             // The user moved on before this window settled. It belongs to the
-            // space that was focused when it appeared; park it there now.
+            // space that was focused when it appeared; stash its role and
+            // park it there now, or the model reports a visible window on an
+            // inactive workspace.
+            session = session.markStashed(space: targetId, ids: [id])
             stash(ids: [id], space: targetId)
         }
         if apply { applyFrames() }
@@ -2706,7 +2759,21 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 "issues": .array([.object(["kind": .string("no-display"), "detail": .string("agent has no bound display")])]),
             ])
         }
-        let issues = verifySession(session, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
+        var issues = verifySession(session, usable: bound.usableRect(gaps: config.gaps), gaps: config.gaps)
+        // A model window CG still lists but we cannot resolve is about to be
+        // churned out of the model (and left buried off-screen). Surface it.
+        let cgLive = cgWindowIds()
+        for space in session.spaces.values {
+            for w in space.tiledLeaves().compactMap(\.leaf) + space.floating {
+                guard cgLive.contains(w.cgWindowId) else { continue }
+                if !hasAXElement(w) {
+                    issues.append(VerifyIssue(
+                        "unresolvable-window",
+                        "window \(w.cgWindowId) (\(w.bundleId ?? "?")) is listed but has no live AX element"
+                    ))
+                }
+            }
+        }
         return .object([
             "ok": .bool(issues.isEmpty),
             "focusedSpace": .int(session.focusedSpace.raw),

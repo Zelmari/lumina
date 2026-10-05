@@ -126,7 +126,10 @@ public func reconcile(
 ///
 /// A window missing from a *failed* AX read tells us nothing at all: busy apps
 /// time out `AXWindows`, so the window is deferred without counting a miss.
-/// `removed` ids CG has also dropped are destroyed immediately.
+/// `removed` ids CG has also dropped are destroyed immediately, unless the
+/// agent still holds a live AX element for them (`elementLive`): CG's list can
+/// transiently omit a live parked window, and deleting one leaves it buried
+/// off-screen with no way back.
 ///
 /// Floating entries are the only capped class. Hidden retention windows
 /// (Spotlight keeps a CG window alive while its UI is dismissed) must not pin
@@ -145,12 +148,17 @@ public struct RemovalGate: Equatable, Sendable {
         cgLive: Set<UInt32>,
         pidOf: [UInt32: Int32],
         axFailedPids: Set<Int32>,
-        floatingIds: Set<UInt32>
+        floatingIds: Set<UInt32>,
+        elementLive: Set<UInt32> = []
     ) -> (real: [UInt32], deferred: [UInt32]) {
         var real: [UInt32] = []
         var deferred: [UInt32] = []
         var next: [UInt32: Int] = [:]
         for id in removed {
+            if elementLive.contains(id) {
+                deferred.append(id)
+                continue
+            }
             guard cgLive.contains(id) else {
                 real.append(id)
                 continue
