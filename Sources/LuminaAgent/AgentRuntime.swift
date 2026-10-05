@@ -260,8 +260,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             tileable = []
             floaters = windows
         } else {
-            tileable = windows.filter { classifyWindow($0) == .tiled }
-            floaters = windows.filter { classifyWindow($0) == .floating }
+            // One enumeration for the whole batch, one classification per
+            // window. The old double filter classified every window twice and
+            // each call enumerated all CG windows.
+            let onScreen = bound.map { Set(onScreenCGWindows(intersecting: $0.axFrame).compactMap(cgWindowID)) } ?? []
+            var classified: [UInt32: ClassifyResult] = [:]
+            for window in windows {
+                classified[window.cgWindowId] = classifyWindow(window, onScreenIds: onScreen)
+            }
+            tileable = windows.filter { classified[$0.cgWindowId] == .tiled }
+            floaters = windows.filter { classified[$0.cgWindowId] == .floating }
         }
         let usable = bound.map { $0.usableRect(gaps: config.gaps) } ?? Rect(x: 0, y: 0, w: 1, h: 1)
         session = session.applyLaunchTiling(
@@ -330,9 +338,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func classifyWindow(_ window: WindowRef) -> ClassifyResult {
-        guard let el = elements[window.cgWindowId], let bound else { return .tiled }
+        guard let bound else { return .tiled }
         let onScreen = Set(onScreenCGWindows(intersecting: bound.axFrame).compactMap(cgWindowID))
-        guard let (input, _, _) = classifyInput(from: el, adapter: adapter, bound: bound, onScreenIds: onScreen) else {
+        return classifyWindow(window, onScreenIds: onScreen)
+    }
+
+    /// Same classification with the on-screen set supplied by the caller, so a
+    /// batch does one WindowServer enumeration instead of one per window.
+    func classifyWindow(_ window: WindowRef, onScreenIds: Set<UInt32>) -> ClassifyResult {
+        guard let el = elements[window.cgWindowId], let bound else { return .tiled }
+        guard let (input, _, _) = classifyInput(from: el, adapter: adapter, bound: bound, onScreenIds: onScreenIds) else {
             return .tiled
         }
         return classify(input, rules: config.windowRules)
@@ -358,6 +373,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         let usable = bound.usableRect(gaps: config.gaps)
         let started = Date()
         var out: [WindowRef] = []
+        // Kept in lockstep with `out`; rebuilding it inside the per-element
+        // loop made boot collection O(windows^2).
+        var used: Set<UInt32> = []
         let cg = onScreenCGWindows(intersecting: bound.axFrame)
         let onScreenIds = Set(cg.compactMap(cgWindowID))
         let ownerPids = Set(cg.compactMap(cgOwnerPID))
@@ -379,7 +397,6 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             if isOurProcess(pid) || !ownerPids.contains(pid) { continue }
             observers.watch(pid: pid)
             for el in adapter.windows(pid: pid) {
-                let used = Set(out.map(\.cgWindowId))
                 guard let (input, id, _) = classifyInput(
                     from: el,
                     adapter: adapter,
@@ -415,6 +432,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 let w = WindowRef(cgWindowId: id, pid: pid, bundleId: app.bundleIdentifier, role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: original)
                 knownOriginals[id] = original
                 markBorn(id)
+                used.insert(id)
                 out.append(w)
             }
         }
@@ -428,7 +446,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                adapter: adapter,
                bound: bound,
                onScreenIds: onScreenIds,
-               excludingWindowIds: Set(out.map(\.cgWindowId))
+               excludingWindowIds: used
            ),
            !out.contains(where: { $0.cgWindowId == id })
         {
@@ -443,16 +461,18 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 let w = WindowRef(cgWindowId: id, pid: pid, bundleId: adapter.bundleId(pid: pid), role: result == .floating ? .floating : .tiled, lastOnscreenFrame: frame, originalFrame: original)
                 knownOriginals[id] = original
                 markBorn(id)
+                used.insert(id)
                 out.append(w)
                 log.info("adopt focused window at boot pid=\(pid) id=\(id) bundle=\(adapter.bundleId(pid: pid) ?? "?")")
             }
         }
-        // front-to-back: CG list is front-to-back already (index 0 frontmost)
-        let order = cg.compactMap(cgWindowID)
+        // front-to-back: CG list is front-to-back already (index 0 frontmost).
+        // One rank map keeps the sort O(n log n) instead of scanning the
+        // front-to-back list per comparison.
+        var rank: [UInt32: Int] = [:]
+        for (i, id) in cg.compactMap(cgWindowID).enumerated() { rank[id] = i }
         out.sort { a, b in
-            let ia = order.firstIndex(of: a.cgWindowId) ?? .max
-            let ib = order.firstIndex(of: b.cgWindowId) ?? .max
-            return ia < ib
+            (rank[a.cgWindowId] ?? .max) < (rank[b.cgWindowId] ?? .max)
         }
         return out
     }
