@@ -7,6 +7,7 @@ final class StatusItemController {
     private var stripView: StatusStripView?
     var onDigit: ((Int) -> Void)?
     var onOpenConfig: (() -> Void)?
+    var onGrantAccessibility: (() -> Void)?
     var onReload: (() -> Void)?
     var onPauseResume: (() -> Void)?
     var onStart: (() -> Void)?
@@ -140,6 +141,13 @@ final class StatusItemController {
             menu.addItem(.separator())
         }
         menu.addItem(menuItem(title: "Open Config", symbol: "gearshape", action: #selector(openConfig)))
+        menu.addItem(
+            menuItem(
+                title: "Grant Accessibility…",
+                symbol: "hand.raised",
+                action: #selector(grantAccessibility)
+            )
+        )
         if current {
             menu.addItem(menuItem(title: "Reload", symbol: "arrow.clockwise", action: #selector(reload)))
             menu.addItem(
@@ -198,6 +206,7 @@ final class StatusItemController {
 
     @objc func pickSpace(_ sender: NSMenuItem) { onDigit?(sender.tag) }
     @objc func openConfig() { onOpenConfig?() }
+    @objc func grantAccessibility() { onGrantAccessibility?() }
     @objc func reload() { onReload?() }
     @objc func pauseResume() { onPauseResume?() }
     @objc func start() { onStart?() }

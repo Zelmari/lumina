@@ -92,6 +92,8 @@ public enum AgentCmd: Equatable, Sendable {
     case markCurrent
     /// This agent is no longer the current Space. Drop hotkeys and stop mutating.
     case yield
+    /// Show the Accessibility grant prompt again (freshly reset TCC record).
+    case accessibilityPrompt
     case debugWindows
 }
 
@@ -105,6 +107,7 @@ public enum ExtraCmd: Equatable, Sendable {
     case start
     case quitAll
     case openConfig
+    case grantAccessibility
     case status
 }
 

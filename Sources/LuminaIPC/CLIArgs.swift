@@ -29,6 +29,8 @@ public enum CLIArgs {
     start                        start Lumina on this Space
     quit                         quit Lumina and untile every window
     open-config                  open the config file
+    grant-accessibility          re-show the Accessibility grant prompt
+                                 (reset TCC first to get the prompt again)
     version                      print the version
     """
 
@@ -80,7 +82,7 @@ public enum CLIArgs {
             return IPCRequest(id: id, cmd: "fullscreen")
         case "float-toggle", "balance", "close", "pause", "resume", "reload",
              "list-windows", "list-workspaces", "verify", "status", "debug-windows",
-             "start", "quit-all", "open-config", "current-token":
+             "start", "quit-all", "open-config", "current-token", "grant-accessibility":
             return IPCRequest(id: id, cmd: head)
         case "quit", "exit":
             // `quit` exits Lumina entirely, like Hyprland's `exit`. Quitting
@@ -92,6 +94,6 @@ public enum CLIArgs {
     }
 
     public static func isExtraCommand(_ cmd: String) -> Bool {
-        ["start", "quit", "exit", "quit-all", "open-config", "current-token"].contains(cmd)
+        ["start", "quit", "exit", "quit-all", "open-config", "current-token", "grant-accessibility"].contains(cmd)
     }
 }

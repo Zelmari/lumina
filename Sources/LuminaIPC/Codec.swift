@@ -165,6 +165,7 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
     case "status": return .ok(.status)
     case "mark-current": return .ok(.markCurrent)
     case "yield": return .ok(.yield)
+    case "accessibility-prompt": return .ok(.accessibilityPrompt)
     case "debug-windows": return .ok(.debugWindows)
     default: return .unknown
     }
@@ -177,6 +178,7 @@ private func parseExtraCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<E
     case "start": return .ok(.start)
     case "quit-all": return .ok(.quitAll)
     case "open-config": return .ok(.openConfig)
+    case "grant-accessibility": return .ok(.grantAccessibility)
     case "status": return .ok(.status)
     default: return .unknown
     }

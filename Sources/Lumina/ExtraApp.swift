@@ -66,6 +66,7 @@ final class ExtraController: NSObject, @unchecked Sendable {
         writeDefaultConfigIfNeeded()
         status.onDigit = { [weak self] n in self?.sendToCurrent(.workspace(id: n)) }
         status.onOpenConfig = { [weak self] in self?.openConfig() }
+        status.onGrantAccessibility = { [weak self] in self?.grantAccessibility() }
         status.onReload = { [weak self] in self?.sendToCurrent(.reload) }
         status.onPauseResume = { [weak self] in self?.togglePause() }
         status.onStart = { [weak self] in self?.startOnThisSpace() }
@@ -349,8 +350,33 @@ final class ExtraController: NSObject, @unchecked Sendable {
         case .openConfig:
             openConfig()
             return .success(id: id)
+        case .grantAccessibility:
+            grantAccessibility()
+            return .success(id: id)
         case .status:
             return .success(id: id, data: currentStatusJSON())
+        }
+    }
+
+    /// Ask the agent to re-show the system Accessibility prompt (works after
+    /// `tccutil reset Accessibility com.zelmari.lumina.agent`) and open the
+    /// Accessibility pane as a fallback when the record already exists.
+    func grantAccessibility() {
+        if let rec = currentRecord() {
+            sendTo(instance: rec.instanceId, socket: rec.socket, .accessibilityPrompt)
+        } else {
+            startOnThisSpace()
+        }
+        openAccessibilitySettings()
+    }
+
+    func openAccessibilitySettings() {
+        let urls = [
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        ]
+        for s in urls {
+            if let url = URL(string: s), NSWorkspace.shared.open(url) { return }
         }
     }
 
@@ -575,6 +601,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .status: return "status"
     case .markCurrent: return "mark-current"
     case .yield: return "yield"
+    case .accessibilityPrompt: return "accessibility-prompt"
     case .debugWindows: return "debug-windows"
     }
 }

@@ -1371,7 +1371,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return .failure(id: id, error: "agent is quitting")
         }
         switch cmd {
-        case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces, .verify:
+        case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces, .verify,
+             .accessibilityPrompt:
             break
         default:
             if userPaused || displayGone || !isCurrent { return .success(id: id) }
@@ -1443,6 +1444,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             isCurrent = false
             unregisterHotkeys()
             startOrStopFFM()
+            return .success(id: id)
+        case .accessibilityPrompt:
+            requestAgentAXPrompt()
             return .success(id: id)
         case .debugWindows:
             return .success(id: id, data: debugWindowsJSON())
