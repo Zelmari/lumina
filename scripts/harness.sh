@@ -230,20 +230,17 @@ for w in json.load(sys.stdin).get("windows", []):
 ' "$1" 2>/dev/null || true
 }
 
-# `make new document` gives a default-size window that classifies as tiled.
-# `open -n` is the permission-free fallback, but TextEdit may restore a saved
-# (possibly parked) frame, so prefer the scripted path when allowed. Wait for
-# each window to be adopted: rapid document churn makes TextEdit's AX tree
-# flaky, and a fixed sleep loses windows.
+# `open -n` activates TextEdit, so the new window is visible and adopted
+# deterministically. `make new document` launches the app hidden, which
+# delays adoption until an activation event. Wait for each window: rapid
+# document churn makes TextEdit's AX tree flaky.
 open_windows() {
   local n="$1"
   for ((i = 0; i < n; i++)); do
     local before id deadline
     before="$(window_ids)"
-    if ! osascript -e 'tell application "TextEdit" to make new document' >/dev/null 2>&1; then
-      open -n -a TextEdit >/dev/null 2>&1 ||
-        { fail "could not launch TextEdit window $((i + 1))"; return 1; }
-    fi
+    open -n -a TextEdit >/dev/null 2>&1 ||
+      { fail "could not launch TextEdit window $((i + 1))"; return 1; }
     deadline=$((SECONDS + 8))
     id=""
     while ((SECONDS < deadline)); do
