@@ -81,13 +81,22 @@ public final class AgentSocketServer {
             return
         }
         // A client that stops reading must not block the serial queue in
-        // write; time the send out so a stalled reader fails instead.
+        // write; time the send out so a stalled reader fails instead. A client
+        // that connects and sends nothing must not hold the queue either.
         var sendTimeout = timeval(tv_sec: 2, tv_usec: 0)
         _ = setsockopt(
             client,
             SOL_SOCKET,
             SO_SNDTIMEO,
             &sendTimeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
+        var readTimeout = timeval(tv_sec: 5, tv_usec: 0)
+        _ = setsockopt(
+            client,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &readTimeout,
             socklen_t(MemoryLayout<timeval>.size)
         )
         queue.async { self.serve(client) }

@@ -62,6 +62,16 @@ final class MenuSocketServer {
             close(client)
             return
         }
+        // A client that connects and sends nothing must not wedge the serial
+        // accept queue for every later command.
+        var readTimeout = timeval(tv_sec: 5, tv_usec: 0)
+        _ = setsockopt(
+            client,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &readTimeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
         queue.async { self.serve(client) }
     }
 
