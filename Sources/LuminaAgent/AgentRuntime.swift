@@ -67,8 +67,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     /// Bounded post-launch discovery polls. A freshly launched app can create
     /// its window after the one refresh `appLaunched` schedules, and the
     /// window-created notification is easily missed while the AX observer is
-    /// still installing, so keep re-reading for a few seconds.
+    /// still installing, so keep re-reading for a few seconds. The delay backs
+    /// off and polling stops as soon as the app produces a window.
     var launchPollsRemaining = 0
+    var launchPollDelay: TimeInterval = 0.25
     /// When a window joined the session. Pruning never removes a window
     /// younger than the grace period; it may just not be visible to AX/CG yet.
     var bornAt: [UInt32: Date] = [:]
@@ -484,6 +486,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 guard let self else { return }
                 self.recentlyLaunchedPids[pid] = Date()
                 self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
+                self.launchPollDelay = 0.25
                 self.scheduleRefresh(reason: "appLaunched")
             }
         }
@@ -516,6 +519,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 self.scheduleRefresh(reason: "appActivated")
                 if self.ownedWindows(pid: app.processIdentifier).isEmpty {
                     self.launchPollsRemaining = max(self.launchPollsRemaining, 3)
+                    self.launchPollDelay = 0.25
                 }
                 // A model window may already be dead (Electron AX churn). A
                 // space full of ghosts must not count as occupied, or macOS
@@ -939,9 +943,24 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         } else if !refreshUnresolved {
             unresolvedRefreshPasses = 0
         }
+        if launchPollsRemaining > 0, !delta.added.isEmpty || !delta.recycled.isEmpty {
+            // A window belonging to the launched app appeared: further
+            // discovery polls only re-read the world for nothing. An unrelated
+            // new window must not end the series early.
+            var livePid: [UInt32: pid_t] = [:]
+            for w in live { livePid[w.cgWindowId] = w.pid }
+            let launchedPids = Set(recentlyLaunchedPids.keys)
+            if (delta.added + delta.recycled).contains(where: { livePid[$0].map(launchedPids.contains) == true }) {
+                launchPollsRemaining = 0
+                launchPollDelay = 0.25
+            }
+        }
         if launchPollsRemaining > 0 {
-            launchPollsRemaining -= 1
-            scheduleRefresh(reason: "launchPoll", delay: 0.75)
+            // Only a discovery poll consumes the budget; the refresh that
+            // observed the launch just starts the series.
+            if reason == "launchPoll" { launchPollsRemaining -= 1 }
+            scheduleRefresh(reason: "launchPoll", delay: launchPollDelay)
+            launchPollDelay = min(launchPollDelay * 2, 1.5)
         }
     }
 
