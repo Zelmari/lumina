@@ -49,10 +49,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
     var pendingRefresh: RefreshRequest?
     var refreshScheduled = false
-    /// Pids launched since the agent started. An app launched hidden (or via
-    /// AppleScript) has no on-screen window, so it would otherwise never be
-    /// enumerated; its main window is adopted and the app unhidden.
-    var recentlyLaunchedPids: Set<pid_t> = []
+    /// Pids launched recently. An app launched hidden (or via AppleScript)
+    /// has no on-screen window, so it would otherwise never be enumerated;
+    /// it is unhidden and re-checked. Entries expire so every background app
+    /// ever launched is not re-read on every refresh forever.
+    var recentlyLaunchedPids: [pid_t: Date] = [:]
+    let recentlyLaunchedWindow: TimeInterval = 20
     /// Bounded follow-up passes when a window was not resolvable yet.
     var unresolvedRefreshPasses = 0
     var refreshUnresolved = false
@@ -72,9 +74,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     var removalGate = RemovalGate()
     /// Sizes an app has actually refused to shrink below. Some apps report
     /// AXMinSize 0 but clamp in practice; without this they overlap the
-    /// neighbour whose tile they overflow. A read that still shows the
-    /// previous target is treated as "not applied yet", not as a minimum.
+    /// neighbour whose tile they overflow. A refusal must be seen twice with
+    /// the window keeping its old size across a shrink request.
     var observedMinSizes: [UInt32: Size] = [:]
+    var overflowStrikes: [UInt32: Int] = [:]
     var clampingOverflow = false
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
     public var configDebounce: DispatchWorkItem?
@@ -353,15 +356,25 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     excludingWindowIds: used
                 ) else { continue }
                 adapter.markAccessibilityHealthy(pid: pid)
+                if adapter.isAppHidden(pid: pid) {
+                    // Unhide and re-check on the next pass; only a window
+                    // that becomes on-screen is adopted.
+                    adapter.unhide(pid: pid)
+                    scheduleRefresh(reason: "unhide", delay: 0.2)
+                    refreshUnresolved = true
+                    continue
+                }
                 let result = classify(input, rules: config.windowRules)
                 log.info(
                     "classify \(app.bundleIdentifier ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
                 )
-                if result == .unmanaged || result == .ignored { continue }
-                if input.appHidden {
-                    // Adopted main window of a hidden app: show the app.
-                    adapter.unhide(pid: pid)
+                if result == .unmanaged || result == .ignored {
+                    // A window CG has not listed yet may become visible a
+                    // moment later; retry instead of dropping it for good.
+                    if !input.isOnScreen { refreshUnresolved = true }
+                    continue
                 }
+                if input.isMinimized { adapter.deminiaturize(el) }
                 observers.watchWindow(el, pid: pid)
                 adapter.rememberWindowId(id, for: el)
                 elements[id] = el
@@ -392,7 +405,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         {
             let result = classify(input, rules: config.windowRules)
             if result != .unmanaged && result != .ignored {
-                if input.appHidden { adapter.unhide(pid: pid) }
+                if input.isMinimized { adapter.deminiaturize(focusedEl) }
                 observers.watchWindow(focusedEl, pid: pid)
                 adapter.rememberWindowId(id, for: focusedEl)
                 elements[id] = focusedEl
@@ -445,7 +458,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             DispatchQueue.main.async { self.observers.watch(pid: pid) }
             MutationQueue.shared.hop { [weak self] in
                 guard let self else { return }
-                self.recentlyLaunchedPids.insert(pid)
+                self.recentlyLaunchedPids[pid] = Date()
                 self.launchPollsRemaining = max(self.launchPollsRemaining, 8)
                 self.scheduleRefresh(reason: "appLaunched")
             }
@@ -455,7 +468,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     @objc func appTerminated(_ n: Notification) {
         if let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             MutationQueue.shared.hop {
-                self.recentlyLaunchedPids.remove(app.processIdentifier)
+                self.recentlyLaunchedPids[app.processIdentifier] = nil
                 self.observers.unwatch(pid: app.processIdentifier)
                 self.adapter.forgetAccessibility(pid: app.processIdentifier)
                 self.dropPid(app.processIdentifier)
@@ -873,7 +886,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             pids.insert(front)
         }
         // A just-launched hidden app has no on-screen window yet.
-        pids.formUnion(recentlyLaunchedPids.filter { !isOurProcess($0) })
+        let cutoff = Date().addingTimeInterval(-recentlyLaunchedWindow)
+        for (pid, launchedAt) in recentlyLaunchedPids where launchedAt > cutoff {
+            if !isOurProcess(pid) { pids.insert(pid) }
+        }
         return pids.sorted()
     }
 
@@ -933,6 +949,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             refreshUnresolved = true
             return
         }
+        if adapter.isAppHidden(pid: pid) {
+            // A background launch (open/AppleScript) leaves the app hidden.
+            // Unhide it and re-check next pass: only a window that actually
+            // becomes on-screen is adopted, so hidden tabs and twins stay
+            // out of the tree.
+            adapter.unhide(pid: pid)
+            scheduleRefresh(reason: "unhide", delay: 0.2)
+            refreshUnresolved = true
+            return
+        }
         if let sid = otherSpace(pid: pid, id: id, element: element) {
             claimed.insert(id)
             observers.watchWindow(element, pid: pid)
@@ -966,9 +992,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         log.info(
             "onCreate \(input.bundleId ?? "?") role=\(input.role ?? "?") sub=\(input.subrole ?? "?") -> \(result) id=\(id)"
         )
-        if input.appHidden, result == .tiled || result == .floating {
-            // Adopted main window of a hidden app: show the app.
-            adapter.unhide(pid: pid)
+        if input.isMinimized {
+            // Adopted minimized windows are tiled; make them visible or the
+            // tile is occupied by a window nobody can see.
+            adapter.deminiaturize(element)
         }
         if result == .unmanaged || result == .ignored {
             // Classified from a placeholder frame (or before appearing
@@ -1015,8 +1042,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             session.spaces[targetId] = space
             // An app can restore a floater at a corner park (macOS saved the
             // frame while it was hidden). Pull it into view instead of
-            // leaving a 1px sliver the user cannot reach.
-            if isStashedAway(frame) {
+            // leaving a 1px sliver the user cannot reach. A window on an
+            // inactive space is parked by the branch below instead.
+            if isStashedAway(frame), targetId == session.focusedSpace {
                 placeFloated([window], space: targetId)
             }
         } else {
@@ -1027,6 +1055,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             placeFloated(floated, space: targetId)
         }
         markBorn(id)
+        // Adopted; stop treating the pid as a pending launch.
+        recentlyLaunchedPids[pid] = nil
         if targetId != session.focusedSpace {
             // The user moved on before this window settled. It belongs to the
             // space that was focused when it appeared; stash its role and
@@ -1101,6 +1131,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             knownOriginals[to] = original
             knownOriginals[from] = nil
         }
+        if let minSize = observedMinSizes[from] {
+            observedMinSizes[to] = minSize
+            observedMinSizes[from] = nil
+        }
+        overflowStrikes[from] = nil
         for sid in session.spaces.keys {
             if session.spaces[sid]?.focusedWindow == from {
                 session.spaces[sid]?.focusedWindow = to
@@ -1161,6 +1196,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         forgetBorn(id)
         knownOriginals[id] = nil
         observedMinSizes[id] = nil
+        overflowStrikes[id] = nil
     }
 
     /// Drop a window that is really gone: close it on the focused space, remove
@@ -1573,7 +1609,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 }
                 continue
             }
-            if let live = adapter.frame(of: el), framesClose(live, rect, slop: 2) {
+            let liveBefore = adapter.frame(of: el)
+            if let live = liveBefore, framesClose(live, rect, slop: 2) {
                 // Already at the tile. Rewriting every frame on every pass
                 // makes apps repaint and flicker for no reason.
                 window.lastOnscreenFrame = rect
@@ -1581,9 +1618,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 var s = session.spaces[session.focusedSpace]!
                 s.setNode(node)
                 session.spaces[session.focusedSpace] = s
+                overflowStrikes[window.cgWindowId] = nil
                 continue
             }
-            let previous = window.lastOnscreenFrame
             window.lastOnscreenFrame = rect
             let result = adapter.setFrame(rect, of: el, tag: &window)
             node.leaf = window
@@ -1601,19 +1638,27 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             }
             if let live = adapter.frame(of: el) {
                 // An app that refuses to shrink below its real minimum keeps
-                // the larger frame and overlaps its neighbour. Only a write
-                // that actually asked to shrink counts: a read still matching
-                // the previous target is "not applied yet", and a user-dragged
-                // frame is handled by the title-bar path.
-                let askedToShrink = previous.w > rect.w + 4 || previous.h > rect.h + 4
+                // its old frame across the write. That must be seen twice
+                // before it becomes a minimum: one read can be a slow app
+                // that simply has not applied the new size yet. A partial
+                // application (neither old nor target) is not a refusal.
+                let askedToShrink = (liveBefore?.w ?? 0) > rect.w + 4
+                    || (liveBefore?.h ?? 0) > rect.h + 4
                 let stillOverflows = live.w > rect.w + 4 || live.h > rect.h + 4
-                if askedToShrink, stillOverflows, !framesClose(live, previous, slop: 4) {
-                    let prior = observedMinSizes[window.cgWindowId] ?? .unknown
-                    observedMinSizes[window.cgWindowId] = Size(
-                        w: max(prior.w, live.w),
-                        h: max(prior.h, live.h)
-                    )
-                    overflowed = true
+                let keptOldSize = liveBefore.map { framesClose(live, $0, slop: 4) } ?? false
+                if askedToShrink, stillOverflows, keptOldSize {
+                    let strikes = (overflowStrikes[window.cgWindowId] ?? 0) + 1
+                    overflowStrikes[window.cgWindowId] = strikes
+                    if strikes >= 2 {
+                        let prior = observedMinSizes[window.cgWindowId] ?? .unknown
+                        observedMinSizes[window.cgWindowId] = Size(
+                            w: live.w > rect.w + 4 ? max(prior.w, live.w) : prior.w,
+                            h: live.h > rect.h + 4 ? max(prior.h, live.h) : prior.h
+                        )
+                        overflowed = true
+                    }
+                } else {
+                    overflowStrikes[window.cgWindowId] = nil
                 }
                 // A busy app can land the size but drop the position, leaving
                 // the window overlapping its neighbours. Re-issue once when
@@ -1637,6 +1682,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             clampOverflowOn(session.focusedSpace)
             applyFrames()
             return
+        }
+        if !overflowStrikes.isEmpty, !clampingOverflow {
+            // A first refusal strike needs a quick second look to confirm.
+            scheduleRefresh(reason: "overflowCheck", delay: 0.2)
         }
         if let fs, let node = space.nodes[fs], let fsWindow = node.leaf {
             if var window = node.leaf, let el = resolvedElement(for: window) {
@@ -2495,6 +2544,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     func dropPid(_ pid: pid_t) {
         let fsBefore = session.current.luminaFullscreen
         let ids = elements.filter { adapter.pid(of: $0.value) == pid }.map(\.key)
+        for (_, window) in ownedWindows(pid: pid) {
+            observedMinSizes[window.cgWindowId] = nil
+            overflowStrikes[window.cgWindowId] = nil
+        }
         for id in ids {
             for spaceId in Array(session.spaces.keys) {
                 session = session.removeWindow(space: spaceId, cgWindowId: id)
@@ -2592,6 +2645,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func handleDisplayChange() {
+        // Minimum sizes are display-relative; re-observe against the new one.
+        observedMinSizes.removeAll()
+        overflowStrikes.removeAll()
         adapter.menuBarScreenMaxY = menuBarMaxY()
         let available = NSScreen.screens.compactMap { BoundDisplay.from(screen: $0, menuBarMaxY: adapter.menuBarScreenMaxY)?.uuid }
         guard let bound else { return }
@@ -2852,6 +2908,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                       let el = elements[w.cgWindowId], adapter.pid(of: el) == w.pid,
                       adapter.isAliveElement(el), let live = adapter.frame(of: el)
                 else { continue }
+                // Still settling: just adopted, a write in flight, or a first
+                // overflow strike awaiting confirmation.
+                if isYoung(w.cgWindowId) || adapter.generationInFlight(for: w.cgWindowId)
+                    || overflowStrikes[w.cgWindowId] != nil
+                {
+                    continue
+                }
                 if !framesClose(live, rect, slop: 8) {
                     issues.append(VerifyIssue(
                         "tile-frame-mismatch",
@@ -2865,7 +2928,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         for (sid, space) in session.spaces where sid != session.focusedSpace {
             for w in space.tiledLeaves().compactMap(\.leaf) + space.floating {
                 guard let el = elements[w.cgWindowId], adapter.pid(of: el) == w.pid,
-                      let live = adapter.frame(of: el)
+                      let live = adapter.frame(of: el),
+                      !adapter.generationInFlight(for: w.cgWindowId)
                 else { continue }
                 if !isStashedAway(live) {
                     issues.append(VerifyIssue(

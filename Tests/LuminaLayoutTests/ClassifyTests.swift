@@ -102,13 +102,10 @@ struct ClassifyTests {
         #expect(classify(input, rules: []) == .tiled)
     }
 
-    @Test func hiddenAppMainWindowIsManaged() {
-        let input = ClassifyInput(isOnScreen: false, appHidden: true, isMainWindow: true)
-        #expect(classify(input, rules: []) == .tiled)
-    }
-
-    @Test func hiddenAppNonMainWindowIgnored() {
-        let input = ClassifyInput(isOnScreen: false, appHidden: true, isMainWindow: false)
+    @Test func hiddenAppWindowsAreIgnoredUntilVisible() {
+        // The agent unhides the app and re-checks; classify never adopts an
+        // off-screen window, even for a hidden app.
+        let input = ClassifyInput(isOnScreen: false)
         #expect(classify(input, rules: []) == .ignored)
     }
 

@@ -110,10 +110,35 @@ record_step() {
   } >> "$ARTIFACTS/geometry.txt"
 }
 
+# Canonical per-window geometry, sorted, for convergence polling.
+geometry_signature() {
+  "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+rows = []
+for w in json.load(sys.stdin).get("windows", []):
+    rows.append("%s:%s:%d:%d:%d:%d" % (
+        w["cgWindowId"], w["space"], w["x"], w["y"], w["w"], w["h"]))
+print("|".join(sorted(rows)))
+' 2>/dev/null || true
+}
+
+# The layout may need a pass or two to settle after a change (observed
+# minimum sizes re-balance a split). Wait until it stops changing.
+wait_for_stable_geometry() {
+  local deadline=$((SECONDS + 8)) prev="" cur
+  while ((SECONDS < deadline)); do
+    cur="$(geometry_signature)"
+    if [[ -n "$cur" && "$cur" == "$prev" ]]; then return 0; fi
+    prev="$cur"
+    sleep 0.4
+  done
+  return 1
+}
+
 # Ids whose geometry changed between two list-windows snapshots while staying
 # on the same workspace.
 geometry_moves() {
-  python3 - "$1" "$2" <<'PY' 2>/dev/null || true
+  python3 - "$1" "$2" <<'PY'
 import json, sys
 before = {w["cgWindowId"]: w for w in json.load(open(sys.argv[1]))["windows"]}
 after = {w["cgWindowId"]: w for w in json.load(open(sys.argv[2]))["windows"]}
@@ -308,18 +333,37 @@ run balance >/dev/null
 verify "after resize/balance"
 
 say "workspace switch with hidden windows"
-"$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null
-run workspace 2 >/dev/null
-verify "on workspace 2"
-run workspace 1 >/dev/null
-verify "back on workspace 1"
-"$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null
-moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
-if [[ -n "$moved" ]]; then
-  fail "geometry changed across a workspace round trip: $moved"
-  geometry_table | sed 's/^/      /'
+# The first round trip may converge once (observed minimum sizes can
+# re-balance a split); the layout must be identical on the next one.
+if ! "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || [[ ! -s "$TMP_BEFORE" ]]; then
+  fail "geometry snapshot before the workspace switch failed"
 else
-  pass "geometry stable across a workspace round trip"
+  run workspace 2 >/dev/null
+  verify "on workspace 2"
+  run workspace 1 >/dev/null
+  verify "back on workspace 1"
+  if ! wait_for_stable_geometry; then
+    fail "geometry did not converge after a workspace round trip"
+  elif ! "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null || [[ ! -s "$TMP_AFTER" ]]; then
+    fail "geometry snapshot after the first workspace switch failed"
+  else
+    run workspace 2 >/dev/null
+    verify "second trip on workspace 2"
+    run workspace 1 >/dev/null
+    verify "second trip back on workspace 1"
+  fi
+  if ! wait_for_stable_geometry; then
+    fail "geometry did not converge after the second workspace round trip"
+  elif ! "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || [[ ! -s "$TMP_BEFORE" ]]; then
+    fail "geometry snapshot after the workspace switch failed"
+  elif ! moved="$(geometry_moves "$TMP_AFTER" "$TMP_BEFORE")"; then
+    fail "geometry comparison failed (malformed snapshot)"
+  elif [[ -n "$moved" ]]; then
+    fail "geometry changed across a second workspace round trip: $moved"
+    geometry_table | sed 's/^/      /'
+  else
+    pass "geometry stable across a second workspace round trip"
+  fi
 fi
 
 say "move window to workspace 2 and back"

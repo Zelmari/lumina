@@ -95,14 +95,21 @@ public func verifySession(_ session: Session, usable: Rect, gaps: Gaps, slop: Do
                 var minY = Double.greatestFiniteMagnitude
                 var maxX = -Double.greatestFiniteMagnitude
                 var maxY = -Double.greatestFiniteMagnitude
+                var sawRect = false
                 for node in tiled {
                     guard let rect = rects[node.id] else { continue }
+                    sawRect = true
                     minX = min(minX, rect.minX)
                     minY = min(minY, rect.minY)
                     maxX = max(maxX, rect.maxX)
                     maxY = max(maxY, rect.maxY)
                 }
-                if abs(minX - usable.minX) > slop || abs(minY - usable.minY) > slop
+                if !sawRect {
+                    issues.append(VerifyIssue(
+                        "layout-hole",
+                        "\(tiled.count) tiled leaves have no frame; the tree root does not reach them"
+                    ))
+                } else if abs(minX - usable.minX) > slop || abs(minY - usable.minY) > slop
                     || abs(maxX - usable.maxX) > slop || abs(maxY - usable.maxY) > slop
                 {
                     issues.append(VerifyIssue(
