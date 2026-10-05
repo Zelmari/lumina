@@ -132,6 +132,9 @@ public struct Config: Equatable, Sendable {
     /// instead of the stash corner. Falls back to the corner whenever the
     /// prediction could be wrong (dialogs, rules, native tabs, fullscreen).
     public var speculativeTile: Bool
+    /// Bundle ids hidden from launch until their first window is tiled.
+    /// Opt-in: apps not listed behave exactly as before.
+    public var hideUntilTiledApps: [String]
     public var unknownTopLevelKeys: [String]
     public var diagnostics: [String]
 
@@ -146,6 +149,7 @@ public struct Config: Equatable, Sendable {
         nativeTabs: [String] = [],
         preParkNewWindows: Bool = true,
         speculativeTile: Bool = false,
+        hideUntilTiledApps: [String] = [],
         unknownTopLevelKeys: [String] = [],
         diagnostics: [String] = []
     ) {
@@ -159,6 +163,7 @@ public struct Config: Equatable, Sendable {
         self.nativeTabs = nativeTabs
         self.preParkNewWindows = preParkNewWindows
         self.speculativeTile = speculativeTile
+        self.hideUntilTiledApps = hideUntilTiledApps
         self.unknownTopLevelKeys = unknownTopLevelKeys
         self.diagnostics = diagnostics
     }
@@ -239,6 +244,7 @@ private struct RawConfig: Decodable {
     var nativeTabs: RawNativeTabs?
     var preParkNewWindows: Bool?
     var speculativeTile: Bool?
+    var hideUntilTiledApps: [String]?
 
     enum CodingKeys: String, CodingKey {
         case spaceCount = "space-count"
@@ -251,6 +257,7 @@ private struct RawConfig: Decodable {
         case nativeTabs = "native-tabs"
         case preParkNewWindows = "pre-park-new-windows"
         case speculativeTile = "speculative-tile"
+        case hideUntilTiledApps = "hide-until-tiled-apps"
     }
 }
 
@@ -286,6 +293,7 @@ public let knownTopLevelKeys: Set<String> = [
     "native-tabs",
     "pre-park-new-windows",
     "speculative-tile",
+    "hide-until-tiled-apps",
 ]
 
 public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config, ConfigError> {
@@ -408,6 +416,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
     let nativeTabs = raw.nativeTabs?.apps ?? base.nativeTabs
     let prePark = raw.preParkNewWindows ?? base.preParkNewWindows
     let speculative = raw.speculativeTile ?? base.speculativeTile
+    let hideUntilTiled = raw.hideUntilTiledApps ?? base.hideUntilTiledApps
 
     return .success(
         Config(
@@ -421,6 +430,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
             nativeTabs: nativeTabs,
             preParkNewWindows: prePark,
             speculativeTile: speculative,
+            hideUntilTiledApps: hideUntilTiled,
             unknownTopLevelKeys: unknown,
             diagnostics: diagnostics
         )
@@ -596,6 +606,8 @@ extension Config {
     # Write a new standard window straight to its predicted tile instead of the
     # corner. Off by default; falls back to the corner on any doubt.
     speculative-tile = false
+    # Bundle ids hidden from launch until their first window is tiled.
+    hide-until-tiled-apps = []
     # z-order, float-existing, or new-only
     launch-tiling = "z-order"
     launch-apps = []                       # e.g. ["com.apple.Terminal"]
