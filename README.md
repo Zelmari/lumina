@@ -38,6 +38,7 @@ A partial file **merges onto the shipped defaults**: omit a key and its default 
 | `focus-follows-mouse` | bool | `false` | Focus the tile under the pointer. |
 | `launch-tiling` | `z-order`, `float-existing`, `new-only` | `z-order` | What happens to windows already open when Lumina starts. |
 | `launch-apps` | array of bundle ids | `[]` | Apps opened when the agent starts, e.g. `["com.apple.Terminal"]`. |
+| `pre-park-new-windows` | bool | `true` | Park a new window in the stash corner the moment it is created, so its default frame is not visible until the tile lands. |
 | `[gaps] inner` | 0–128 | `8` | Gap between tiles. |
 | `[gaps] outer` | 0–128 | `8` | Gap between tiles and the screen edges. |
 | `[native-tabs] apps` | array of bundle ids | Terminal, Ghostty | Apps whose tabs are separate windows (macOS native tabbing). |
@@ -119,6 +120,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 ## Menu extra
 
 - The workspace strip shows digits 1…N, where N is `max(5, highest used workspace)` capped at `space-count`. Click a digit to switch.
+- The strip updates immediately: a click highlights the digit on the spot, and the agent pushes every workspace/pause/current change over a subscription (with a 250ms–3s adaptive poll as a safety net).
 - The menu has Open Config, Grant Accessibility…, Reload, Pause/Resume, Start on this Space, Launch at Login, Quit this Space, and Quit all.
 - Warnings (Secure Input blocking hotkeys, Accessibility denied, invalid config, hotkey conflict) appear in the strip and its tooltip.
 
@@ -145,6 +147,7 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 | `BENCH_COUNT` / `BENCH_WARMUP` | Pings and warmup for `lumina bench` (default 50 / 5) |
 | `BENCH_MAX_P95_MS` | Fail when IPC round-trip p95 exceeds this (default 25) |
 | `BENCH_STRICT=1` / `BENCH_FRAME_MAX_MS` | Also gate on refresh-to-frame p95 (default 50) |
+| `BENCH_LAUNCH_MAX_MS` / `BENCH_MENU_MAX_MS` | With `BENCH_STRICT=1`, gate launch-to-frame (default 500) and menu-push latency (default 250) |
 | `LUMINA_LOG` | Agent log path (default `~/Library/Logs/Lumina.log`) |
 
 ## Known behavior
@@ -158,7 +161,7 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 
 ## Status
 
-Layout and IPC are unit-tested with SwiftPM (219 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
+Layout and IPC are unit-tested with SwiftPM (225 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
 
 On macOS, `swift test` needs the Xcode toolchain (`export DEVELOPER_DIR=/Applications/Xcode.app`); Command Line Tools lack the `Testing` module.
 
