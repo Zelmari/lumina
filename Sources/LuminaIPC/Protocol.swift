@@ -87,7 +87,9 @@ public enum AgentCmd: Equatable, Sendable {
     case listWindows
     case listWorkspaces
     case verify
-    case status
+    /// `full` adds diagnostics that cost a WindowServer enumeration; the menu
+    /// extra polls with false.
+    case status(full: Bool)
     /// Transport-only liveness probe. The socket server answers it without
     /// hopping onto the mutation queue, so it measures raw IPC round trips.
     case ping

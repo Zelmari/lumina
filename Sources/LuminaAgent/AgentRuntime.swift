@@ -1733,8 +1733,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             return .success(id: id, data: listWorkspacesJSON())
         case .verify:
             return .success(id: id, data: verifyWindowsJSON())
-        case .status:
-            return .success(id: id, data: statusJSON())
+        case .status(let full):
+            return .success(id: id, data: statusJSON(full: full))
         case .ping:
             // The socket server normally answers pings without reaching the
             // mutation queue; this keeps direct callers working.
@@ -3241,7 +3241,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
     }
 
-    func statusJSON() -> JSONValue {
+    func statusJSON(full: Bool = true) -> JSONValue {
         let usedIndices = session.spaces.values
             .filter { !$0.tiledLeaves().isEmpty || !$0.floating.isEmpty }
             .map { $0.id.raw }
@@ -3250,26 +3250,31 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             focused: session.focusedSpace.raw,
             used: usedIndices
         )
-        return .object([
+        var payload: [String: JSONValue] = [
             "secureInput": .bool(secureInput),
             "axTrusted": .bool(axTrusted),
             "configError": configError.map { .string($0) } ?? .null,
-            "configDiagnostics": .array(config.diagnostics.map { .string($0) }),
             "paused": .bool(userPaused),
             "displayGone": .bool(displayGone),
             "instanceId": .string(instanceId.uuidString),
             "space": .int(session.focusedSpace.raw),
-            "focusedWindow": session.current.focusedWindow.map { .int(Int($0)) } ?? .null,
             "spaceCount": .int(session.spaceCount),
             "visibleSpaceCount": .int(visible),
             "isCurrent": .bool(isCurrent),
-            "hasOnScreenIncludingSlivers": .bool(hasOnScreenIncludingSlivers()),
             "lastRefreshMs": lastRefreshSummary.map { .int($0.durationMs) } ?? .null,
             "refreshLatencyMs": refreshLatency.last.map { .double($0) } ?? .null,
             "refreshLatencyP95Ms": refreshLatency.p95.map { .double($0) } ?? .null,
             "hotkeyError": hotkeys.hotkeyError.map { .string($0) } ?? .null,
             "skylightSpaceId": boundSkyLightId.map { .int(Int($0)) } ?? .null,
-        ])
+        ]
+        if full {
+            // These cost a WindowServer enumeration and extra reads; the menu
+            // extra polls at 1.25 Hz and never consumes them.
+            payload["configDiagnostics"] = .array(config.diagnostics.map { .string($0) })
+            payload["focusedWindow"] = session.current.focusedWindow.map { .int(Int($0)) } ?? .null
+            payload["hasOnScreenIncludingSlivers"] = .bool(hasOnScreenIncludingSlivers())
+        }
+        return .object(payload)
     }
 
     struct RefreshSummary: Equatable, Sendable {
