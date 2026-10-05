@@ -166,15 +166,23 @@ struct ReconcileTests {
         #expect(result.deferred.isEmpty)
     }
 
-    @Test func tiledRemovalDeferredUnboundedWhileCGLive() {
+    @Test func tiledRemovalRemovedAfterExtendedGraceWhenCGLingers() {
+        // A closed Electron window can linger in CG while AX no longer lists
+        // it. Tiled entries get twice the floating grace, then are removed;
+        // an unbounded deferral pinned the dead tile's split forever.
         var gate = RemovalGate()
-        for _ in 0..<10 {
+        for attempt in 1...4 {
             let result = gate.classify(
                 removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: []
             )
-            #expect(result.real.isEmpty)
+            #expect(result.real.isEmpty, "attempt \(attempt) should still defer")
             #expect(result.deferred == [7])
         }
+        let result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: []
+        )
+        #expect(result.real == [7])
+        #expect(result.deferred.isEmpty)
     }
 
     @Test func liveElementVetoesRemovalEvenWhenCGMissesIt() {
@@ -191,6 +199,23 @@ struct ReconcileTests {
         )
         #expect(result.real.isEmpty)
         #expect(result.deferred == [7])
+    }
+
+    @Test func liveElementVetoIsCapped() {
+        // A closed window can keep answering a role read while the app stops
+        // listing it. Six consecutive veto deferrals, then removal.
+        var gate = RemovalGate()
+        for attempt in 1...6 {
+            let result = gate.classify(
+                removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [], elementLive: [7]
+            )
+            #expect(result.deferred == [7], "attempt \(attempt) should defer")
+            #expect(result.real.isEmpty)
+        }
+        let result = gate.classify(
+            removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [], elementLive: [7]
+        )
+        #expect(result.real == [7])
     }
 
     @Test func deadElementStillRemovedWhenCGMissesIt() {

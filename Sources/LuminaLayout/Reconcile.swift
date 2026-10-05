@@ -119,11 +119,6 @@ public func reconcile(
 
 /// Decides which model windows a refresh is allowed to destroy.
 ///
-/// CG's window list is the aliveness truth for tiled and stashed windows: a
-/// "successful" AX read that omits one is not evidence of death (Ghostty
-/// intermittently drops live windows from `AXWindows`), so those are deferred
-/// for as long as WindowServer still lists them. There is no miss cap.
-///
 /// A window missing from a *failed* AX read tells us nothing at all: busy apps
 /// time out `AXWindows`, so the window is deferred without counting a miss.
 /// `removed` ids CG has also dropped are destroyed immediately, unless the
@@ -131,15 +126,22 @@ public func reconcile(
 /// transiently omit a live parked window, and deleting one leaves it buried
 /// off-screen with no way back.
 ///
-/// Floating entries are the only capped class. Hidden retention windows
-/// (Spotlight keeps a CG window alive while its UI is dismissed) must not pin
-/// model entries forever, so they are removed after a few consecutive misses.
+/// When the AX read *succeeded* and omitted the window, CG may still list a
+/// lingering record (Electron windows that closed, hidden retention windows).
+/// Every class counts misses then: floating entries after `grace`, tiled and
+/// stashed entries after twice that, so a dead tile cannot pin a split
+/// forever while a transient omission still has room to recover.
 public struct RemovalGate: Equatable, Sendable {
     private var misses: [UInt32: Int]
+    /// Consecutive passes a live-element veto has deferred an id. The veto
+    /// protects a live parked window from a transient CG omission, but a
+    /// closed window whose element still answers must not be pinned forever.
+    private var vetoMisses: [UInt32: Int]
     private let grace: Int
 
     public init(grace: Int = 2) {
         self.misses = [:]
+        self.vetoMisses = [:]
         self.grace = grace
     }
 
@@ -154,9 +156,16 @@ public struct RemovalGate: Equatable, Sendable {
         var real: [UInt32] = []
         var deferred: [UInt32] = []
         var next: [UInt32: Int] = [:]
+        var nextVeto: [UInt32: Int] = [:]
         for id in removed {
             if elementLive.contains(id) {
-                deferred.append(id)
+                let miss = (vetoMisses[id] ?? 0) + 1
+                if miss > grace * 3 {
+                    real.append(id)
+                } else {
+                    deferred.append(id)
+                    nextVeto[id] = miss
+                }
                 continue
             }
             guard cgLive.contains(id) else {
@@ -167,12 +176,14 @@ public struct RemovalGate: Equatable, Sendable {
                 deferred.append(id)
                 continue
             }
-            guard floatingIds.contains(id) else {
-                deferred.append(id)
-                continue
-            }
+            // The AX read succeeded and omitted the window, but CG still
+            // lists it. That is a lingering record (a closed Electron
+            // window) as often as it is a transient omission, so every class
+            // counts misses. Tiled entries get a longer grace because losing
+            // a live parked window is worse than a stale tile for a moment.
             let miss = (misses[id] ?? 0) + 1
-            if miss > grace {
+            let limit = floatingIds.contains(id) ? grace : grace * 2
+            if miss > limit {
                 real.append(id)
             } else {
                 deferred.append(id)
@@ -180,6 +191,7 @@ public struct RemovalGate: Equatable, Sendable {
             }
         }
         misses = next
+        vetoMisses = nextVeto
         return (real, deferred)
     }
 }
