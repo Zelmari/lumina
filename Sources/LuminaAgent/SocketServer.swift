@@ -14,6 +14,10 @@ public final class AgentSocketServer {
         attributes: .concurrent
     )
     private var source: DispatchSourceRead?
+    /// Subscribed menu-extra connections. Owned by the server; writes are
+    /// serialized by the mutation queue that calls `broadcast`.
+    private let subscriberLock = NSLock()
+    private var subscribers: [Int32] = []
     public var onCommand: ((AgentCmd, String) -> IPCResponse)?
     private let log: LuminaLog
     public let path: String
@@ -76,7 +80,41 @@ public final class AgentSocketServer {
         source?.cancel()
         source = nil
         if listenFD >= 0 { close(listenFD); listenFD = -1 }
+        subscriberLock.lock()
+        let fds = subscribers
+        subscribers.removeAll()
+        subscriberLock.unlock()
+        for fd in fds { close(fd) }
         unlink(path)
+    }
+
+    /// True when at least one menu extra is subscribed to status pushes.
+    public var hasSubscribers: Bool {
+        subscriberLock.lock()
+        defer { subscriberLock.unlock() }
+        return !subscribers.isEmpty
+    }
+
+    /// Push one notification to every subscriber. Called on the mutation queue;
+    /// a dead or stalled subscriber is dropped, never blocking the caller
+    /// beyond its send timeout.
+    public func broadcast(event: String, data: JSONValue) {
+        guard let line = try? encode(IPCNotification(event: event, data: data)),
+              let payload = line.data(using: .utf8)
+        else { return }
+        subscriberLock.lock()
+        let fds = subscribers
+        subscriberLock.unlock()
+        guard !fds.isEmpty else { return }
+        var dead: [Int32] = []
+        for fd in fds where !writeAll(fd, payload) {
+            dead.append(fd)
+        }
+        guard !dead.isEmpty else { return }
+        subscriberLock.lock()
+        subscribers.removeAll { dead.contains($0) }
+        subscriberLock.unlock()
+        for fd in dead { close(fd) }
     }
 
     private func acceptOne() {
@@ -142,6 +180,21 @@ public final class AgentSocketServer {
                             "pong": .bool(true),
                             "uptimeMs": .double(Date().timeIntervalSince(startedAt) * 1000),
                         ]))
+                    } else if case .subscribe = cmd {
+                        // Hand the session off: send the initial snapshot and
+                        // keep the fd open for pushes. Returning here skips
+                        // the close at the end of serve.
+                        let initial = onCommand?(.status(full: false), id)
+                        let line = try? encode(IPCNotification(event: "status", data: initial?.data))
+                        let payload = line?.data(using: .utf8)
+                        guard let payload, writeAll(fd, payload) else {
+                            close(fd)
+                            return
+                        }
+                        subscriberLock.lock()
+                        subscribers.append(fd)
+                        subscriberLock.unlock()
+                        return
                     } else if let onCommand {
                         var captured: IPCResponse?
                         let sem = DispatchSemaphore(value: 0)

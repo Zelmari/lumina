@@ -21,7 +21,7 @@ struct CodecTests {
     }
 
     @Test func unknownCmd() {
-        let line = #"{"v":1,"id":"1","cmd":"explode","args":{}}"#
+        let line = #"{"v":2,"id":"1","cmd":"explode","args":{}}"#
         let parsed = parseLine(line)
         guard case .error(let resp) = parsed else {
             Issue.record("expected error")
@@ -32,7 +32,7 @@ struct CodecTests {
     }
 
     @Test func missingArgs() {
-        let line = #"{"v":1,"id":"1","cmd":"focus","args":{}}"#
+        let line = #"{"v":2,"id":"1","cmd":"focus","args":{}}"#
         let parsed = parseLine(line)
         guard case .error(let resp) = parsed else {
             Issue.record("expected error")
@@ -42,21 +42,21 @@ struct CodecTests {
     }
 
     @Test func invalidArgValuesAreNotReportedAsMissing() {
-        let focus = parseLine(#"{"v":1,"id":"1","cmd":"focus","args":{"dir":"sideways"}}"#)
+        let focus = parseLine(#"{"v":2,"id":"1","cmd":"focus","args":{"dir":"sideways"}}"#)
         guard case .error(let focusErr) = focus else {
             Issue.record("expected error, got \(focus)")
             return
         }
         #expect(focusErr.error == "invalid args: dir=sideways")
 
-        let workspace = parseLine(#"{"v":1,"id":"2","cmd":"workspace","args":{"id":"zero"}}"#)
+        let workspace = parseLine(#"{"v":2,"id":"2","cmd":"workspace","args":{"id":"zero"}}"#)
         guard case .error(let workspaceErr) = workspace else {
             Issue.record("expected error, got \(workspace)")
             return
         }
         #expect(workspaceErr.error == "invalid args: id=zero")
 
-        let fullscreen = parseLine(#"{"v":1,"id":"3","cmd":"fullscreen","args":{"mode":true}}"#)
+        let fullscreen = parseLine(#"{"v":2,"id":"3","cmd":"fullscreen","args":{"mode":true}}"#)
         guard case .error(let fullscreenErr) = fullscreen else {
             Issue.record("expected error, got \(fullscreen)")
             return
@@ -65,7 +65,7 @@ struct CodecTests {
     }
 
     @Test func versionRejected() {
-        let line = #"{"v":2,"id":"1","cmd":"workspace","args":{"id":3}}"#
+        let line = #"{"v":99,"id":"1","cmd":"workspace","args":{"id":3}}"#
         let parsed = parseLine(line)
         guard case .error(let resp) = parsed else {
             Issue.record("expected error")
@@ -80,7 +80,7 @@ struct CodecTests {
     }
 
     @Test func extraArgsIgnored() {
-        let line = #"{"v":1,"id":"x","cmd":"focus","args":{"dir":"left","unused":true}}"#
+        let line = #"{"v":2,"id":"x","cmd":"focus","args":{"dir":"left","unused":true}}"#
         let parsed = parseLine(line)
         guard case .request(.focus(let dir), _) = parsed else {
             Issue.record("expected focus, got \(parsed)")
@@ -90,7 +90,7 @@ struct CodecTests {
     }
 
     @Test func extraCurrentToken() {
-        let line = #"{"v":1,"id":"z","cmd":"current-token","args":{}}"#
+        let line = #"{"v":2,"id":"z","cmd":"current-token","args":{}}"#
         let parsed = parseLine(line, as: .extra)
         guard case .extra(.currentToken, let id) = parsed else {
             Issue.record("expected extra, got \(parsed)")
@@ -100,7 +100,7 @@ struct CodecTests {
     }
 
     @Test func debugWindowsParses() {
-        let line = #"{"v":1,"id":"d","cmd":"debug-windows","args":{}}"#
+        let line = #"{"v":2,"id":"d","cmd":"debug-windows","args":{}}"#
         let parsed = parseLine(line)
         guard case .request(.debugWindows, let id) = parsed else {
             Issue.record("expected debug-windows, got \(parsed)")
@@ -110,7 +110,7 @@ struct CodecTests {
     }
 
     @Test func pingParses() {
-        let line = #"{"v":1,"id":"p","cmd":"ping","args":{}}"#
+        let line = #"{"v":2,"id":"p","cmd":"ping","args":{}}"#
         let parsed = parseLine(line)
         guard case .request(.ping, let id) = parsed else {
             Issue.record("expected ping, got \(parsed)")
@@ -119,8 +119,36 @@ struct CodecTests {
         #expect(id == "p")
     }
 
+    @Test func subscribeParses() {
+        let line = #"{"v":2,"id":"s","cmd":"subscribe","args":{}}"#
+        let parsed = parseLine(line)
+        guard case .request(.subscribe, let id) = parsed else {
+            Issue.record("expected subscribe, got \(parsed)")
+            return
+        }
+        #expect(id == "s")
+    }
+
+    @Test func notificationRoundTrips() throws {
+        let notification = IPCNotification(event: "status", data: .object(["space": .int(3)]))
+        let line = try encode(notification)
+        #expect(line.hasSuffix("\n"))
+        let decoded = try decodeNotification(Data(line.utf8))
+        #expect(decoded == notification)
+    }
+
+    @Test func responseLineIsNotANotification() throws {
+        let line = try encode(IPCResponse.success(id: "x", data: .object(["a": .int(1)])))
+        #expect(try decodeNotification(Data(line.utf8)) == nil)
+    }
+
+    @Test func notificationVersionMismatchDropped() throws {
+        let line = try encode(IPCNotification(v: 99, event: "status"))
+        #expect(try decodeNotification(Data(line.utf8)) == nil)
+    }
+
     @Test func requestWithoutArgsDecodes() throws {
-        let line = #"{"v":1,"id":"x","cmd":"status"}"#
+        let line = #"{"v":2,"id":"x","cmd":"status"}"#
         let parsed = parseLine(line)
         guard case .request(.status(let full), let id) = parsed else {
             Issue.record("expected status, got \(parsed)")
@@ -135,7 +163,7 @@ struct CodecTests {
     }
 
     @Test func statusFullFalseParses() {
-        let line = #"{"v":1,"id":"x","cmd":"status","args":{"full":false}}"#
+        let line = #"{"v":2,"id":"x","cmd":"status","args":{"full":false}}"#
         guard case .request(.status(let full), _) = parseLine(line) else {
             Issue.record("expected status, got \(parseLine(line))")
             return
@@ -163,7 +191,7 @@ struct CodecTests {
         #expect(JSONValue.double(.infinity).int == nil)
         #expect(JSONValue.double(.nan).int == nil)
         #expect(JSONValue.double(42.0).int == 42)
-        let line = #"{"v":1,"id":"1","cmd":"workspace","args":{"id":1e30}}"#
+        let line = #"{"v":2,"id":"1","cmd":"workspace","args":{"id":1e30}}"#
         guard case .error(let response) = parseLine(line) else {
             Issue.record("expected an error response")
             return
@@ -308,17 +336,17 @@ struct ArgvTests {
         #expect(CLIArgs.earlyExit(["lumina", "debug-windows"]) == nil)
         #expect(CLIArgs.parse(["lumina", "debug-windows"])?.cmd == "debug-windows")
         #expect(CLIArgs.parse(["lumina", "ping"])?.cmd == "ping")
-        let zero = #"{"v":1,"id":"z","cmd":"workspace","args":{"id":0}}"#
+        let zero = #"{"v":2,"id":"z","cmd":"workspace","args":{"id":0}}"#
         guard case .request(.workspace(let zeroId), _) = parseLine(zero) else {
             Issue.record("expected workspace 0, got \(parseLine(zero))")
             return
         }
         #expect(zeroId == 10)
-        guard case .request(.yield, _) = parseLine(#"{"v":1,"id":"y","cmd":"yield","args":{}}"#) else {
+        guard case .request(.yield, _) = parseLine(#"{"v":2,"id":"y","cmd":"yield","args":{}}"#) else {
             Issue.record("expected yield")
             return
         }
-        let mark = #"{"v":1,"id":"m","cmd":"mark-current","args":{}}"#
+        let mark = #"{"v":2,"id":"m","cmd":"mark-current","args":{}}"#
         let parsed = parseLine(mark)
         guard case .request(.markCurrent, let id) = parsed else {
             Issue.record("expected mark-current, got \(parsed)")

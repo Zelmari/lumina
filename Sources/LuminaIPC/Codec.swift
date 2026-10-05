@@ -75,6 +75,30 @@ public func decodeResponse(_ data: Data) throws -> IPCResponse {
     return response
 }
 
+/// Encode a server-initiated notification line. Same framing as a response:
+/// one JSON object plus a newline.
+public func encode(_ notification: IPCNotification) throws -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let data = try encoder.encode(notification)
+    guard var line = String(data: data, encoding: .utf8) else {
+        throw IPCCodecError.encodeFailed
+    }
+    if !line.hasSuffix("\n") { line.append("\n") }
+    return line
+}
+
+/// Decode a pushed notification. Returns nil for a response line or a
+/// version mismatch, so a reader can fall back to `decodeResponse`.
+public func decodeNotification(_ data: Data) throws -> IPCNotification? {
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["event"] is String
+    else { return nil }
+    let notification = try JSONDecoder().decode(IPCNotification.self, from: data)
+    guard notification.v == ipcProtocolVersion else { return nil }
+    return notification
+}
+
 public enum IPCCodecError: Error {
     case encodeFailed
     case unsupportedVersion(Int)
@@ -164,6 +188,7 @@ private func parseAgentCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<A
     case "verify": return .ok(.verify)
     case "status": return .ok(.status(full: args["full"]?.bool ?? true))
     case "ping": return .ok(.ping)
+    case "subscribe": return .ok(.subscribe)
     case "mark-current": return .ok(.markCurrent)
     case "yield": return .ok(.yield)
     case "accessibility-prompt": return .ok(.accessibilityPrompt)

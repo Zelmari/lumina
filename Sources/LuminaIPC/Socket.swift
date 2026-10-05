@@ -64,6 +64,34 @@ public enum LuminaSocket {
         return buffer.isEmpty ? nil : buffer
     }
 
+    /// Block until one newline-terminated message arrives, the peer closes, or
+    /// `stop` becomes true. For long-lived subscription readers: a timeout is
+    /// not an error and a partial line is never returned as complete.
+    public static func readLineBlocking(
+        _ fd: Int32,
+        stop: () -> Bool,
+        idleTick: TimeInterval = 0.25
+    ) -> Data? {
+        var buffer = Data()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            if let index = buffer.firstIndex(of: 0x0A) {
+                return buffer.subdata(in: buffer.startIndex..<index)
+            }
+            if buffer.count > ipcMaxLineBytes { return nil }
+            if stop() { return nil }
+            setReceiveTimeout(fd, seconds: idleTick)
+            let n = read(fd, &chunk, chunk.count)
+            if n < 0 {
+                if errno == EINTR { continue }
+                if errno == EAGAIN || errno == EWOULDBLOCK { continue }
+                return nil
+            }
+            if n == 0 { return nil }
+            buffer.append(contentsOf: chunk.prefix(n))
+        }
+    }
+
     /// Connect to a UNIX socket and return the fd. The caller owns it.
     public static func connect(path: String) -> Int32? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)

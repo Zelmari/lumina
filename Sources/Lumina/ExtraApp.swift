@@ -58,8 +58,13 @@ final class ExtraController: NSObject, @unchecked Sendable {
     private var cachedLoginEnabled: Bool?
     private var cachedLoginEnabledAt = Date.distantPast
     /// True when at least one agent is pushing status over a subscription;
-    /// the timer then only reconciles.
+    /// the timer then only reconciles. Accessed on the status queue.
     var hasHealthySubscriptions = false
+    /// Long-lived push connections, one per live registry record.
+    var subscriptions: [UUID: AgentSubscription] = [:]
+    /// Latest status per instance from either a push or a poll.
+    var pushedStatus: [UUID: AgentStatus] = [:]
+    var healthySubscriptionIds: Set<UUID> = []
 
     override init() {
         uid = getuid()
@@ -107,8 +112,11 @@ final class ExtraController: NSObject, @unchecked Sendable {
         bootRegistry()
         maybeFirstRun()
         // The interval is adaptive: short while an agent is current, long when
-        // there is nothing to show.
-        scheduleStatusTimer(interval: 0.25, leeway: 0.1)
+        // there is nothing to show. Armed on the status queue, which owns it.
+        statusQueue.async { [weak self] in
+            self?.scheduleStatusTimer(interval: 0.25, leeway: 0.1)
+            self?.reconcileSubscriptions()
+        }
     }
 
     /// (Re)arm the status poll. Status queue only; a no-op when the interval is
@@ -288,24 +296,11 @@ final class ExtraController: NSObject, @unchecked Sendable {
         ),
             let obj = resp.data?.object
         else { return nil }
-        return AgentStatus(
-            secureInput: obj["secureInput"]?.bool ?? false,
-            axTrusted: obj["axTrusted"]?.bool ?? false,
-            configError: obj["configError"]?.string,
-            paused: obj["paused"]?.bool ?? false,
-            instanceId: obj["instanceId"]?.string,
-            space: obj["space"]?.int,
-            displayGone: obj["displayGone"]?.bool ?? false,
-            hotkeyError: obj["hotkeyError"]?.string,
-            spaceCount: obj["spaceCount"]?.int,
-            visibleSpaceCount: obj["visibleSpaceCount"]?.int,
-            isCurrent: obj["isCurrent"]?.bool ?? false,
-            hasOnScreenIncludingSlivers: obj["hasOnScreenIncludingSlivers"]?.bool ?? false,
-            skylightSpaceId: obj["skylightSpaceId"]?.int.map { UInt64($0) }
-        )
+        return AgentStatus(json: obj)
     }
 
     func agentDied(_ record: InstanceRecord) {
+        statusQueue.async { [weak self] in self?.dropSubscription(record.instanceId) }
         let followedQuit = spawner.quitPids.contains(record.pid)
         switch pidDeathAction(followedQuit: followedQuit) {
         case .removeNoRestart:
@@ -466,14 +461,80 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func pollStatusBody() {
+        reconcileSubscriptions()
         let reg = registry.load()
         let live = reg.agents.filter { kill($0.pid, 0) == 0 }
-        var claimants: [(InstanceRecord, AgentStatus)] = []
+        var statuses: [(InstanceRecord, AgentStatus)] = []
         for rec in live {
-            if let status = fetchAgentStatus(socket: rec.socket), status.isCurrent {
-                claimants.append((rec, status))
+            if let status = fetchAgentStatus(socket: rec.socket) {
+                pushedStatus[rec.instanceId] = status
+                statuses.append((rec, status))
             }
         }
+        applyStatuses(statuses, yieldLosers: true)
+    }
+
+    /// Subscribe to every live agent and drop subscriptions for dead ones.
+    /// Status queue only.
+    func reconcileSubscriptions() {
+        let reg = registry.load()
+        let live = reg.agents.filter { kill($0.pid, 0) == 0 }
+        let liveIds = Set(live.map(\.instanceId))
+        for (id, sub) in subscriptions where !liveIds.contains(id) {
+            sub.stop()
+            subscriptions[id] = nil
+            pushedStatus[id] = nil
+            healthySubscriptionIds.remove(id)
+        }
+        hasHealthySubscriptions = !healthySubscriptionIds.isEmpty
+        for rec in live where subscriptions[rec.instanceId] == nil {
+            let sub = AgentSubscription(instanceId: rec.instanceId, socketPath: rec.socket, log: log)
+            sub.onStatus = { [weak self] status in
+                self?.statusQueue.async { self?.receivePushedStatus(rec.instanceId, status) }
+            }
+            sub.onHealth = { [weak self] healthy in
+                self?.statusQueue.async { self?.subscriptionHealthChanged(rec.instanceId, healthy: healthy) }
+            }
+            subscriptions[rec.instanceId] = sub
+            sub.start()
+        }
+    }
+
+    func dropSubscription(_ id: UUID) {
+        subscriptions[id]?.stop()
+        subscriptions[id] = nil
+        pushedStatus[id] = nil
+        healthySubscriptionIds.remove(id)
+        hasHealthySubscriptions = !healthySubscriptionIds.isEmpty
+    }
+
+    func receivePushedStatus(_ id: UUID, _ status: AgentStatus) {
+        pushedStatus[id] = status
+        let reg = registry.load()
+        let live = reg.agents.filter { kill($0.pid, 0) == 0 }
+        let statuses: [(InstanceRecord, AgentStatus)] = live.compactMap { rec in
+            pushedStatus[rec.instanceId].map { (rec, $0) }
+        }
+        // Pushes are already authoritative; winners are not re-yielded.
+        applyStatuses(statuses, yieldLosers: false)
+    }
+
+    func subscriptionHealthChanged(_ id: UUID, healthy: Bool) {
+        if healthy {
+            healthySubscriptionIds.insert(id)
+        } else {
+            healthySubscriptionIds.remove(id)
+        }
+        hasHealthySubscriptions = !healthySubscriptionIds.isEmpty
+        // Re-arm the poll at the push-backed (or unpushed) cadence.
+        pollStatus()
+    }
+
+    /// Shared by polled statuses and pushed snapshots: pick the current agent,
+    /// persist it, and update the strip.
+    func applyStatuses(_ statuses: [(InstanceRecord, AgentStatus)], yieldLosers: Bool) {
+        let reg = registry.load()
+        let claimants = statuses.filter { $0.1.isCurrent }
         let winnerId = pickCurrentAgent(claimants: claimants.map(\.0.instanceId), lastCurrent: reg.lastCurrentInstanceId)
         if let winnerId, let pair = claimants.first(where: { $0.0.instanceId == winnerId }) {
             let rec = pair.0
@@ -506,13 +567,15 @@ final class ExtraController: NSObject, @unchecked Sendable {
             }
             // Yield losers off the poll path: an unresponsive agent used to
             // hold up the strip and the next poll for up to its socket timeout.
-            let losers = claimants.filter { $0.0.instanceId != rec.instanceId }
-            if !losers.isEmpty {
-                DispatchQueue.global(qos: .utility).async { [weak self] in
-                    for pair in losers {
-                        // Only one agent may hold current; losers must drop
-                        // hotkeys/frames.
-                        self?.sendTo(instance: pair.0.instanceId, socket: pair.0.socket, .yield)
+            if yieldLosers {
+                let losers = claimants.filter { $0.0.instanceId != rec.instanceId }
+                if !losers.isEmpty {
+                    DispatchQueue.global(qos: .utility).async { [weak self] in
+                        for pair in losers {
+                            // Only one agent may hold current; losers must
+                            // drop hotkeys/frames.
+                            self?.sendTo(instance: pair.0.instanceId, socket: pair.0.socket, .yield)
+                        }
                     }
                 }
             }
@@ -687,6 +750,7 @@ func agentCmdName(_ cmd: AgentCmd) -> String {
     case .verify: return "verify"
     case .status: return "status"
     case .ping: return "ping"
+    case .subscribe: return "subscribe"
     case .markCurrent: return "mark-current"
     case .yield: return "yield"
     case .accessibilityPrompt: return "accessibility-prompt"
