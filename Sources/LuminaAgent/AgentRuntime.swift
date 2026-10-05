@@ -1791,6 +1791,11 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
     }
 
     func handleBound(_ command: BoundCommand) {
+        handleBoundBody(command)
+        publishStatus()
+    }
+
+    private func handleBoundBody(_ command: BoundCommand) {
         if isStopping() || userPaused || displayGone || !isCurrent { return }
         log.info("command \(command.commandString)")
         switch command {
@@ -1904,7 +1909,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         switch cmd {
         case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces, .verify,
-             .accessibilityPrompt, .debugAX, .ping:
+             .accessibilityPrompt, .debugAX, .ping, .subscribe:
             break
         default:
             if userPaused || displayGone || !isCurrent { return .success(id: id) }
@@ -1943,6 +1948,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             userPaused = true
             unregisterHotkeys()
             startOrStopFFM()
+            publishStatus()
             return .success(id: id)
         case .resume:
             if !displayGone {
@@ -1951,11 +1957,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 startOrStopFFM()
                 refreshOriginalsFromLive()
             }
+            publishStatus()
             return .success(id: id)
         case .reload:
             if let error = reloadConfig() {
                 return .failure(id: id, error: error)
             }
+            publishStatus()
             return .success(id: id)
         case .quit:
             stop()
@@ -1973,13 +1981,19 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             // The socket server normally answers pings without reaching the
             // mutation queue; this keeps direct callers working.
             return .success(id: id, data: .object(["pong": .bool(true)]))
+        case .subscribe:
+            // The socket server intercepts subscribe before the mutation
+            // queue; this keeps direct callers working.
+            return .success(id: id)
         case .markCurrent:
             recomputeCurrentToken(reason: .start)
+            publishStatus()
             return .success(id: id)
         case .yield:
             isCurrent = false
             unregisterHotkeys()
             startOrStopFFM()
+            publishStatus()
             return .success(id: id)
         case .accessibilityPrompt:
             requestAgentAXPrompt()
@@ -3150,6 +3164,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             runRefresh(reason: "start", space: session.focusedSpace)
         }
         startOrStopFFM()
+        publishStatus()
     }
 
     func managedWindowIds() -> Set<UInt32> {
@@ -3180,6 +3195,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             displayGone = true
             unregisterHotkeys()
             log.info("display gone uuid=\(bound.uuid)")
+            publishStatus()
             return
         }
         if displayGone, shouldAutoResume(userPaused: userPaused, boundUUID: bound.uuid, availableUUIDs: available) {
@@ -3189,6 +3205,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             clampOverflowOn(session.focusedSpace)
             applyFrames()
             restashOffspace()
+            publishStatus()
             return
         }
         // Still attached, but the usable geometry may have changed (scaled
@@ -3485,6 +3502,13 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             guard let id = cgWindowID(row) else { return false }
             return ids.contains(id)
         }
+    }
+
+    /// Push the strip-visible status to subscribed menu extras. Cheap no-op
+    /// when nobody listens, so it is safe to call on every command.
+    func publishStatus() {
+        guard let server, server.hasSubscribers else { return }
+        server.broadcast(event: "status", data: statusJSON(full: false))
     }
 
     func statusJSON(full: Bool = true) -> JSONValue {

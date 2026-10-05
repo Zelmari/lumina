@@ -1,6 +1,6 @@
 import Foundation
 
-public let ipcProtocolVersion = 1
+public let ipcProtocolVersion = 2
 public let ipcMaxLineBytes = 1_048_576
 
 public struct IPCRequest: Equatable, Sendable, Codable {
@@ -56,6 +56,20 @@ public enum ParseResult: Equatable, Sendable {
     case lineTooLong
 }
 
+/// Server-initiated message on a subscribed connection. Distinct from
+/// `IPCResponse` so a reader can tell a pushed snapshot from a reply.
+public struct IPCNotification: Equatable, Sendable, Codable {
+    public var v: Int
+    public var event: String
+    public var data: JSONValue?
+
+    public init(v: Int = ipcProtocolVersion, event: String, data: JSONValue? = nil) {
+        self.v = v
+        self.event = event
+        self.data = data
+    }
+}
+
 public enum DirectionArg: String, Equatable, Sendable, Codable {
     case left, down, up, right
 }
@@ -93,6 +107,9 @@ public enum AgentCmd: Equatable, Sendable {
     /// Transport-only liveness probe. The socket server answers it without
     /// hopping onto the mutation queue, so it measures raw IPC round trips.
     case ping
+    /// Keep the connection open and stream status notifications. The agent
+    /// sends one snapshot immediately, then one per strip-visible change.
+    case subscribe
     /// Extra-only: swipe-back attach without SkyLight (reason `start`).
     case markCurrent
     /// This agent is no longer the current Space. Drop hotkeys and stop mutating.
