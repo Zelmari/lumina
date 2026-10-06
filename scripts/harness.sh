@@ -33,6 +33,15 @@
 #   BENCH_STRICT set to 1 to fail when a launch takes longer than
 #                BENCH_LAUNCH_MAX_MS (default 500) or the menu push takes
 #                longer than BENCH_MENU_MAX_MS (default 250)
+#   LAUNCH_TEST  set to 0 to skip the cold-launch CG measurement (default 1)
+#   FEATURE_TEST set to 0 to skip speculative-tile and hide-until-tiled
+#                checks; both temporarily edit the config and restore it
+#                (default 1)
+#   SHIELD_BOOT_TEST set to 1 to also restart Lumina to check that an app
+#                left hidden by a previous agent is revealed at boot
+#                (default 0; it quits and restarts the agent)
+#   BENCH_COLD_MAX_MS  strict gate for the CG-measured cold launch
+#                (default 3000; it includes the app's own launch time)
 
 set -uo pipefail
 
@@ -40,6 +49,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WINDOW_COUNT="${WINDOW_COUNT:-3}"
 KEEP_WINDOWS="${KEEP_WINDOWS:-0}"
 LUMINA_LOG="${LUMINA_LOG:-$HOME/Library/Logs/Lumina.log}"
+CONFIG_PATH="${CONFIG_PATH:-$HOME/.config/lumina/lumina.toml}"
 FAILURES=0
 STEP=0
 
@@ -58,11 +68,18 @@ if [[ -f "$ROOT/scripts/cgwindows.swift" ]] && command -v swiftc >/dev/null 2>&1
     CGWINDOWS_BIN=""
   fi
 fi
+# The feature sections temporarily add top-level config keys; the original
+# file is restored on every exit path, including Ctrl-C.
+CONFIG_BACKUP=""
 cleanup_tmp() {
   rm -f "$TMP_BEFORE" "$TMP_AFTER"
   [[ -n "$CGWINDOWS_BIN" ]] && rm -f "$CGWINDOWS_BIN"
 }
-trap cleanup_tmp EXIT
+cleanup_all() {
+  cleanup_tmp
+  if declare -F restore_config >/dev/null 2>&1; then restore_config; fi
+}
+trap cleanup_all EXIT INT TERM
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "harness.sh only runs on macOS." >&2
@@ -96,6 +113,174 @@ run() {
     fail "lumina $* exited $rc: $out"
   fi
   printf '%s\n' "$out"
+}
+
+# --- Feature-test config surgery -------------------------------------------
+
+backup_config() {
+  [[ -n "$CONFIG_BACKUP" ]] && return 0
+  [[ -f "$CONFIG_PATH" ]] || return 0
+  CONFIG_BACKUP="$(mktemp -t lumina-config-backup)"
+  cp "$CONFIG_PATH" "$CONFIG_BACKUP" 2>/dev/null || true
+}
+
+# Deleting a key from the file does not reset it on reload: a missing key
+# falls back to the value in the running config. So restoring means putting
+# the user's file back, explicitly resetting the test keys to their
+# defaults, reloading, and reading the user's file again.
+restore_config() {
+  [[ -n "$CONFIG_BACKUP" ]] || return 0
+  cp "$CONFIG_BACKUP" "$CONFIG_PATH" 2>/dev/null || true
+  write_config_top_level speculative-tile false
+  write_config_top_level hide-until-tiled-apps "[]"
+  "$LUMINA" reload >/dev/null 2>&1 || true
+  cp "$CONFIG_BACKUP" "$CONFIG_PATH" 2>/dev/null || true
+  "$LUMINA" reload >/dev/null 2>&1 || true
+  rm -f "$CONFIG_BACKUP"
+  CONFIG_BACKUP=""
+}
+
+# Force the running agent's test keys back to defaults while preserving the
+# file; used at startup in case an interrupted earlier run left them active.
+reset_feature_config_in_memory() {
+  [[ -f "$CONFIG_PATH" ]] || return 0
+  local tmp
+  tmp="$(mktemp -t lumina-config-reset)"
+  cp "$CONFIG_PATH" "$tmp" 2>/dev/null || true
+  write_config_top_level speculative-tile false
+  write_config_top_level hide-until-tiled-apps "[]"
+  "$LUMINA" reload >/dev/null 2>&1 || true
+  cp "$tmp" "$CONFIG_PATH" 2>/dev/null || true
+  rm -f "$tmp"
+  "$LUMINA" reload >/dev/null 2>&1 || true
+}
+
+# Add or replace a top-level key without touching the backup. TOML tables
+# own every key after their header, so an appended key would land inside the
+# last table; insert before the first table header instead.
+write_config_top_level() {
+  local key="$1" value="$2"
+  python3 - "$CONFIG_PATH" "$key" "$value" <<'PY'
+import sys
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    lines = open(path).read().splitlines()
+except FileNotFoundError:
+    lines = []
+stripped = [l.strip() for l in lines]
+lines = [l for l, s in zip(lines, stripped) if not s.startswith(key + " ")]
+idx = next((i for i, s in enumerate(stripped) if s.startswith("[")), len(lines))
+lines.insert(idx, "%s = %s" % (key, value))
+open(path, "w").write("\n".join(lines) + "\n")
+PY
+}
+
+set_config_top_level() {
+  backup_config
+  write_config_top_level "$1" "$2"
+}
+
+# --- Cold-launch CG measurement --------------------------------------------
+
+# Open a fresh instance of `app`, then sample the independent CG oracle until
+# the new window matches its model tile. Prints one JSON object with the
+# first frame the window ever had, when it first appeared, when it reached
+# the tile, and whether the very first frame already was the tile.
+measure_launch() {
+  local app="$1" timeout="${2:-5}"
+  [[ -n "$CGWINDOWS_BIN" ]] || return 1
+  local before_pids pid deadline t0 out
+  before_pids="$(pgrep -x "$app" 2>/dev/null | tr '\n' ' ' || true)"
+  t0="$(python3 -c 'import time; print(int(time.time() * 1000))')"
+  open -n -a "$app" >/dev/null 2>&1 || return 1
+  pid=""
+  deadline=$((SECONDS + 4))
+  while ((SECONDS < deadline)); do
+    for p in $(pgrep -x "$app" 2>/dev/null || true); do
+      case " $before_pids " in *" $p "*) continue ;; esac
+      pid="$p"
+      break
+    done
+    [[ -n "$pid" ]] && break
+    sleep 0.01
+  done
+  [[ -z "$pid" ]] && return 1
+  out=$(python3 - "$CGWINDOWS_BIN" "$LUMINA" "$pid" "$t0" "$timeout" <<'PY' 2>/dev/null || true
+import json, subprocess, sys, time
+
+cg_bin, lumina, pid, t0, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), float(sys.argv[5])
+pid_str = str(pid)
+deadline = time.time() * 1000 + timeout * 1000
+first = None
+tiled_at = None
+model = None
+models = []
+i = 0
+
+def close(a, b):
+    # CG border bounds include the shadow; the model geometry checks use
+    # 12pt.
+    return (abs(a["x"] - b["x"]) <= 12 and abs(a["y"] - b["y"]) <= 12
+            and abs(a["w"] - b["w"]) <= 12 and abs(a["h"] - b["h"]) <= 12)
+
+while time.time() * 1000 < deadline:
+    now = time.time() * 1000
+    try:
+        rows = json.loads(subprocess.run([cg_bin, pid_str], capture_output=True, timeout=1).stdout)
+    except Exception:
+        rows = []
+    if i % 4 == 0:
+        try:
+            raw = subprocess.run([lumina, "list-windows"], capture_output=True, timeout=2).stdout
+            models = [w for w in json.loads(raw).get("windows", []) if int(w.get("pid", -1)) == pid]
+        except Exception:
+            models = []
+    model_ids = {int(w["cgWindowId"]) for w in models}
+    # Prefer a window the model actually tracks: a restored document can sit
+    # next to the new one and outsize it.
+    tracked = [r for r in rows if int(r["cgWindowId"]) in model_ids] if model_ids else rows
+    live = max(tracked or rows, key=lambda r: float(r["w"]) * float(r["h"])) if (tracked or rows) else None
+    if live is not None and first is None:
+        first = dict(live)
+        first["at"] = now
+    model = None
+    if live is not None:
+        model = next((w for w in models if int(w["cgWindowId"]) == int(live["cgWindowId"])), None)
+    if live is not None and model is not None and close(live, model):
+        tiled_at = now
+        break
+    i += 1
+    time.sleep(0.008)
+
+def rect(r):
+    return None if r is None else {"x": r["x"], "y": r["y"], "w": r["w"], "h": r["h"], "onscreen": r.get("onscreen")}
+
+result = {
+    "pid": pid,
+    "firstMs": None if first is None else round(first["at"] - t0),
+    "tiledMs": None if tiled_at is None else round(tiled_at - t0),
+    "first": rect(first),
+    "model": rect(model),
+    "firstIsTile": None if first is None or model is None else close(first, model),
+}
+print(json.dumps(result))
+PY
+)
+  printf '%s\n' "$out"
+}
+
+# Kill a test instance and wait for it to exit. SIGKILL on purpose: SIGTERM
+# opens TextEdit's save-confirmation dialog for the untitled test document.
+kill_test_instance() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  kill -9 "$pid" >/dev/null 2>&1 || true
+  local deadline=$((SECONDS + 5))
+  while ((SECONDS < deadline)); do
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+    sleep 0.2
+  done
+  return 1
 }
 
 # One line per managed window: id, bundle, space, role, size, position.
@@ -489,6 +674,10 @@ if ! "$LUMINA" status >/dev/null 2>&1; then
   echo "agent is not answering; start Lumina on this Space first." >&2
   exit 2
 fi
+# The agent reads the config at start and on reload. Reset the feature-test
+# keys in memory and re-read the file so an interrupted earlier run cannot
+# leave shield/speculative behavior active for this run.
+reset_feature_config_in_memory
 
 reset_test_app
 sleep 0.5
@@ -772,6 +961,133 @@ if v is not None:
     printf '   no menu push line in the agent log\n'
   fi
 
+  if [[ "${LAUNCH_TEST:-1}" != "0" ]]; then
+    say "latency: cold-launch CG measurement"
+    if [[ -n "$CGWINDOWS_BIN" ]]; then
+      cold_json="$(measure_launch TextEdit 8)"
+      cold_pid="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("pid") or "")
+except Exception: print("")' 2>/dev/null)"
+      cold_tiled="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
+try:
+    v = json.load(sys.stdin).get("tiledMs")
+    print("" if v is None else v)
+except Exception: print("")' 2>/dev/null)"
+      cold_first_tile="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("firstIsTile"))
+except Exception: print("")' 2>/dev/null)"
+      if [[ -n "$cold_tiled" ]]; then
+        printf '   cold launch pid=%s first=%sms tiled=%sms firstIsTile=%s\n' \
+          "$cold_pid" \
+          "$(printf '%s' "$cold_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("firstMs"))' 2>/dev/null)" \
+          "$cold_tiled" "$cold_first_tile"
+        if [[ -n "$ARTIFACTS" ]]; then
+          printf '%s\n' "$cold_json" > "$ARTIFACTS/cold-launch.json"
+        fi
+        if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
+          cold_max="${BENCH_COLD_MAX_MS:-3000}"
+          if ((cold_tiled <= cold_max)); then
+            pass "cold launch tiled in ${cold_tiled}ms within ${cold_max}ms"
+          else
+            fail "cold launch took ${cold_tiled}ms (limit ${cold_max}ms)"
+          fi
+        fi
+      else
+        fail "cold launch never produced a tiled window ($cold_json)"
+      fi
+      if [[ -n "$cold_pid" ]]; then
+        repark_count="$(grep -c "pre-park re-park .* pid=$cold_pid " "$LUMINA_LOG" 2>/dev/null || true)"
+        printf '   re-park lines for pid %s: %s (bounded at 3)\n' "$cold_pid" "${repark_count:-0}"
+        if (( ${repark_count:-0} > 3 )); then
+          fail "re-park looped for pid $cold_pid (${repark_count} attempts)"
+        fi
+      fi
+      kill_test_instance "$cold_pid" >/dev/null 2>&1 || fail "could not stop the cold-launch test instance"
+      sleep 0.6
+    else
+      printf '   cgwindows unavailable; cold-launch CG measurement skipped\n'
+    fi
+  fi
+
+  if [[ "${FEATURE_TEST:-1}" != "0" && -n "$CGWINDOWS_BIN" && -f "$CONFIG_PATH" ]]; then
+    say "launch concealment: speculative tile"
+    set_config_top_level speculative-tile true
+    "$LUMINA" reload >/dev/null 2>&1
+    sleep 0.3
+    spec_json="$(measure_launch TextEdit 8)"
+    spec_pid="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("pid") or "")
+except Exception: print("")' 2>/dev/null)"
+    spec_first_tile="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("firstIsTile"))
+except Exception: print("")' 2>/dev/null)"
+    if [[ -n "$ARTIFACTS" ]]; then printf '%s\n' "$spec_json" > "$ARTIFACTS/speculative-tile.json"; fi
+    spec_first_ms="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("firstMs"))
+except Exception: print("")' 2>/dev/null)"
+    printf '   speculative tile pid=%s first=%sms firstIsTile=%s\n' "$spec_pid" "$spec_first_ms" "$spec_first_tile"
+    # The app can paint before the watch detects it, and a fast adoption can
+    # tile before any pre-park runs, so the first observed frame is not a
+    # sound assertion on its own. Pass when the window was written straight
+    # to a predicted tile, or when its first observed frame already was the
+    # tile; fail if a corner park was used.
+    if [[ -n "$spec_pid" ]] \
+      && grep -q "pre-park tile .* pid=$spec_pid " "$LUMINA_LOG" 2>/dev/null; then
+      if grep -q "pre-park window .* pid=$spec_pid " "$LUMINA_LOG" 2>/dev/null; then
+        fail "speculative tile: a corner park was also used for pid $spec_pid"
+      else
+        pass "speculative tile: window was written straight to a predicted tile"
+      fi
+    elif [[ "$spec_first_tile" == "True" ]]; then
+      pass "speculative tile: first observed frame already was the tile (adopted before any park)"
+    elif [[ -n "$spec_pid" ]]; then
+      fail "speculative tile: no 'pre-park tile' line and first frame was not the tile ($spec_json)"
+    else
+      fail "speculative tile: no measurement ($spec_json)"
+    fi
+    kill_test_instance "$spec_pid" >/dev/null 2>&1 || true
+    restore_config
+    sleep 0.6
+
+    say "launch concealment: hide until tiled"
+    set_config_top_level hide-until-tiled-apps '["com.apple.TextEdit"]'
+    "$LUMINA" reload >/dev/null 2>&1
+    sleep 0.3
+    shield_json="$(measure_launch TextEdit 8)"
+    shield_pid="$(printf '%s' "$shield_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("pid") or "")
+except Exception: print("")' 2>/dev/null)"
+    shield_tiled="$(printf '%s' "$shield_json" | python3 -c 'import json,sys
+try:
+    v = json.load(sys.stdin).get("tiledMs")
+    print("" if v is None else v)
+except Exception: print("")' 2>/dev/null)"
+    if [[ -n "$ARTIFACTS" ]]; then printf '%s\n' "$shield_json" > "$ARTIFACTS/hide-until-tiled.json"; fi
+    if [[ -z "$shield_tiled" ]]; then
+      fail "hide-until-tiled: window never reached its tile ($shield_json)"
+    else
+      pass "hide-until-tiled: window tiled in ${shield_tiled}ms"
+    fi
+    if [[ -n "$shield_pid" ]]; then
+      if grep -q "launch shield hide pid=$shield_pid " "$LUMINA_LOG" 2>/dev/null \
+        && grep -q "launch shield reveal pid=$shield_pid reason=tiled" "$LUMINA_LOG" 2>/dev/null; then
+        pass "shield hid the app then revealed it after tiling"
+      else
+        fail "shield log missing hide/reveal(tiled) for pid $shield_pid"
+      fi
+      sleep 0.4
+      shield_visible="$(osascript -e "tell application \"System Events\" to get visible of first process whose unix id is $shield_pid" 2>/dev/null || true)"
+      if [[ "$shield_visible" == "true" ]]; then
+        pass "shielded app visible after reveal"
+      else
+        fail "shielded app still not visible (visible=$shield_visible)"
+      fi
+      kill_test_instance "$shield_pid" >/dev/null 2>&1 || true
+    fi
+    restore_config
+    sleep 0.6
+  fi
+
   if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
     "$LUMINA" status 2>/dev/null | python3 -c '
 import json, sys
@@ -853,6 +1169,40 @@ if [[ "${TABS_TEST:-1}" != "0" ]]; then
   fi
   TRACKED_IDS="$saved_tracked"
   verify "after native tabs"
+fi
+
+# Shield recovery: a crash or force-quit can leave a hide-until-tiled app
+# hidden with no in-memory state to reveal it. Boot must unhide it. Off by
+# default because it quits and restarts the agent (which recenters windows).
+if [[ "${SHIELD_BOOT_TEST:-0}" == "1" && -f "$CONFIG_PATH" ]]; then
+  say "launch concealment: hidden app revealed after agent restart"
+  set_config_top_level hide-until-tiled-apps '["com.apple.TextEdit"]'
+  "$LUMINA" reload >/dev/null 2>&1
+  sleep 0.3
+  boot_json="$(measure_launch TextEdit 8)"
+  boot_pid="$(printf '%s' "$boot_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("pid") or "")
+except Exception: print("")' 2>/dev/null)"
+  if [[ -z "$boot_pid" ]]; then
+    fail "shield boot test: no test instance was launched"
+  else
+    # Simulate a stranded app: hide it by hand, then restart the agent.
+    osascript -e "tell application \"System Events\" to set visible of first process whose unix id is $boot_pid to false" >/dev/null 2>&1 || true
+    sleep 0.5
+    "$LUMINA" quit >/dev/null 2>&1 || true
+    sleep 2.5
+    "$LUMINA" start >/dev/null 2>&1 || true
+    sleep 6
+    boot_visible="$(osascript -e "tell application \"System Events\" to get visible of first process whose unix id is $boot_pid" 2>/dev/null || true)"
+    if [[ "$boot_visible" == "true" ]]; then
+      pass "boot revealed an app left hidden by the previous agent"
+    else
+      fail "app still hidden after agent restart (visible=$boot_visible)"
+    fi
+    kill_test_instance "$boot_pid" >/dev/null 2>&1 || true
+  fi
+  restore_config
+  verify "after shield boot recovery"
 fi
 
 if [[ "${QUIT_TEST:-0}" == "1" ]]; then
