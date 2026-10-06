@@ -88,7 +88,7 @@ Commands: `focus left|down|up|right`, `swap left|down|up|right`, `resize grow|sh
 | `⌥1` … `⌥9`, `⌥0` | Workspace 1 … 10 |
 | `⌥⇧1` … `⌥⇧9`, `⌥⇧0` | Move the focused window to workspace 1 … 10 and follow it |
 
-Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window. Lumina keeps one tile per app window and swaps the backing window when you switch tabs. Add other apps to `[native-tabs] apps` if they show the same behavior.
+Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window. Lumina keeps one tile per visual window and swaps the backing window when you switch tabs. A separate window (Cmd+N) is its own tile. Add other apps to `[native-tabs] apps` if they show the same behavior.
 
 ## CLI
 
@@ -130,7 +130,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 
 ## Test harness
 
-`scripts/harness.sh` is the agent-facing end-to-end regression suite. It drives the real CLI against the running agent. It opens TextEdit windows and walks through focus, swap, float, fullscreen, resize/balance, opening on a fresh workspace, closing a single window (reflow), two workspace round trips (geometry stability), move-to-workspace, the menu-extra workspace count, config reload, a latency section (`lumina bench` IPC round trips plus the agent's recorded refresh-to-frame p95), and native tabs on a dedicated Ghostty instance, then cleans up. It asserts that no tracked window leaves the model and that geometry converges.
+`scripts/harness.sh` is the agent-facing end-to-end regression suite. It drives the real CLI against the running agent. It opens TextEdit windows and walks through focus, swap, float, fullscreen, resize/balance, opening on a fresh workspace, closing a single window (reflow), two workspace round trips (geometry stability), move-to-workspace, the menu-extra workspace count, config reload, a latency section (`lumina bench` IPC round trips plus the agent's recorded refresh-to-frame p95), native tabs on a dedicated Ghostty instance, and Ghostty Cmd-N opening new tiled windows beside the apps already on the workspace, then cleans up. It asserts that no tracked window leaves the model and that geometry converges.
 
 `lumina verify` runs after every step and checks: duplicate windows, windows visible on an inactive workspace, tiles overlapping or outside the display, a layout hole that does not span the usable rect, stale focus, a retained dead AX element, a tiled window not at its tile, and a hidden-workspace window still on screen.
 
@@ -147,6 +147,7 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 | `RECORD=1` | Write per-step `list-windows`/`list-workspaces`/`verify`/`debug-windows` artifacts plus `geometry.txt` under `artifacts/` |
 | `VERBOSE=1` | Print the per-window geometry table every step |
 | `TABS_TEST=0` | Skip the native-tabs section |
+| `NEW_WINDOW_TEST=0` | Skip the Ghostty Cmd-N new-window section |
 | `BENCH=0` | Skip the latency section |
 | `BENCH_COUNT` / `BENCH_WARMUP` | Pings and warmup for `lumina bench` (default 50 / 5) |
 | `BENCH_MAX_P95_MS` | Fail when IPC round-trip p95 exceeds this (default 25) |
