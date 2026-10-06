@@ -218,7 +218,7 @@ struct PathTests {
     @Test func longTmpdirResolvesToFittingAgentSocket() {
         let tmpdir = "/var/folders/lf/gqssmzzn47z1rt274bk0cc780000gn/T"
         let uuid = "8A29DD3F-0A9E-4CF5-8B1B-F2FDBED3BE43"
-        let support = "/Users/zelmari/Library/Application Support/Lumina"
+        let support = "/Users/example/Library/Application Support/Lumina"
         let paths = LuminaPaths.agentSocketPath(
             uid: 501,
             tmpdir: tmpdir,
@@ -275,7 +275,7 @@ struct PathTests {
             uid: 501,
             tmpdir: "/var/folders/lf/gqssmzzn47z1rt274bk0cc780000gn/T",
             instanceId: instanceId,
-            supportFallback: "/Users/zelmari/Library/Application Support/Lumina"
+            supportFallback: "/Users/example/Library/Application Support/Lumina"
         )
         #expect(unixSocketPathFits(resolved))
         #expect(resolved == "/tmp/lumina-501/2885d0ac2e5a9d79.sock")
@@ -330,6 +330,14 @@ struct ArgvTests {
         #expect(CLIArgs.parse(["lumina", "move-node-to-workspace", "0"])?.args["id"]?.int == 10)
         #expect(CLIArgs.parse(["lumina", "focus", "version"])?.cmd == "focus")
         #expect(CLIArgs.earlyExit(["lumina", "version"]) == .version)
+        #expect(CLIArgs.earlyExit(["lumina", "help"]) == .help)
+        #expect(CLIArgs.earlyExit(["lumina", "--help"]) == .help)
+        #expect(CLIArgs.parse(["lumina", "help"]) == nil)
+        #expect(CLIArgs.parse(["lumina", "exit"])?.cmd == "quit-all")
+        #expect(CLIArgs.parse(["lumina", "quit-all"])?.cmd == "quit-all")
+        #expect(CLIArgs.parse(["lumina", "current-token"])?.cmd == "current-token")
+        #expect(CLIArgs.usage.contains("current-token"))
+        #expect(CLIArgs.usage.contains("Exit 2"))
         #expect(CLIArgs.earlyExit(["lumina", "debug"]) == .debug)
         #expect(CLIArgs.earlyExit(["lumina", "focus", "version"]) == nil)
         #expect(CLIArgs.parse(["lumina", "debug"]) == nil)
