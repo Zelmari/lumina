@@ -468,6 +468,16 @@ public final class AXAdapter {
         AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString)
     }
 
+    /// The green button. Native-fullscreen exit can leave the window zoomed
+    /// to the screen, and `setFrame` is ignored until zoom is cleared.
+    public func pressZoom(of element: AXUIElement) {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXZoomButtonAttribute as CFString, &ref) == .success,
+              let button = ref, CFGetTypeID(button) == AXUIElementGetTypeID()
+        else { return }
+        AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString)
+    }
+
     public func isMinimized(_ element: AXUIElement) -> Bool {
         boolAttribute(element, kAXMinimizedAttribute as CFString)
     }

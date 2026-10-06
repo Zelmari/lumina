@@ -233,9 +233,15 @@ private func framesMatch(_ a: Rect, _ b: Rect, slop: Double) -> Bool {
 ///
 /// When the AX read *succeeded* and omitted the window, CG may still list a
 /// lingering record (Electron windows that closed, hidden retention windows).
-/// Every class counts misses then: floating entries after `grace`, tiled and
-/// stashed entries after twice that, so a dead tile cannot pin a split
-/// forever while a transient omission still has room to recover.
+/// Every class counts misses then: floating entries after `grace`, tiled
+/// entries after twice that, so a dead tile cannot pin a split forever while
+/// a transient omission still has room to recover.
+///
+/// `parkedIds` are stashed or on a workspace that is not focused. An empty
+/// `AXWindows` list is normal for them, and a retained element keeps
+/// answering, so the live-element veto cap must not delete them while CG
+/// still lists the window. A parked id CG has dropped still follows the
+/// ordinary rules.
 public struct RemovalGate: Equatable, Sendable {
     private var misses: [UInt32: Int]
     /// Consecutive passes a live-element veto has deferred an id. The veto
@@ -256,13 +262,21 @@ public struct RemovalGate: Equatable, Sendable {
         pidOf: [UInt32: Int32],
         axFailedPids: Set<Int32>,
         floatingIds: Set<UInt32>,
-        elementLive: Set<UInt32> = []
+        elementLive: Set<UInt32> = [],
+        parkedIds: Set<UInt32> = []
     ) -> (real: [UInt32], deferred: [UInt32]) {
         var real: [UInt32] = []
         var deferred: [UInt32] = []
         var next: [UInt32: Int] = [:]
         var nextVeto: [UInt32: Int] = [:]
         for id in removed {
+            // Hidden-workspace and stashed windows disappear from AX while
+            // they are still on screen to CoreGraphics. Counting that as a
+            // close drops them out of the model after a few seconds.
+            if parkedIds.contains(id), cgLive.contains(id) {
+                deferred.append(id)
+                continue
+            }
             if elementLive.contains(id) {
                 let miss = (vetoMisses[id] ?? 0) + 1
                 if miss > grace * 3 {

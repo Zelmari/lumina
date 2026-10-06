@@ -363,6 +363,41 @@ struct ReconcileTests {
         #expect(result.deferred.isEmpty)
     }
 
+    @Test func parkedWindowStaysWhileCGListsIt() {
+        // A stashed window on another workspace answers an empty AXWindows
+        // list and its element stays alive. That used to hit the veto cap
+        // and delete Safari, Discord, and the other workspace's tiles.
+        var gate = RemovalGate()
+        for attempt in 1...12 {
+            let result = gate.classify(
+                removed: [7],
+                cgLive: [7],
+                pidOf: [7: 10],
+                axFailedPids: [],
+                floatingIds: [7],
+                elementLive: [7],
+                parkedIds: [7]
+            )
+            #expect(result.deferred == [7], "attempt \(attempt) should keep the parked window")
+            #expect(result.real.isEmpty)
+        }
+    }
+
+    @Test func parkedWindowCGDroppedIsStillRemovable() {
+        var gate = RemovalGate()
+        let result = gate.classify(
+            removed: [7],
+            cgLive: [],
+            pidOf: [7: 10],
+            axFailedPids: [],
+            floatingIds: [7],
+            elementLive: [],
+            parkedIds: [7]
+        )
+        #expect(result.real == [7])
+        #expect(result.deferred.isEmpty)
+    }
+
     @Test func seenWindowResetsMisses() {
         var gate = RemovalGate()
         _ = gate.classify(removed: [7], cgLive: [7], pidOf: [7: 10], axFailedPids: [], floatingIds: [7])
