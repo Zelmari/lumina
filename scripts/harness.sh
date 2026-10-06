@@ -21,6 +21,9 @@
 #                managed window was restored to a usable size (Lumina stays
 #                quit afterwards; relaunch it yourself)
 #   LUMINA_LOG   agent log path (default ~/Library/Logs/Lumina.log)
+#   CONFIG_PATH  config the feature sections edit and restore
+#                (default ~/.config/lumina/lumina.toml). Every run calls
+#                reset_feature_config_in_memory on that file when it exists.
 #   RECORD       set to 1 to write per-step geometry artifacts under
 #                artifacts/harness-<timestamp>/ (windows, workspaces, verify,
 #                debug-windows dumps, and geometry.txt)
@@ -28,9 +31,11 @@
 #   TABS_TEST    set to 0 to skip the native-tabs (Ghostty) section
 #   NEW_WINDOW_TEST set to 0 to skip the Ghostty Cmd-N new-window section
 #   GHOSTTY_SPACES_TEST set to 0 to skip the multi-workspace Ghostty section
-#                (one window on workspaces 2-4, an empty 5, five on 2 with
-#                focus and swap, nine on 3, a tenth that overlaps, and
-#                lumina close)
+#                (one window beside the apps already on workspace 1, one each
+#                on 2-4, an empty 5, five on 2 with focus, swap, resize,
+#                balance, float, and Lumina fullscreen, a move to workspace 5
+#                and back, a tab versus Cmd-N, native fullscreen, nine on 3,
+#                a tenth that floats or overlaps, and lumina close)
 #   BENCH        set to 0 to skip the latency section (default 1)
 #   BENCH_COUNT  pings for `lumina bench` (default 50)
 #   BENCH_WARMUP warmup pings (default 5)
@@ -38,12 +43,15 @@
 #   BENCH_STRICT set to 1 to fail when a launch takes longer than
 #                BENCH_LAUNCH_MAX_MS (default 500) or the menu push takes
 #                longer than BENCH_MENU_MAX_MS (default 250)
-#   LAUNCH_TEST  set to 0 to skip the cold-launch CG measurement (default 1)
+#   LAUNCH_TEST  set to 0 to skip the cold-launch CG measurement (default 1).
+#                Runs even when BENCH=0. If cgwindows cannot be compiled the
+#                section prints a skip and does not fail the run.
 #   FEATURE_TEST set to 0 to skip the config checks (gaps, a float window
 #                rule, an ignore rule, a rejected config file,
 #                focus-follows-mouse, launch-tiling, speculative-tile,
 #                and hide-until-tiled). They edit the config and restore it
-#                (default 1)
+#                (default 1). Runs even when BENCH=0. Skipped, and the run
+#                can still pass, when cgwindows or the config file is missing.
 #   SHIELD_BOOT_TEST set to 1 to also restart Lumina to check that an app
 #                left hidden by a previous agent is revealed at boot
 #                (default 0; it quits and restarts the agent)
@@ -1489,86 +1497,97 @@ if v is not None:
     printf '   no menu push line in the agent log\n'
   fi
 
-  if [[ "${LAUNCH_TEST:-1}" != "0" ]]; then
-    say "latency: cold-launch CG measurement"
-    if [[ -n "$CGWINDOWS_BIN" ]]; then
-      cold_json="$(measure_launch TextEdit 8)"
-      cold_pid="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
+  if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
+    "$LUMINA" status 2>/dev/null | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+created = s.get("createdLatencyP95Ms")
+launched = s.get("launchedLatencyP95Ms")
+print("created p95=%s launched p95=%s (report only)" % (created, launched))
+' 2>/dev/null || true
+  fi
+fi
+
+if [[ "${LAUNCH_TEST:-1}" != "0" ]]; then
+  say "latency: cold-launch CG measurement"
+  if [[ -n "$CGWINDOWS_BIN" ]]; then
+    cold_json="$(measure_launch TextEdit 8)"
+    cold_pid="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("pid") or "")
 except Exception: print("")' 2>/dev/null)"
-      cold_tiled="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
+    cold_tiled="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
 try:
-    v = json.load(sys.stdin).get("tiledMs")
-    print("" if v is None else v)
+  v = json.load(sys.stdin).get("tiledMs")
+  print("" if v is None else v)
 except Exception: print("")' 2>/dev/null)"
-      cold_first_tile="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
+    cold_first_tile="$(printf '%s' "$cold_json" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("firstIsTile"))
 except Exception: print("")' 2>/dev/null)"
-      if [[ -n "$cold_tiled" ]]; then
-        printf '   cold launch pid=%s first=%sms tiled=%sms firstIsTile=%s\n' \
-          "$cold_pid" \
-          "$(printf '%s' "$cold_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("firstMs"))' 2>/dev/null)" \
-          "$cold_tiled" "$cold_first_tile"
-        if [[ -n "$ARTIFACTS" ]]; then
-          printf '%s\n' "$cold_json" > "$ARTIFACTS/cold-launch.json"
-        fi
-        if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
-          cold_max="${BENCH_COLD_MAX_MS:-3000}"
-          if ((cold_tiled <= cold_max)); then
-            pass "cold launch tiled in ${cold_tiled}ms within ${cold_max}ms"
-          else
-            fail "cold launch took ${cold_tiled}ms (limit ${cold_max}ms)"
-          fi
-        fi
-      else
-        fail "cold launch never produced a tiled window ($cold_json)"
+    if [[ -n "$cold_tiled" ]]; then
+      printf '   cold launch pid=%s first=%sms tiled=%sms firstIsTile=%s\n' \
+        "$cold_pid" \
+        "$(printf '%s' "$cold_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("firstMs"))' 2>/dev/null)" \
+        "$cold_tiled" "$cold_first_tile"
+      if [[ -n "$ARTIFACTS" ]]; then
+        printf '%s\n' "$cold_json" > "$ARTIFACTS/cold-launch.json"
       fi
-      if [[ -n "$cold_pid" ]]; then
-        repark_count="$(grep -c "pre-park re-park .* pid=$cold_pid " "$LUMINA_LOG" 2>/dev/null || true)"
-        printf '   re-park lines for pid %s: %s (bounded at 3)\n' "$cold_pid" "${repark_count:-0}"
-        if (( ${repark_count:-0} > 3 )); then
-          fail "re-park looped for pid $cold_pid (${repark_count} attempts)"
+      if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
+        cold_max="${BENCH_COLD_MAX_MS:-3000}"
+        if ((cold_tiled <= cold_max)); then
+          pass "cold launch tiled in ${cold_tiled}ms within ${cold_max}ms"
+        else
+          fail "cold launch took ${cold_tiled}ms (limit ${cold_max}ms)"
         fi
       fi
-      kill_test_instance "$cold_pid" >/dev/null 2>&1 || fail "could not stop the cold-launch test instance"
-      sleep 0.6
     else
-      printf '   cgwindows unavailable; cold-launch CG measurement skipped\n'
+      fail "cold launch never produced a tiled window ($cold_json)"
     fi
+    if [[ -n "$cold_pid" ]]; then
+      repark_count="$(grep -c "pre-park re-park .* pid=$cold_pid " "$LUMINA_LOG" 2>/dev/null || true)"
+      printf '   re-park lines for pid %s: %s (bounded at 3)\n' "$cold_pid" "${repark_count:-0}"
+      if (( ${repark_count:-0} > 3 )); then
+        fail "re-park looped for pid $cold_pid (${repark_count} attempts)"
+      fi
+    fi
+    kill_test_instance "$cold_pid" >/dev/null 2>&1 || fail "could not stop the cold-launch test instance"
+    sleep 0.6
+  else
+    printf '   cgwindows unavailable; cold-launch CG measurement skipped\n'
   fi
+fi
 
-  if [[ "${FEATURE_TEST:-1}" != "0" && -n "$CGWINDOWS_BIN" && -f "$CONFIG_PATH" ]]; then
-    say "config: gaps, focus-follows-mouse, launch-tiling, float rule"
-    backup_config
-    if [[ -z "$CONFIG_BACKUP" ]]; then
-      fail "could not back up $CONFIG_PATH"
-    else
-      python3 - "$CONFIG_PATH" <<'PY'
+if [[ "${FEATURE_TEST:-1}" != "0" && -n "$CGWINDOWS_BIN" && -f "$CONFIG_PATH" ]]; then
+  say "config: gaps, focus-follows-mouse, launch-tiling, float rule"
+  backup_config
+  if [[ -z "$CONFIG_BACKUP" ]]; then
+    fail "could not back up $CONFIG_PATH"
+  else
+    python3 - "$CONFIG_PATH" <<'PY'
 import re, sys
 path = sys.argv[1]
 text = open(path).read()
 def num(key, default):
-    m = re.search(r'(?m)^%s\s*=\s*(\d+)' % key, text)
-    return int(m.group(1)) if m else default
+  m = re.search(r'(?m)^%s\s*=\s*(\d+)' % key, text)
+  return int(m.group(1)) if m else default
 inner, outer = num("inner", 8), num("outer", 8)
 new_inner, new_outer = inner + 16, outer + 24
 def widen(body):
-    body = re.sub(r'(?m)^inner\s*=\s*\d+', 'inner = %d' % new_inner, body, count=1)
-    body = re.sub(r'(?m)^outer\s*=\s*\d+', 'outer = %d' % new_outer, body, count=1)
-    if not re.search(r'(?m)^inner\s*=', body):
-        body = body.rstrip() + '\ninner = %d\n' % new_inner
-    if not re.search(r'(?m)^outer\s*=', body):
-        body = body.rstrip() + '\nouter = %d\n' % new_outer
-    return body
+  body = re.sub(r'(?m)^inner\s*=\s*\d+', 'inner = %d' % new_inner, body, count=1)
+  body = re.sub(r'(?m)^outer\s*=\s*\d+', 'outer = %d' % new_outer, body, count=1)
+  if not re.search(r'(?m)^inner\s*=', body):
+      body = body.rstrip() + '\ninner = %d\n' % new_inner
+  if not re.search(r'(?m)^outer\s*=', body):
+      body = body.rstrip() + '\nouter = %d\n' % new_outer
+  return body
 if re.search(r'(?m)^\[gaps\]', text):
-    gap = re.search(r'(?ms)^\[gaps\][^\[]*', text)
-    if gap:
-        text = text[:gap.start()] + widen(gap.group(0)) + text[gap.end():]
+  gap = re.search(r'(?ms)^\[gaps\][^\[]*', text)
+  if gap:
+      text = text[:gap.start()] + widen(gap.group(0)) + text[gap.end():]
 else:
-    text += '\n[gaps]\ninner = %d\nouter = %d\n' % (new_inner, new_outer)
+  text += '\n[gaps]\ninner = %d\nouter = %d\n' % (new_inner, new_outer)
 lines = text.splitlines()
 def drop(key, rows):
-    return [row for row in rows if not row.strip().startswith(key + " ") and not row.strip().startswith(key + "=")]
+  return [row for row in rows if not row.strip().startswith(key + " ") and not row.strip().startswith(key + "=")]
 lines = drop("focus-follows-mouse", lines)
 lines = drop("launch-tiling", lines)
 stripped = [row.strip() for row in lines]
@@ -1579,193 +1598,182 @@ text = "\n".join(lines) + "\n"
 text += '\n[[window-rule]]\napp-id = "com.apple.TextEdit"\naction = "float"\n'
 open(path, "w").write(text)
 PY
-      if ! "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || [[ ! -s "$TMP_BEFORE" ]]; then
-        fail "geometry snapshot before the gap change failed"
-      else
-        run reload >/dev/null
-        sleep 0.6
-        if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
-          gap_moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
-          if [[ -n "$gap_moved" ]]; then
-            pass "larger gaps reflowed tiles:$gap_moved"
-          else
-            fail "larger gaps did not move a tile"
-          fi
-        else
-          fail "geometry snapshot after the gap change failed"
-        fi
-      fi
-      rule_before="$(window_ids)"
-      rule_pids_before="$(pgrep -x TextEdit 2>/dev/null | tr '\n' ' ' || true)"
-      open_windows 1
-      rule_id="$(new_textedit_id "$rule_before")"
-      rule_role="$(window_field "$rule_id" role)"
-      if [[ "$rule_role" == "floating" ]]; then
-        pass "window rule floated the new TextEdit ($rule_id)"
-      else
-        fail "window rule left the new TextEdit ${rule_role:-unmanaged} (id ${rule_id:-none})"
-      fi
-      rule_pid="$(window_field "$rule_id" pid)"
-      case " $rule_pids_before " in
-        *" $rule_pid "*)
-          osascript -e 'tell application "TextEdit" to close front window saving no' >/dev/null 2>&1 || true
-          ;;
-        *)
-          kill_test_instance "$rule_pid" >/dev/null 2>&1 || true
-          ;;
-      esac
-      restore_config
-      sleep 0.6
-      verify "after config restore"
-    fi
-
-    say "launch concealment: speculative tile"
-    set_config_top_level speculative-tile true
-    "$LUMINA" reload >/dev/null 2>&1
-    sleep 0.3
-    spec_json="$(measure_launch TextEdit 8)"
-    spec_pid="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("pid") or "")
-except Exception: print("")' 2>/dev/null)"
-    spec_first_tile="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("firstIsTile"))
-except Exception: print("")' 2>/dev/null)"
-    if [[ -n "$ARTIFACTS" ]]; then printf '%s\n' "$spec_json" > "$ARTIFACTS/speculative-tile.json"; fi
-    spec_first_ms="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("firstMs"))
-except Exception: print("")' 2>/dev/null)"
-    printf '   speculative tile pid=%s first=%sms firstIsTile=%s\n' "$spec_pid" "$spec_first_ms" "$spec_first_tile"
-    # The app can paint before the watch detects it, and a fast adoption can
-    # tile before any pre-park runs, so the first observed frame is not a
-    # sound assertion on its own. Pass when the window was written straight
-    # to a predicted tile, or when its first observed frame already was the
-    # tile; fail if a corner park was used.
-    if [[ -n "$spec_pid" ]] \
-      && grep -q "pre-park tile .* pid=$spec_pid " "$LUMINA_LOG" 2>/dev/null; then
-      if grep -q "pre-park window .* pid=$spec_pid " "$LUMINA_LOG" 2>/dev/null; then
-        fail "speculative tile: a corner park was also used for pid $spec_pid"
-      else
-        pass "speculative tile: window was written straight to a predicted tile"
-      fi
-    elif [[ "$spec_first_tile" == "True" ]]; then
-      pass "speculative tile: first observed frame already was the tile (adopted before any park)"
-    elif [[ -n "$spec_pid" ]]; then
-      fail "speculative tile: no 'pre-park tile' line and first frame was not the tile ($spec_json)"
+    if ! "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || [[ ! -s "$TMP_BEFORE" ]]; then
+      fail "geometry snapshot before the gap change failed"
     else
-      fail "speculative tile: no measurement ($spec_json)"
-    fi
-    kill_test_instance "$spec_pid" >/dev/null 2>&1 || true
-    restore_config
-    sleep 0.6
-
-    say "launch concealment: hide until tiled"
-    set_config_top_level hide-until-tiled-apps '["com.apple.TextEdit"]'
-    "$LUMINA" reload >/dev/null 2>&1
-    sleep 0.3
-    shield_json="$(measure_launch TextEdit 8)"
-    shield_pid="$(printf '%s' "$shield_json" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("pid") or "")
-except Exception: print("")' 2>/dev/null)"
-    shield_tiled="$(printf '%s' "$shield_json" | python3 -c 'import json,sys
-try:
-    v = json.load(sys.stdin).get("tiledMs")
-    print("" if v is None else v)
-except Exception: print("")' 2>/dev/null)"
-    if [[ -n "$ARTIFACTS" ]]; then printf '%s\n' "$shield_json" > "$ARTIFACTS/hide-until-tiled.json"; fi
-    if [[ -z "$shield_tiled" ]]; then
-      fail "hide-until-tiled: window never reached its tile ($shield_json)"
-    else
-      pass "hide-until-tiled: window tiled in ${shield_tiled}ms"
-    fi
-    if [[ -n "$shield_pid" ]]; then
-      if grep -q "launch shield hide pid=$shield_pid " "$LUMINA_LOG" 2>/dev/null \
-        && grep -q "launch shield reveal pid=$shield_pid reason=tiled" "$LUMINA_LOG" 2>/dev/null; then
-        pass "shield hid the app then revealed it after tiling"
-      else
-        fail "shield log missing hide/reveal(tiled) for pid $shield_pid"
-      fi
-      sleep 0.4
-      shield_visible="$(osascript -e "tell application \"System Events\" to get visible of first process whose unix id is $shield_pid" 2>/dev/null || true)"
-      if [[ "$shield_visible" == "true" ]]; then
-        pass "shielded app visible after reveal"
-      else
-        fail "shielded app still not visible (visible=$shield_visible)"
-      fi
-      kill_test_instance "$shield_pid" >/dev/null 2>&1 || true
-    fi
-    restore_config
-    sleep 0.6
-
-    say "config: ignore rule and a rejected file"
-    backup_config
-    if [[ -z "$CONFIG_BACKUP" ]]; then
-      fail "could not back up $CONFIG_PATH for the ignore rule"
-    else
-      printf '\n[[window-rule]]\napp-id = "com.apple.TextEdit"\naction = "ignore"\n' >> "$CONFIG_PATH"
       run reload >/dev/null
-      sleep 0.4
-      ignore_before="$(window_ids)"
-      ignore_pids="$(pgrep -x TextEdit 2>/dev/null | tr '\n' ' ' || true)"
-      open -n -a TextEdit >/dev/null 2>&1 || fail "could not launch TextEdit for the ignore rule"
-      ignore_deadline=$((SECONDS + 4))
-      ignore_id=""
-      while ((SECONDS < ignore_deadline)); do
-        ignore_id="$(new_textedit_id "$ignore_before")"
-        [[ -n "$ignore_id" ]] && break
-        sleep 0.3
-      done
-      if [[ -z "$ignore_id" ]]; then
-        pass "ignore rule left the new TextEdit unmanaged"
+      sleep 0.6
+      if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+        gap_moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+        if [[ -n "$gap_moved" ]]; then
+          pass "larger gaps reflowed tiles:$gap_moved"
+        else
+          fail "larger gaps did not move a tile"
+        fi
       else
-        fail "ignore rule adopted TextEdit $ignore_id as $(window_field "$ignore_id" role)"
-      fi
-      for ignore_pid in $(pgrep -x TextEdit 2>/dev/null || true); do
-        case " $ignore_pids " in
-          *" $ignore_pid "*) ;;
-          *) kill -9 "$ignore_pid" >/dev/null 2>&1 || true ;;
-        esac
-      done
-      restore_config
-      sleep 0.4
-      backup_config
-      if [[ -z "$CONFIG_BACKUP" ]]; then
-        fail "could not back up $CONFIG_PATH before the broken config"
-      else
-        printf 'this is not toml [\n' > "$CONFIG_PATH"
-        bad_reload=0
-        "$LUMINA" reload >/dev/null 2>&1 || bad_reload=1
-        if [[ "$bad_reload" == "1" ]]; then
-          pass "reload rejected a broken config"
-        else
-          fail "reload accepted a broken config"
-        fi
-        bad_error="$(status_flag configError)"
-        if [[ -n "$bad_error" && "$bad_error" != "None" && "$bad_error" != "null" ]]; then
-          pass "status reports the config error"
-        else
-          fail "status configError is empty after a broken config"
-        fi
-        restore_config
-        sleep 0.4
-        restored_error="$(status_flag configError)"
-        if [[ -z "$restored_error" || "$restored_error" == "None" || "$restored_error" == "null" ]]; then
-          pass "config error cleared after restore"
-        else
-          fail "config error still set after restore ($restored_error)"
-        fi
-        verify "after rejected config"
+        fail "geometry snapshot after the gap change failed"
       fi
     fi
+    rule_before="$(window_ids)"
+    rule_pids_before="$(pgrep -x TextEdit 2>/dev/null | tr '\n' ' ' || true)"
+    open_windows 1
+    rule_id="$(new_textedit_id "$rule_before")"
+    rule_role="$(window_field "$rule_id" role)"
+    if [[ "$rule_role" == "floating" ]]; then
+      pass "window rule floated the new TextEdit ($rule_id)"
+    else
+      fail "window rule left the new TextEdit ${rule_role:-unmanaged} (id ${rule_id:-none})"
+    fi
+    rule_pid="$(window_field "$rule_id" pid)"
+    case " $rule_pids_before " in
+      *" $rule_pid "*)
+        osascript -e 'tell application "TextEdit" to close front window saving no' >/dev/null 2>&1 || true
+        ;;
+      *)
+        kill_test_instance "$rule_pid" >/dev/null 2>&1 || true
+        ;;
+    esac
+    restore_config
+    sleep 0.6
+    verify "after config restore"
   fi
 
-  if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
-    "$LUMINA" status 2>/dev/null | python3 -c '
-import json, sys
-s = json.load(sys.stdin)
-created = s.get("createdLatencyP95Ms")
-launched = s.get("launchedLatencyP95Ms")
-print("created p95=%s launched p95=%s (report only)" % (created, launched))
-' 2>/dev/null || true
+  say "launch concealment: speculative tile"
+  set_config_top_level speculative-tile true
+  "$LUMINA" reload >/dev/null 2>&1
+  sleep 0.3
+  spec_json="$(measure_launch TextEdit 8)"
+  spec_pid="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("pid") or "")
+except Exception: print("")' 2>/dev/null)"
+  spec_first_tile="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("firstIsTile"))
+except Exception: print("")' 2>/dev/null)"
+  if [[ -n "$ARTIFACTS" ]]; then printf '%s\n' "$spec_json" > "$ARTIFACTS/speculative-tile.json"; fi
+  spec_first_ms="$(printf '%s' "$spec_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("firstMs"))
+except Exception: print("")' 2>/dev/null)"
+  printf '   speculative tile pid=%s first=%sms firstIsTile=%s\n' "$spec_pid" "$spec_first_ms" "$spec_first_tile"
+  # The app can paint before the watch detects it, and a fast adoption can
+  # tile before any pre-park runs, so the first observed frame is not a
+  # sound assertion on its own. Pass when the window was written straight
+  # to a predicted tile, or when its first observed frame already was the
+  # tile; fail if a corner park was used.
+  if [[ -n "$spec_pid" ]] \
+    && grep -q "pre-park tile .* pid=$spec_pid " "$LUMINA_LOG" 2>/dev/null; then
+    if grep -q "pre-park window .* pid=$spec_pid " "$LUMINA_LOG" 2>/dev/null; then
+      fail "speculative tile: a corner park was also used for pid $spec_pid"
+    else
+      pass "speculative tile: window was written straight to a predicted tile"
+    fi
+  elif [[ "$spec_first_tile" == "True" ]]; then
+    pass "speculative tile: first observed frame already was the tile (adopted before any park)"
+  elif [[ -n "$spec_pid" ]]; then
+    fail "speculative tile: no 'pre-park tile' line and first frame was not the tile ($spec_json)"
+  else
+    fail "speculative tile: no measurement ($spec_json)"
+  fi
+  kill_test_instance "$spec_pid" >/dev/null 2>&1 || true
+  restore_config
+  sleep 0.6
+
+  say "launch concealment: hide until tiled"
+  set_config_top_level hide-until-tiled-apps '["com.apple.TextEdit"]'
+  "$LUMINA" reload >/dev/null 2>&1
+  sleep 0.3
+  shield_json="$(measure_launch TextEdit 8)"
+  shield_pid="$(printf '%s' "$shield_json" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("pid") or "")
+except Exception: print("")' 2>/dev/null)"
+  shield_tiled="$(printf '%s' "$shield_json" | python3 -c 'import json,sys
+try:
+  v = json.load(sys.stdin).get("tiledMs")
+  print("" if v is None else v)
+except Exception: print("")' 2>/dev/null)"
+  if [[ -n "$ARTIFACTS" ]]; then printf '%s\n' "$shield_json" > "$ARTIFACTS/hide-until-tiled.json"; fi
+  if [[ -z "$shield_tiled" ]]; then
+    fail "hide-until-tiled: window never reached its tile ($shield_json)"
+  else
+    pass "hide-until-tiled: window tiled in ${shield_tiled}ms"
+  fi
+  if [[ -n "$shield_pid" ]]; then
+    if grep -q "launch shield hide pid=$shield_pid " "$LUMINA_LOG" 2>/dev/null \
+      && grep -q "launch shield reveal pid=$shield_pid reason=tiled" "$LUMINA_LOG" 2>/dev/null; then
+      pass "shield hid the app then revealed it after tiling"
+    else
+      fail "shield log missing hide/reveal(tiled) for pid $shield_pid"
+    fi
+    sleep 0.4
+    shield_visible="$(osascript -e "tell application \"System Events\" to get visible of first process whose unix id is $shield_pid" 2>/dev/null || true)"
+    if [[ "$shield_visible" == "true" ]]; then
+      pass "shielded app visible after reveal"
+    else
+      fail "shielded app still not visible (visible=$shield_visible)"
+    fi
+    kill_test_instance "$shield_pid" >/dev/null 2>&1 || true
+  fi
+  restore_config
+  sleep 0.6
+
+  say "config: ignore rule and a rejected file"
+  backup_config
+  if [[ -z "$CONFIG_BACKUP" ]]; then
+    fail "could not back up $CONFIG_PATH for the ignore rule"
+  else
+    printf '\n[[window-rule]]\napp-id = "com.apple.TextEdit"\naction = "ignore"\n' >> "$CONFIG_PATH"
+    run reload >/dev/null
+    sleep 0.4
+    ignore_before="$(window_ids)"
+    ignore_pids="$(pgrep -x TextEdit 2>/dev/null | tr '\n' ' ' || true)"
+    open -n -a TextEdit >/dev/null 2>&1 || fail "could not launch TextEdit for the ignore rule"
+    ignore_deadline=$((SECONDS + 4))
+    ignore_id=""
+    while ((SECONDS < ignore_deadline)); do
+      ignore_id="$(new_textedit_id "$ignore_before")"
+      [[ -n "$ignore_id" ]] && break
+      sleep 0.3
+    done
+    if [[ -z "$ignore_id" ]]; then
+      pass "ignore rule left the new TextEdit unmanaged"
+    else
+      fail "ignore rule adopted TextEdit $ignore_id as $(window_field "$ignore_id" role)"
+    fi
+    for ignore_pid in $(pgrep -x TextEdit 2>/dev/null || true); do
+      case " $ignore_pids " in
+        *" $ignore_pid "*) ;;
+        *) kill -9 "$ignore_pid" >/dev/null 2>&1 || true ;;
+      esac
+    done
+    restore_config
+    sleep 0.4
+    backup_config
+    if [[ -z "$CONFIG_BACKUP" ]]; then
+      fail "could not back up $CONFIG_PATH before the broken config"
+    else
+      printf 'this is not toml [\n' > "$CONFIG_PATH"
+      bad_reload=0
+      "$LUMINA" reload >/dev/null 2>&1 || bad_reload=1
+      if [[ "$bad_reload" == "1" ]]; then
+        pass "reload rejected a broken config"
+      else
+        fail "reload accepted a broken config"
+      fi
+      bad_error="$(status_flag configError)"
+      if [[ -n "$bad_error" && "$bad_error" != "None" && "$bad_error" != "null" ]]; then
+        pass "status reports the config error"
+      else
+        fail "status configError is empty after a broken config"
+      fi
+      restore_config
+      sleep 0.4
+      restored_error="$(status_flag configError)"
+      if [[ -z "$restored_error" || "$restored_error" == "None" || "$restored_error" == "null" ]]; then
+        pass "config error cleared after restore"
+      else
+        fail "config error still set after restore ($restored_error)"
+      fi
+      verify "after rejected config"
+    fi
   fi
 fi
 
