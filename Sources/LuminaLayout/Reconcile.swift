@@ -117,6 +117,111 @@ public func reconcile(
     )
 }
 
+/// A window as native-tab reconciliation sees it. `onScreen` means CG lists
+/// it on screen and it is not a stash sliver. Frames are AX/CG top-left space.
+public struct NativeTabWindow: Equatable, Sendable {
+    public var id: UInt32
+    public var frame: Rect
+    public var onScreen: Bool
+
+    public init(id: UInt32, frame: Rect, onScreen: Bool) {
+        self.id = id
+        self.frame = frame
+        self.onScreen = onScreen
+    }
+}
+
+/// What to do with one native-tab app's model entries this pass. `rebinds`
+/// swap a tile onto the backing window that is now showing. `drop` removes
+/// inactive backing windows that must not occupy a tile.
+public struct NativeTabResolution: Equatable, Sendable {
+    public var rebinds: [RebindPair]
+    public var drop: [UInt32]
+
+    public init(rebinds: [RebindPair] = [], drop: [UInt32] = []) {
+        self.rebinds = rebinds
+        self.drop = drop
+    }
+}
+
+/// One tile per visual window for apps whose tabs are separate NSWindows.
+///
+/// macOS native tabs keep every tab's NSWindow alive. The selected tab is on
+/// screen. The others sit at the same frame and are usually off screen; during
+/// a switch CG briefly lists both. Those ids share a frame, so they collapse
+/// onto the focused id (or the only on-screen id).
+///
+/// A real new window (Ghostty Cmd+N, Terminal's new window) is also on screen,
+/// at its own frame. It is a separate cluster and is not rebound or dropped,
+/// so the caller can insert it as its own tile. An off-screen window whose
+/// frame matches none of the on-screen windows (a stash on another workspace)
+/// is left alone.
+public func resolveNativeTabs(
+    managed: [NativeTabWindow],
+    live: [NativeTabWindow],
+    focusedId: UInt32?,
+    frameSlop: Double = 8
+) -> NativeTabResolution {
+    let visible = live
+        .filter { $0.onScreen && $0.frame.w >= 50 && $0.frame.h >= 50 }
+        .sorted { $0.id < $1.id }
+    var clusters: [[NativeTabWindow]] = []
+    for window in visible {
+        if let index = clusters.firstIndex(where: {
+            framesMatch($0[0].frame, window.frame, slop: frameSlop)
+        }) {
+            clusters[index].append(window)
+        } else {
+            clusters.append([window])
+        }
+    }
+
+    var used: Set<UInt32> = []
+    var rebinds: [RebindPair] = []
+    var drop: [UInt32] = []
+    for cluster in clusters {
+        let active: NativeTabWindow
+        if let focusedId, let match = cluster.first(where: { $0.id == focusedId }) {
+            active = match
+        } else if cluster.count == 1, let only = cluster.first {
+            active = only
+        } else {
+            // Several backing windows share a frame and focus did not pick
+            // one. Guessing would steal a real window. The next pass retries.
+            continue
+        }
+        let clusterIds = Set(cluster.map(\.id))
+        let members = managed.filter { window in
+            if used.contains(window.id) { return false }
+            if clusterIds.contains(window.id) { return true }
+            // Inactive tabs are off screen at the selected tab's frame.
+            // An on-screen window belongs only to its own cluster.
+            return !window.onScreen && framesMatch(window.frame, active.frame, slop: frameSlop)
+        }
+        let memberIds = Set(members.map(\.id))
+        if memberIds.contains(active.id) {
+            for id in memberIds.subtracting([active.id]).sorted() {
+                drop.append(id)
+            }
+        } else if let keeper = members.filter({ clusterIds.contains($0.id) }).min(by: { $0.id < $1.id })?.id
+            ?? members.min(by: { $0.id < $1.id })?.id
+        {
+            rebinds.append(RebindPair(from: keeper, to: active.id))
+            for id in memberIds.subtracting([keeper]).sorted() {
+                drop.append(id)
+            }
+        }
+        used.formUnion(memberIds)
+        used.insert(active.id)
+    }
+    return NativeTabResolution(rebinds: rebinds.sorted(), drop: drop.sorted())
+}
+
+private func framesMatch(_ a: Rect, _ b: Rect, slop: Double) -> Bool {
+    abs(a.x - b.x) <= slop && abs(a.y - b.y) <= slop
+        && abs(a.w - b.w) <= slop && abs(a.h - b.h) <= slop
+}
+
 /// Decides which model windows a refresh is allowed to destroy.
 ///
 /// A window missing from a *failed* AX read tells us nothing at all: busy apps

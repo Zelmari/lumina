@@ -149,6 +149,107 @@ struct ReconcileTests {
         #expect(delta.added == [1, 2])
     }
 
+    private func tab(_ id: UInt32, _ frame: Rect, onScreen: Bool) -> NativeTabWindow {
+        NativeTabWindow(id: id, frame: frame, onScreen: onScreen)
+    }
+
+    private var tile: Rect { Rect(x: 8, y: 41, w: 723, h: 450) }
+    private var spawned: Rect { Rect(x: 8, y: 33, w: 1106, h: 762) }
+    private var corner: Rect { Rect(x: 1460, y: 40, w: 1, h: 450) }
+
+    @Test func tabSwitchRebindsTheOffScreenBackingWindow() {
+        // Cmd+T: the new backing window is on screen at the same frame and
+        // the previous tab has gone off screen. One tile, new id.
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: false)],
+            live: [tab(1, tile, onScreen: false), tab(2, tile, onScreen: true)],
+            focusedId: 2
+        )
+        #expect(plan.rebinds == [RebindPair(from: 1, to: 2)])
+        #expect(plan.drop.isEmpty)
+    }
+
+    @Test func tabSwitchFlickerRebindsWhenBothBackingWindowsAreOnScreen() {
+        // CG briefly lists the old and new tab at the same frame.
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: true)],
+            live: [tab(1, tile, onScreen: true), tab(2, tile, onScreen: true)],
+            focusedId: 2
+        )
+        #expect(plan.rebinds == [RebindPair(from: 1, to: 2)])
+        #expect(plan.drop.isEmpty)
+    }
+
+    @Test func secondOnScreenWindowIsNotATab() {
+        // Cmd+N: the new window is focused and on screen at its own frame.
+        // The existing window stays a tile. Nothing is rebound or dropped.
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: true)],
+            live: [tab(1, tile, onScreen: true), tab(2, spawned, onScreen: true)],
+            focusedId: 2
+        )
+        #expect(plan.rebinds.isEmpty)
+        #expect(plan.drop.isEmpty)
+    }
+
+    @Test func twoRealWindowsStayWhenFocusIsAlreadyModeled() {
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: true), tab(2, spawned, onScreen: true)],
+            live: [tab(1, tile, onScreen: true), tab(2, spawned, onScreen: true)],
+            focusedId: 2
+        )
+        #expect(plan.rebinds.isEmpty)
+        #expect(plan.drop.isEmpty)
+    }
+
+    @Test func inactiveTabSharingAFrameIsDropped() {
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: true), tab(3, tile, onScreen: false)],
+            live: [
+                tab(1, tile, onScreen: true),
+                tab(3, tile, onScreen: false),
+                tab(2, spawned, onScreen: true),
+            ],
+            focusedId: 2
+        )
+        #expect(plan.rebinds.isEmpty)
+        #expect(plan.drop == [3])
+    }
+
+    @Test func tabSwitchOnOneWindowLeavesTheOtherWindow() {
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: false), tab(2, spawned, onScreen: true)],
+            live: [
+                tab(1, tile, onScreen: false),
+                tab(4, tile, onScreen: true),
+                tab(2, spawned, onScreen: true),
+            ],
+            focusedId: 4
+        )
+        #expect(plan.rebinds == [RebindPair(from: 1, to: 4)])
+        #expect(plan.drop.isEmpty)
+    }
+
+    @Test func stashedWindowOnAnotherFrameIsKept() {
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: true), tab(9, corner, onScreen: false)],
+            live: [tab(1, tile, onScreen: true), tab(9, corner, onScreen: false)],
+            focusedId: 1
+        )
+        #expect(plan.rebinds.isEmpty)
+        #expect(plan.drop.isEmpty)
+    }
+
+    @Test func sameFrameDuplicateAlreadyInTheModelIsDropped() {
+        let plan = resolveNativeTabs(
+            managed: [tab(1, tile, onScreen: true), tab(2, tile, onScreen: true)],
+            live: [tab(1, tile, onScreen: true), tab(2, tile, onScreen: true)],
+            focusedId: 2
+        )
+        #expect(plan.rebinds.isEmpty)
+        #expect(plan.drop == [1])
+    }
+
     @Test func massRemovalIsOnlySuspendedWhenLocked() {
         #expect(shouldSuspendMassRemoval(modelCount: 6, removedCount: 4, screenLocked: true))
         #expect(!shouldSuspendMassRemoval(modelCount: 6, removedCount: 2, screenLocked: true))
