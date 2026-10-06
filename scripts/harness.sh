@@ -644,6 +644,26 @@ ghostty_pids() {
   ps -axo pid,comm | grep 'Ghostty.app/Contents/MacOS/ghostty' | grep -v grep | awk '{print $1}'
 }
 
+# A restored session is a real second OS window. Counting that as a tile the
+# test created makes "Cmd-T stays one tile" and "Cmd-N adds one" unmeasurable.
+# The flag overrides the user's Ghostty config for this process only.
+open_test_ghostty() {
+  local before p deadline
+  before="$(ghostty_pids)"
+  open -n -a Ghostty --args --window-save-state=never >/dev/null 2>&1 || true
+  deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    for p in $(ghostty_pids); do
+      if ! printf '%s\n' "$before" | grep -qx "$p"; then
+        echo "$p"
+        return 0
+      fi
+    done
+    sleep 0.4
+  done
+  return 1
+}
+
 pid_count() {
   "$LUMINA" list-windows 2>/dev/null |
     python3 -c '
@@ -1183,20 +1203,7 @@ if [[ "${TABS_TEST:-1}" != "0" ]]; then
   say "native tabs: one Ghostty tile across tab creation and switches"
   saved_tracked="${TRACKED_IDS:-}"
   TRACKED_IDS=""
-  pids_before="$(ghostty_pids)"
-  open -n -a Ghostty >/dev/null 2>&1
-  ghost_pid=""
-  deadline=$((SECONDS + 10))
-  while ((SECONDS < deadline)); do
-    for p in $(ghostty_pids); do
-      if ! printf '%s\n' "$pids_before" | grep -qx "$p"; then
-        ghost_pid="$p"
-        break
-      fi
-    done
-    [[ -n "$ghost_pid" ]] && break
-    sleep 0.4
-  done
+  ghost_pid="$(open_test_ghostty || true)"
   if [[ -z "$ghost_pid" ]]; then
     fail "could not start a test Ghostty instance"
   else
@@ -1213,6 +1220,11 @@ if [[ "${TABS_TEST:-1}" != "0" ]]; then
       printf '   note: no launch-watch line for pid %s (created note handled it)\n' "$ghost_pid"
     fi
     for tab in 1 2 3; do
+      front="$(focus_pid "$ghost_pid")"
+      if [[ "$front" != "$ghost_pid" ]]; then
+        fail "Cmd-T $tab not sent: frontmost pid is ${front:-none}, test pid is $ghost_pid"
+        break
+      fi
       ghostty_new_tab
       sleep 1.2
       managed="$(pid_count "$ghost_pid")"
@@ -1226,6 +1238,11 @@ if [[ "${TABS_TEST:-1}" != "0" ]]; then
     done
     # Tab switching is best effort: the key binding is user-configurable.
     for i in 1 2 3; do
+      front="$(focus_pid "$ghost_pid")"
+      if [[ "$front" != "$ghost_pid" ]]; then
+        fail "tab switch $i not sent: frontmost pid is ${front:-none}, test pid is $ghost_pid"
+        break
+      fi
       ghostty_next_tab
       sleep 0.8
       managed="$(pid_count "$ghost_pid")"
@@ -1278,20 +1295,7 @@ for w in json.load(sys.stdin).get("windows", []):
       fail "geometry did not settle before the Ghostty new-window test"
     fi
     "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || fail "pre-Ghostty snapshot failed"
-    pids_before="$(ghostty_pids)"
-    open -n -a Ghostty >/dev/null 2>&1
-    ghost_pid=""
-    deadline=$((SECONDS + 10))
-    while ((SECONDS < deadline)); do
-      for p in $(ghostty_pids); do
-        if ! printf '%s\n' "$pids_before" | grep -qx "$p"; then
-          ghost_pid="$p"
-          break
-        fi
-      done
-      [[ -n "$ghost_pid" ]] && break
-      sleep 0.4
-    done
+    ghost_pid="$(open_test_ghostty || true)"
     if [[ -z "$ghost_pid" ]]; then
       fail "could not start a test Ghostty instance for Cmd-N"
     else
