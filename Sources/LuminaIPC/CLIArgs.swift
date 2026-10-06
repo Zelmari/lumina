@@ -31,20 +31,28 @@ public enum CLIArgs {
     reload                       reload ~/.config/lumina/lumina.toml
     pause | resume               stop / resume managing windows
     start                        start Lumina on this Space
-    quit                         quit Lumina and untile every window
+    quit | exit | quit-all       quit Lumina and untile every window
     open-config                  open the config file
     grant-accessibility          re-show the Accessibility grant prompt
                                  (reset TCC first to get the prompt again)
+    current-token                print this Space's instance id as JSON
     version                      print the version
+    debug                        print LUMINA_DEBUG; does not contact the agent
+    help                         print this help
+
+    workspace 0 is workspace 10. move-node-to-workspace 0 is the same.
+    Exit 0 is success. Exit 1 is a command error or verify issues.
+    Exit 2 means no agent is running on this Space.
+    Commands with nothing to return print ok. Errors go to stderr.
     """
 
-    /// `version`, `-h`, and `--help` only when they are the command, so
+    /// `version`, `help`, `-h`, and `--help` only when they are the command, so
     /// `lumina focus version` still reaches the agent. `debug` prints the
     /// env flag and exits; it is not an agent command.
     public static func earlyExit(_ argv: [String]) -> CLIEarlyExit? {
         guard let head = argv.dropFirst().first else { return nil }
         switch head {
-        case "-h", "--help": return .help
+        case "-h", "--help", "help": return .help
         case "version": return .version
         case "debug": return .debug
         default: return nil
