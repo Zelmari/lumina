@@ -712,9 +712,11 @@ print(" ".join(ids))
 ' "$1" 2>/dev/null || true
 }
 
-# On-screen windows of one pid that are not managed tiles, or that cover
-# another on-screen window. Empty output is clean. No output when the CG
-# oracle is unavailable, so a machine without swiftc still has the model checks.
+# On-screen windows of one pid that are missing from the model, overlap
+# each other, or cover another tiled window. A floating window sitting on
+# a tile is allowed, same as assert_live_geometry. Empty output is clean.
+# No output when the CG oracle is unavailable, so a machine without swiftc
+# still has the model checks.
 pid_onscreen_problems() {
   local pid="$1"
   [[ -n "$CGWINDOWS_BIN" ]] || return 0
@@ -732,7 +734,8 @@ import json, os
 model = json.loads(os.environ["MODEL"])
 live = json.loads(os.environ["LIVE"])
 pid = int(os.environ["PID"])
-managed = {w["cgWindowId"] for w in model.get("windows", [])}
+roles = {w["cgWindowId"]: w.get("role") for w in model.get("windows", [])}
+managed = set(roles)
 
 def big(w):
     return w.get("onscreen") and w.get("w", 0) >= 80 and w.get("h", 0) >= 80
@@ -743,7 +746,7 @@ def overlap(a, b, slop=4):
     return iw > slop and ih > slop
 
 ours = [w for w in live if w.get("pid") == pid and big(w)]
-others = [w for w in live if w.get("pid") != pid and big(w) and w["cgWindowId"] in managed]
+others = [w for w in live if w.get("pid") != pid and big(w) and roles.get(w["cgWindowId"]) == "tiled"]
 problems = []
 for w in ours:
     if w["cgWindowId"] not in managed:
