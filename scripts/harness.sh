@@ -11,7 +11,7 @@
 # harness has Accessibility and Automation permission (System Settings →
 # Privacy & Security), and TextEdit is available. The script opens and
 # closes TextEdit documents and opens/kills a test Ghostty instance for the
-# native-tabs section; do not run it while you are editing a document.
+# native-tabs and new-window sections; do not run it while you are editing a document.
 #
 # Env:
 #   LUMINA       path to the CLI (default: bundled app, PATH, then .build/debug)
@@ -26,6 +26,7 @@
 #                debug-windows dumps, and geometry.txt)
 #   VERBOSE      set to 1 to print the per-window geometry table every step
 #   TABS_TEST    set to 0 to skip the native-tabs (Ghostty) section
+#   NEW_WINDOW_TEST set to 0 to skip the Ghostty Cmd-N new-window section
 #   BENCH        set to 0 to skip the latency section (default 1)
 #   BENCH_COUNT  pings for `lumina bench` (default 50)
 #   BENCH_WARMUP warmup pings (default 5)
@@ -669,6 +670,81 @@ ghostty_next_tab() {
   osascript -e 'tell application "System Events" to keystroke "]" using {command down, shift down}' >/dev/null 2>&1 || true
 }
 
+# Cmd-N is a new OS window. Cmd-T (ghostty_new_tab) is a tab in the current one.
+ghostty_new_window() {
+  osascript -e 'tell application "System Events" to keystroke "n" using command down' >/dev/null 2>&1 || true
+}
+
+# Keystrokes go to whichever app is frontmost. Pin that to the test pid and
+# return the unix id that actually ended up frontmost.
+focus_pid() {
+  local pid="$1"
+  osascript -e "tell application \"System Events\" to set frontmost of first process whose unix id is $pid to true" >/dev/null 2>&1 || true
+  osascript -e 'tell application "System Events" to unix id of first process whose frontmost is true' 2>/dev/null || true
+}
+
+pid_ids() {
+  "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
+ids = [str(w["cgWindowId"]) for w in json.load(sys.stdin).get("windows", []) if w.get("pid") == pid]
+print(" ".join(ids))
+' "$1" 2>/dev/null || true
+}
+
+# On-screen windows of one pid that are not managed tiles, or that cover
+# another on-screen window. Empty output is clean. No output when the CG
+# oracle is unavailable, so a machine without swiftc still has the model checks.
+pid_onscreen_problems() {
+  local pid="$1"
+  [[ -n "$CGWINDOWS_BIN" ]] || return 0
+  local model pids live
+  model="$("$LUMINA" list-windows 2>/dev/null)" || return 0
+  [[ -n "$model" ]] || return 0
+  pids="$(printf '%s' "$model" | python3 -c '
+import json, sys
+print(" ".join(str(w["pid"]) for w in json.load(sys.stdin).get("windows", [])))
+' 2>/dev/null)"
+  live="$("$CGWINDOWS_BIN" "$pid" $pids 2>/dev/null)" || return 0
+  [[ -n "$live" ]] || return 0
+  MODEL="$model" LIVE="$live" PID="$pid" python3 - <<'PY'
+import json, os
+model = json.loads(os.environ["MODEL"])
+live = json.loads(os.environ["LIVE"])
+pid = int(os.environ["PID"])
+managed = {w["cgWindowId"] for w in model.get("windows", [])}
+
+def big(w):
+    return w.get("onscreen") and w.get("w", 0) >= 80 and w.get("h", 0) >= 80
+
+def overlap(a, b, slop=4):
+    iw = min(a["x"] + a["w"], b["x"] + b["w"]) - max(a["x"], b["x"])
+    ih = min(a["y"] + a["h"], b["y"] + b["h"]) - max(a["y"], b["y"])
+    return iw > slop and ih > slop
+
+ours = [w for w in live if w.get("pid") == pid and big(w)]
+others = [w for w in live if w.get("pid") != pid and big(w) and w["cgWindowId"] in managed]
+problems = []
+for w in ours:
+    if w["cgWindowId"] not in managed:
+        problems.append("unmanaged-onscreen id=%s %.0fx%.0f@%.0f,%.0f" % (
+            w["cgWindowId"], w["w"], w["h"], w["x"], w["y"]))
+for i in range(len(ours)):
+    for j in range(i + 1, len(ours)):
+        a, b = ours[i], ours[j]
+        if overlap(a, b):
+            problems.append("overlap id=%s %.0fx%.0f@%.0f,%.0f vs id=%s %.0fx%.0f@%.0f,%.0f" % (
+                a["cgWindowId"], a["w"], a["h"], a["x"], a["y"],
+                b["cgWindowId"], b["w"], b["h"], b["x"], b["y"]))
+for w in ours:
+    for other in others:
+        if overlap(w, other):
+            problems.append("covers id=%s pid=%s vs id=%s pid=%s" % (
+                w["cgWindowId"], w.get("pid"), other["cgWindowId"], other.get("pid")))
+print("\n".join(problems))
+PY
+}
+
 say "Lumina at $LUMINA"
 if ! "$LUMINA" status >/dev/null 2>&1; then
   echo "agent is not answering; start Lumina on this Space first." >&2
@@ -1169,6 +1245,147 @@ if [[ "${TABS_TEST:-1}" != "0" ]]; then
   fi
   TRACKED_IDS="$saved_tracked"
   verify "after native tabs"
+fi
+
+# Cmd-N is a new window, not a tab. Each one joins the tile tree beside the
+# windows already on the workspace. Collapsing it into the existing Ghostty
+# tile leaves the old window on screen and stacks later windows on top of
+# every other app. A dedicated instance is opened and killed, same as tabs.
+if [[ "${NEW_WINDOW_TEST:-1}" != "0" ]]; then
+  say "Ghostty Cmd-N opens a new tiled window"
+  focused="$("$LUMINA" list-workspaces 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["focused"])' 2>/dev/null || true)"
+  te_ids="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+focused = int(sys.argv[1])
+for w in json.load(sys.stdin).get("windows", []):
+    if w.get("space") == focused and w.get("role") == "tiled" and w.get("bundleId") == "com.apple.TextEdit":
+        print(w["cgWindowId"])
+' "$focused" 2>/dev/null || true)"
+  if [[ -z "$te_ids" ]]; then
+    open_windows 1 || true
+    te_ids="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+focused = int(sys.argv[1])
+for w in json.load(sys.stdin).get("windows", []):
+    if w.get("space") == focused and w.get("role") == "tiled" and w.get("bundleId") == "com.apple.TextEdit":
+        print(w["cgWindowId"])
+' "$focused" 2>/dev/null || true)"
+  fi
+  if [[ -z "$te_ids" ]]; then
+    fail "no tiled TextEdit on the focused workspace to tile beside"
+  else
+    if ! wait_for_stable_geometry; then
+      fail "geometry did not settle before the Ghostty new-window test"
+    fi
+    "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || fail "pre-Ghostty snapshot failed"
+    pids_before="$(ghostty_pids)"
+    open -n -a Ghostty >/dev/null 2>&1
+    ghost_pid=""
+    deadline=$((SECONDS + 10))
+    while ((SECONDS < deadline)); do
+      for p in $(ghostty_pids); do
+        if ! printf '%s\n' "$pids_before" | grep -qx "$p"; then
+          ghost_pid="$p"
+          break
+        fi
+      done
+      [[ -n "$ghost_pid" ]] && break
+      sleep 0.4
+    done
+    if [[ -z "$ghost_pid" ]]; then
+      fail "could not start a test Ghostty instance for Cmd-N"
+    else
+      if wait_for_pid_count "$ghost_pid" 1; then
+        pass "first Ghostty window adopted"
+      else
+        fail "first Ghostty window was not adopted (managed $(pid_count "$ghost_pid"))"
+      fi
+      if ! wait_for_stable_geometry; then
+        fail "geometry did not settle after the first Ghostty window"
+      fi
+      verify "after first Ghostty window for Cmd-N"
+      "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null || true
+      moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+      if [[ -n "$moved" ]]; then
+        pass "existing tiles reflowed when Ghostty joined"
+      else
+        fail "no existing tile moved when the first Ghostty window was adopted"
+        geometry_table | sed 's/^/      /'
+      fi
+      kept_ids="$(pid_ids "$ghost_pid")"
+      for n in 1 2; do
+        front="$(focus_pid "$ghost_pid")"
+        if [[ "$front" != "$ghost_pid" ]]; then
+          fail "Cmd-N $n not sent: frontmost pid is ${front:-none}, test pid is $ghost_pid"
+          break
+        fi
+        ghostty_new_window
+        want=$((n + 1))
+        sleep 0.6
+        if wait_for_pid_count "$ghost_pid" "$want"; then
+          if ! wait_for_stable_geometry; then
+            fail "geometry did not settle after Cmd-N $n"
+          fi
+          managed="$(pid_count "$ghost_pid")"
+          if [[ "$managed" -eq "$want" ]]; then
+            pass "after Cmd-N $n: Ghostty has $want managed windows"
+          else
+            fail "after Cmd-N $n: Ghostty settled at $managed managed windows (want $want)"
+            geometry_table | sed 's/^/      /'
+          fi
+        else
+          fail "after Cmd-N $n: Ghostty has $(pid_count "$ghost_pid") managed windows (want $want)"
+          geometry_table | sed 's/^/      /'
+        fi
+        missing=""
+        now_ids="$(pid_ids "$ghost_pid")"
+        for id in $kept_ids; do
+          case " $now_ids " in
+            *" $id "*) ;;
+            *) missing="$missing $id" ;;
+          esac
+        done
+        if [[ -z "$missing" ]]; then
+          pass "after Cmd-N $n: earlier Ghostty windows stayed in the model"
+        else
+          fail "after Cmd-N $n: Ghostty windows left the model:$missing"
+        fi
+        problems="$(pid_onscreen_problems "$ghost_pid")"
+        if [[ -n "$problems" ]]; then
+          fail "after Cmd-N $n: Ghostty windows overlap or sit outside the model"
+          printf '%s\n' "$problems" | sed 's/^/      /'
+        else
+          pass "after Cmd-N $n: on-screen Ghostty windows match their tiles"
+        fi
+        verify "after Ghostty Cmd-N $n"
+        kept_ids="$now_ids"
+      done
+      "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null || true
+      moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+      te_moved=""
+      for id in $te_ids; do
+        case " $moved " in
+          *" $id "*) te_moved="$te_moved $id" ;;
+        esac
+      done
+      if [[ -n "$te_moved" ]]; then
+        pass "TextEdit still reflowed after Cmd-N:$te_moved"
+      else
+        # A spiral split of the Ghostty tile does not move every sibling.
+        # Falling all the way back to the pre-Ghostty frames means the new
+        # windows never joined that tree.
+        fail "TextEdit frames match the pre-Ghostty snapshot after Cmd-N (ids: $te_ids)"
+        geometry_table | sed 's/^/      /'
+      fi
+      kill "$ghost_pid" >/dev/null 2>&1 || true
+      if wait_for_pid_count "$ghost_pid" 0; then
+        pass "Cmd-N test Ghostty instance removed"
+      else
+        fail "Cmd-N test Ghostty instance still managed"
+      fi
+      verify "after Ghostty new-window cleanup"
+    fi
+  fi
 fi
 
 # Shield recovery: a crash or force-quit can leave a hide-until-tiled app
