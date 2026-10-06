@@ -152,6 +152,10 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 | `BENCH_MAX_P95_MS` | Fail when IPC round-trip p95 exceeds this (default 25) |
 | `BENCH_STRICT=1` | Gate on launch-to-frame (default 500ms) and menu-push latency (default 250ms) |
 | `BENCH_LAUNCH_MAX_MS` / `BENCH_MENU_MAX_MS` | Thresholds for the strict gates |
+| `BENCH_COLD_MAX_MS` | Strict gate for the CG-measured cold launch, including the app's own launch time (default 3000ms) |
+| `LAUNCH_TEST=0` | Skip the cold-launch CG measurement |
+| `FEATURE_TEST=0` | Skip the speculative-tile and hide-until-tiled checks (they temporarily add config keys and restore the file) |
+| `SHIELD_BOOT_TEST=1` | Also quit and restart Lumina to check a hidden app is revealed at boot |
 | `LUMINA_LOG` | Agent log path (default `~/Library/Logs/Lumina.log`) |
 
 ## Known behavior
