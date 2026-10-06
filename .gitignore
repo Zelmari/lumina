@@ -191,11 +191,10 @@ core.*
 *.local.sh
 *.local.swift
 
+# Local agent instructions. Contributor rules live in CONTRIBUTING.md.
 skills/
 AGENTS.md
 CLAUDE.md
 
-// Plans is intentionally gitignored, the PROMPTS file is explicitly mentioned because at times i
-// choose to unignore plans but usually intend to keep specifically PROMPTS.md gitignored
+# Design notes stay local.
 plans/
-plans/PROMPTS.md

@@ -15,6 +15,12 @@ swift test --filter LuminaLayoutTests
 swift test --filter LuminaIPCTests
 ```
 
+On a Mac, `swift test` needs the Xcode toolchain. Command Line Tools do not ship the `Testing` module:
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+```
+
 On an Apple silicon Mac, assemble a local, ad-hoc-signed release `.app`:
 
 ```sh
@@ -30,6 +36,8 @@ That produces `dist/Lumina.app`:
 | CLI | `Contents/MacOS/lumina` | socket client only |
 
 `file` on all three Mach-Os should be arm64, not universal. `Contents/MacOS/lumina version` prints the CLI version.
+
+Launch that build with `open dist/Lumina.app`. `open -a Lumina` opens whichever copy is registered, which may be an older one.
 
 Grant Accessibility to **Lumina Agent**, not the menu extra and not a Homebrew symlink of `lumina`. `bundle.sh` pins the ad-hoc designated requirement to the agent bundle id so local rebuilds should keep that grant. A Developer ID build still uses the cert’s requirement (see below).
 
