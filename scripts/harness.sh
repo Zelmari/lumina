@@ -27,6 +27,10 @@
 #   VERBOSE      set to 1 to print the per-window geometry table every step
 #   TABS_TEST    set to 0 to skip the native-tabs (Ghostty) section
 #   NEW_WINDOW_TEST set to 0 to skip the Ghostty Cmd-N new-window section
+#   GHOSTTY_SPACES_TEST set to 0 to skip the multi-workspace Ghostty section
+#                (one window on workspaces 2-4, an empty 5, five on 2 with
+#                focus and swap, nine on 3, a tenth that overlaps, and
+#                lumina close)
 #   BENCH        set to 0 to skip the latency section (default 1)
 #   BENCH_COUNT  pings for `lumina bench` (default 50)
 #   BENCH_WARMUP warmup pings (default 5)
@@ -35,8 +39,10 @@
 #                BENCH_LAUNCH_MAX_MS (default 500) or the menu push takes
 #                longer than BENCH_MENU_MAX_MS (default 250)
 #   LAUNCH_TEST  set to 0 to skip the cold-launch CG measurement (default 1)
-#   FEATURE_TEST set to 0 to skip speculative-tile and hide-until-tiled
-#                checks; both temporarily edit the config and restore it
+#   FEATURE_TEST set to 0 to skip the config checks (gaps, a float window
+#                rule, an ignore rule, a rejected config file,
+#                focus-follows-mouse, launch-tiling, speculative-tile,
+#                and hide-until-tiled). They edit the config and restore it
 #                (default 1)
 #   SHIELD_BOOT_TEST set to 1 to also restart Lumina to check that an app
 #                left hidden by a previous agent is revealed at boot
@@ -682,6 +688,25 @@ wait_for_pid_count() {
   return 1
 }
 
+wait_for_pid_tiled() {
+  local pid="$1" space="$2" deadline=$((SECONDS + 8))
+  while ((SECONDS < deadline)); do
+    if "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
+space = int(sys.argv[2])
+for w in json.load(sys.stdin).get("windows", []):
+    if w.get("pid") == pid and w.get("space") == space and w.get("role") == "tiled":
+        sys.exit(0)
+sys.exit(1)
+' "$pid" "$space" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 ghostty_new_tab() {
   osascript -e 'tell application "System Events" to keystroke "t" using command down' >/dev/null 2>&1 || true
 }
@@ -703,6 +728,28 @@ focus_pid() {
   osascript -e 'tell application "System Events" to unix id of first process whose frontmost is true' 2>/dev/null || true
 }
 
+# Point the agent at a TextEdit tile on the workspace that is already
+# focused. Activating TextEdit follows whichever document macOS considers
+# frontmost, including a sole window on another workspace, and every later
+# check then runs against that one-window space.
+focus_textedit() {
+  local space deadline id bundle win_space
+  space="$(focused_workspace)"
+  deadline=$((SECONDS + 4))
+  while ((SECONDS < deadline)); do
+    id="$(focused_window_id)"
+    bundle="$(window_field "$id" bundleId)"
+    win_space="$(window_field "$id" space)"
+    if [[ "$bundle" == "com.apple.TextEdit" && "$win_space" == "$space" && "$(window_field "$id" role)" == "tiled" ]]; then
+      printf '%s\n' "$id"
+      return 0
+    fi
+    run focus right >/dev/null
+    sleep 0.15
+  done
+  return 1
+}
+
 focused_window_id() {
   "$LUMINA" status 2>/dev/null | python3 -c '
 import json, sys
@@ -711,6 +758,76 @@ try:
 except Exception:
     value = None
 print("" if value is None else value)
+' 2>/dev/null || true
+}
+
+window_field() {
+  "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+want = int(sys.argv[1])
+field = sys.argv[2]
+for w in json.load(sys.stdin).get("windows", []):
+    if int(w.get("cgWindowId") or 0) == want:
+        value = w.get(field)
+        print("" if value is None else value)
+        break
+' "$1" "$2" 2>/dev/null || true
+}
+
+window_frame() {
+  local x y w h
+  x="$(window_field "$1" x)"
+  y="$(window_field "$1" y)"
+  w="$(window_field "$1" w)"
+  h="$(window_field "$1" h)"
+  [[ -n "$x" ]] || return 0
+  python3 -c 'import sys; print("%d,%d,%d,%d" % tuple(round(float(v)) for v in sys.argv[1:]))' "$x" "$y" "$w" "$h" 2>/dev/null || true
+}
+
+focused_workspace() {
+  "$LUMINA" list-workspaces 2>/dev/null | python3 -c '
+import json, sys
+try: print(int(json.load(sys.stdin).get("focused") or 0))
+except Exception: print(0)
+' 2>/dev/null || echo 0
+}
+
+count_role_on_space() {
+  "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+space = int(sys.argv[1])
+role = sys.argv[2]
+print(sum(1 for w in json.load(sys.stdin).get("windows", []) if w.get("space") == space and w.get("role") == role))
+' "$1" "$2" 2>/dev/null || echo 0
+}
+
+status_flag() {
+  "$LUMINA" status 2>/dev/null | python3 -c '
+import json, sys
+try: print(json.load(sys.stdin).get(sys.argv[1]))
+except Exception: print("")
+' "$1" 2>/dev/null || true
+}
+
+# Live on-screen overlap among the given pids. Empty output is clean.
+# Stashed windows are off the display and are not counted.
+live_overlap_pids() {
+  [[ -n "$CGWINDOWS_BIN" ]] || return 0
+  [[ -n "${1// }" ]] || return 0
+  # shellcheck disable=SC2086
+  "$CGWINDOWS_BIN" $1 2>/dev/null | python3 -c '
+import json, sys
+rows = [w for w in json.load(sys.stdin) if w.get("onscreen") and w["w"] >= 20 and w["h"] >= 20 and w["x"] < 1600 and w["y"] < 980]
+def overlap(a, b, slop=8):
+    ax, ay, ax2, ay2 = a["x"], a["y"], a["x"] + a["w"], a["y"] + a["h"]
+    bx, by, bx2, by2 = b["x"], b["y"], b["x"] + b["w"], b["y"] + b["h"]
+    return min(ax2, bx2) - max(ax, bx) > slop and min(ay2, by2) - max(ay, by) > slop
+lines = []
+for i in range(len(rows)):
+    for j in range(i + 1, len(rows)):
+        if overlap(rows[i], rows[j]):
+            lines.append("overlap pid=%s pid=%s" % (rows[i]["pid"], rows[j]["pid"]))
+print("\n".join(lines))
 ' 2>/dev/null || true
 }
 
@@ -829,34 +946,216 @@ run workspace 1 >/dev/null
 verify "back on workspace 1"
 
 say "focus movement"
+focus_before="$(focused_window_id)"
 run focus right >/dev/null
 verify "after focus right"
-run focus left >/dev/null
-verify "after focus left"
+focus_after="$(focused_window_id)"
+if [[ -n "$focus_before" && "$focus_after" != "$focus_before" ]]; then
+  pass "focus right moved to window $focus_after"
+else
+  run focus left >/dev/null
+  focus_after="$(focused_window_id)"
+  if [[ -n "$focus_before" && "$focus_after" != "$focus_before" ]]; then
+    pass "focus left moved to window $focus_after"
+  else
+    fail "focus did not leave window ${focus_before:-none}"
+  fi
+fi
+run focus up >/dev/null
+verify "after focus up"
+run focus down >/dev/null
+verify "after focus down"
 
 say "swap"
+swap_id="$(focused_window_id)"
+swap_before="$(window_frame "$swap_id")"
 run swap right >/dev/null
 verify "after swap right"
-run swap left >/dev/null
-verify "after swap left"
-
-say "float toggle"
-run float-toggle >/dev/null
-verify "after float on"
-run float-toggle >/dev/null
-verify "after float off"
-
-say "lumina fullscreen"
-run fullscreen lumina >/dev/null
-verify "in fullscreen"
-run fullscreen lumina >/dev/null
-verify "after fullscreen exit"
+swap_after="$(window_frame "$swap_id")"
+if [[ -n "$swap_before" && "$swap_after" != "$swap_before" ]]; then
+  pass "swap right moved window $swap_id"
+else
+  run swap left >/dev/null
+  swap_after="$(window_frame "$swap_id")"
+  if [[ -n "$swap_before" && "$swap_after" != "$swap_before" ]]; then
+    pass "swap left moved window $swap_id"
+  else
+    fail "swap did not move window ${swap_id:-none}"
+  fi
+fi
+run swap up >/dev/null
+verify "after swap up"
+run swap down >/dev/null
+verify "after swap down"
 
 say "resize and balance"
-run resize grow >/dev/null
-run resize shrink >/dev/null
-run balance >/dev/null
+focus_textedit >/dev/null || fail "could not focus a tiled TextEdit for resize"
+resize_space="$(focused_workspace)"
+resize_tiled="$(count_role_on_space "$resize_space" tiled)"
+if [[ "${resize_tiled:-0}" -lt 2 ]]; then
+  fail "resize needs at least two tiled windows on workspace $resize_space (have ${resize_tiled:-0})"
+elif ! "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || [[ ! -s "$TMP_BEFORE" ]]; then
+  fail "geometry snapshot before resize failed"
+else
+  run resize grow >/dev/null
+  if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+    grown="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+    if [[ -n "$grown" ]]; then
+      pass "resize grow moved:$grown"
+    else
+      fail "resize grow did not move a window"
+    fi
+    if "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null && [[ -s "$TMP_BEFORE" ]]; then
+      run resize shrink >/dev/null
+      if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+        shrunk="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+        if [[ -n "$shrunk" ]]; then
+          pass "resize shrink moved:$shrunk"
+        else
+          fail "resize shrink did not move a window"
+        fi
+      else
+        fail "geometry snapshot after resize shrink failed"
+      fi
+    else
+      fail "geometry snapshot before resize shrink failed"
+    fi
+    run resize grow >/dev/null
+    if "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null && [[ -s "$TMP_BEFORE" ]]; then
+      run balance >/dev/null
+      if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+        balanced="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+        if [[ -n "$balanced" ]]; then
+          pass "balance moved:$balanced"
+        else
+          fail "balance did not move a window"
+        fi
+      else
+        fail "geometry snapshot after balance failed"
+      fi
+    else
+      fail "geometry snapshot before balance failed"
+    fi
+  else
+    fail "geometry snapshot after resize grow failed"
+  fi
+fi
 verify "after resize/balance"
+
+say "native fullscreen"
+nf_id="$(focus_textedit || true)"
+if [[ -z "$nf_id" ]]; then
+  fail "could not focus a tiled TextEdit for native fullscreen"
+else
+  nf_pid="$(window_field "$nf_id" pid)"
+  run fullscreen native >/dev/null
+  nf_gone=0
+  nf_deadline=$((SECONDS + 6))
+  while ((SECONDS < nf_deadline)); do
+    if [[ -z "$(window_field "$nf_id" role)" ]]; then
+      nf_gone=1
+      break
+    fi
+    sleep 0.3
+  done
+  if (( nf_gone == 1 )); then
+    pass "native fullscreen detached TextEdit $nf_id"
+    run fullscreen native >/dev/null
+    nf_back=0
+    nf_deadline=$((SECONDS + 6))
+    while ((SECONDS < nf_deadline)); do
+      if [[ -n "$nf_pid" ]] && "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
+for w in json.load(sys.stdin).get("windows", []):
+    if w.get("pid") == pid and w.get("role") == "tiled":
+        sys.exit(0)
+sys.exit(1)
+' "$nf_pid" 2>/dev/null; then
+        nf_back=1
+        break
+      fi
+      sleep 0.3
+    done
+    if (( nf_back == 1 )); then
+      pass "native fullscreen exit tiled TextEdit pid $nf_pid again"
+    else
+      fail "native fullscreen exit did not retile TextEdit pid ${nf_pid:-none}"
+      run fullscreen native >/dev/null || true
+    fi
+  else
+    fail "native fullscreen left TextEdit $nf_id in the model (role $(window_field "$nf_id" role))"
+    run fullscreen native >/dev/null || true
+  fi
+  # TextEdit replaces the window and comes back zoomed to the screen.
+  # setFrame does not stick, and the id is then dropped from the model.
+  # This process is only the fullscreen probe. Close it before geometry
+  # checks so the zoomed frame is not scored against the other tiles.
+  if [[ -n "$nf_pid" ]]; then
+    kill -9 "$nf_pid" >/dev/null 2>&1 || true
+    nf_deadline=$((SECONDS + 4))
+    while ((SECONDS < nf_deadline)); do
+      if ! kill -0 "$nf_pid" 2>/dev/null && [[ -z "$(window_field "$nf_id" role)" ]]; then
+        break
+      fi
+      sleep 0.2
+    done
+  fi
+  if [[ -n "$nf_id" ]]; then
+    TRACKED_IDS="$(printf '%s' "$TRACKED_IDS" | tr ' ' '\n' | grep -v "^${nf_id}$" | tr '\n' ' ')"
+  fi
+  verify "after native fullscreen"
+fi
+
+say "float toggle"
+float_id="$(focus_textedit || true)"
+if [[ -z "$float_id" ]]; then
+  fail "could not focus a tiled TextEdit for float-toggle"
+else
+  run float-toggle >/dev/null
+  verify "after float on"
+  float_role="$(window_field "$float_id" role)"
+  if [[ "$float_role" == "floating" ]]; then
+    pass "window $float_id is floating"
+  else
+    fail "float-toggle left window $float_id as ${float_role:-missing}"
+  fi
+  run float-toggle >/dev/null
+  verify "after float off"
+  float_role="$(window_field "$float_id" role)"
+  if [[ "$float_role" == "tiled" ]]; then
+    pass "window $float_id is tiled again"
+  else
+    fail "float-toggle did not retile window $float_id (role ${float_role:-missing})"
+  fi
+fi
+
+say "lumina fullscreen"
+fs_id="$(focus_textedit || true)"
+fs_space="$(focused_workspace)"
+fs_before="$(count_role_on_space "$fs_space" tiled)"
+if [[ -z "$fs_id" ]]; then
+  fail "could not focus a tiled TextEdit for fullscreen"
+else
+  run fullscreen lumina >/dev/null
+  verify "in fullscreen"
+  fs_role="$(window_field "$fs_id" role)"
+  fs_during="$(count_role_on_space "$fs_space" tiled)"
+  if [[ "$fs_role" == "luminaFS" && "$fs_during" == "0" ]]; then
+    pass "lumina fullscreen parked the other tiles"
+  else
+    fail "lumina fullscreen role=${fs_role:-missing} tiled=$fs_during (was $fs_before)"
+  fi
+  run fullscreen lumina >/dev/null
+  verify "after fullscreen exit"
+  fs_role="$(window_field "$fs_id" role)"
+  fs_after="$(count_role_on_space "$fs_space" tiled)"
+  if [[ "$fs_role" == "tiled" && "$fs_after" == "$fs_before" ]]; then
+    pass "fullscreen exit restored $fs_after tiled windows"
+  else
+    fail "fullscreen exit role=${fs_role:-missing} tiled=$fs_after (was $fs_before)"
+  fi
+fi
 
 # Closing one window (app stays running) must reflow the remaining tiles.
 # The live-geometry oracle inside verify catches a stale tile/coverage hole.
@@ -910,12 +1209,44 @@ else
   fi
 fi
 
+say "workspace next and prev"
+space_before="$(focused_workspace)"
+run workspace next >/dev/null
+space_next="$(focused_workspace)"
+if [[ "$space_next" != "$space_before" && "$space_next" != "0" ]]; then
+  pass "workspace next left $space_before for $space_next"
+else
+  fail "workspace next stayed on ${space_next:-none}"
+fi
+verify "after workspace next"
+run workspace prev >/dev/null
+space_back="$(focused_workspace)"
+if [[ "$space_back" == "$space_before" ]]; then
+  pass "workspace prev returned to $space_back"
+else
+  fail "workspace prev landed on $space_back (wanted $space_before)"
+fi
+verify "after workspace prev"
+
 say "move window to workspace 2 and back"
+move_id="$(focused_window_id)"
 run move-node-to-workspace 2 >/dev/null
 verify "after move to 2"
+move_space="$(window_field "$move_id" space)"
+if [[ "$move_space" == "2" ]]; then
+  pass "window $move_id is on workspace 2"
+else
+  fail "window $move_id is on workspace ${move_space:-none} after the move"
+fi
 run workspace 2 >/dev/null
 verify "on workspace 2 after move"
 run move-node-to-workspace 1 >/dev/null
+move_space="$(window_field "$move_id" space)"
+if [[ "$move_space" == "1" ]]; then
+  pass "window $move_id is back on workspace 1"
+else
+  fail "window $move_id is on workspace ${move_space:-none} after moving back"
+fi
 run workspace 1 >/dev/null
 verify "back on workspace 1"
 
@@ -954,9 +1285,96 @@ else
   pass "configured space count is $configured; the 5-workspace minimum covers it"
 fi
 
+say "workspace 0 is workspace 10"
+if [[ "$(status_space_count)" -ge 10 ]]; then
+  run workspace 0 >/dev/null
+  if [[ "$(focused_workspace)" == "10" ]]; then
+    pass "workspace 0 focused workspace 10"
+  else
+    fail "workspace 0 focused workspace $(focused_workspace)"
+  fi
+  verify "on workspace 10"
+  run workspace 1 >/dev/null
+  verify "back from workspace 10"
+else
+  pass "space count is $(status_space_count); workspace 0 is workspace 10 only when that space exists"
+fi
+
 say "reload config"
 run reload >/dev/null
 verify "after reload"
+
+say "pause freezes layout commands"
+if ! "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null; then
+  fail "geometry snapshot before pause failed"
+else
+  run pause >/dev/null
+  if [[ "$(status_flag paused)" == "True" ]]; then
+    pass "agent is paused"
+  else
+    fail "pause left paused=$(status_flag paused)"
+  fi
+  run resize grow >/dev/null
+  if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null; then
+    paused_moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+    if [[ -z "$paused_moved" ]]; then
+      pass "resize while paused did not move a window"
+    else
+      fail "resize while paused moved:$paused_moved"
+    fi
+  else
+    fail "geometry snapshot during pause failed"
+  fi
+  run resume >/dev/null
+  if [[ "$(status_flag paused)" == "False" ]]; then
+    pass "agent resumed"
+  else
+    fail "resume left paused=$(status_flag paused)"
+  fi
+  verify "after resume"
+fi
+
+say "version, ping, and debug dump"
+ver="$("$LUMINA" version 2>&1)" || fail "version command failed"
+if [[ -n "$ver" ]]; then
+  pass "version: $ver"
+else
+  fail "version printed nothing"
+fi
+ping_out="$("$LUMINA" ping 2>&1)" || fail "ping failed: $ping_out"
+if printf '%s' "$ping_out" | grep -q 'pong'; then
+  pass "ping answered"
+else
+  fail "ping did not answer pong: $ping_out"
+fi
+dump="$("$LUMINA" debug-windows 2>&1)" || fail "debug-windows failed: $dump"
+if [[ -f "$dump" ]] && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$dump" >/dev/null 2>&1; then
+  pass "debug-windows wrote JSON"
+else
+  fail "debug-windows did not write JSON (${dump:-no path})"
+fi
+help_out="$("$LUMINA" --help 2>&1)" || fail "help failed: $help_out"
+if printf '%s' "$help_out" | grep -q 'workspace'; then
+  pass "help lists the commands"
+else
+  fail "help did not list commands: $help_out"
+fi
+debug_out="$("$LUMINA" debug 2>&1)" || fail "debug failed: $debug_out"
+if printf '%s' "$debug_out" | grep -q 'LUMINA_DEBUG='; then
+  pass "debug reports the env flag"
+else
+  fail "debug did not report LUMINA_DEBUG: $debug_out"
+fi
+token_out="$("$LUMINA" current-token 2>&1)" || fail "current-token failed: $token_out"
+token_id="$(printf '%s' "$token_out" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("instanceId") or "")
+except Exception: print("")' 2>/dev/null)"
+status_id="$(status_flag instanceId)"
+if [[ -n "$token_id" && "$token_id" == "$status_id" ]]; then
+  pass "current-token matches status"
+else
+  fail "current-token ${token_id:-none} does not match status ${status_id:-none}"
+fi
 
 # Latency: pure IPC round trips (no Accessibility needed) and the agent's
 # recorded event-to-frame time. The IPC gate is always on; the frame gate is
@@ -1120,6 +1538,87 @@ except Exception: print("")' 2>/dev/null)"
   fi
 
   if [[ "${FEATURE_TEST:-1}" != "0" && -n "$CGWINDOWS_BIN" && -f "$CONFIG_PATH" ]]; then
+    say "config: gaps, focus-follows-mouse, launch-tiling, float rule"
+    backup_config
+    if [[ -z "$CONFIG_BACKUP" ]]; then
+      fail "could not back up $CONFIG_PATH"
+    else
+      python3 - "$CONFIG_PATH" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+def num(key, default):
+    m = re.search(r'(?m)^%s\s*=\s*(\d+)' % key, text)
+    return int(m.group(1)) if m else default
+inner, outer = num("inner", 8), num("outer", 8)
+new_inner, new_outer = inner + 16, outer + 24
+def widen(body):
+    body = re.sub(r'(?m)^inner\s*=\s*\d+', 'inner = %d' % new_inner, body, count=1)
+    body = re.sub(r'(?m)^outer\s*=\s*\d+', 'outer = %d' % new_outer, body, count=1)
+    if not re.search(r'(?m)^inner\s*=', body):
+        body = body.rstrip() + '\ninner = %d\n' % new_inner
+    if not re.search(r'(?m)^outer\s*=', body):
+        body = body.rstrip() + '\nouter = %d\n' % new_outer
+    return body
+if re.search(r'(?m)^\[gaps\]', text):
+    gap = re.search(r'(?ms)^\[gaps\][^\[]*', text)
+    if gap:
+        text = text[:gap.start()] + widen(gap.group(0)) + text[gap.end():]
+else:
+    text += '\n[gaps]\ninner = %d\nouter = %d\n' % (new_inner, new_outer)
+lines = text.splitlines()
+def drop(key, rows):
+    return [row for row in rows if not row.strip().startswith(key + " ") and not row.strip().startswith(key + "=")]
+lines = drop("focus-follows-mouse", lines)
+lines = drop("launch-tiling", lines)
+stripped = [row.strip() for row in lines]
+idx = next((i for i, s in enumerate(stripped) if s.startswith("[")), len(lines))
+lines.insert(idx, 'launch-tiling = "new-only"')
+lines.insert(idx, "focus-follows-mouse = true")
+text = "\n".join(lines) + "\n"
+text += '\n[[window-rule]]\napp-id = "com.apple.TextEdit"\naction = "float"\n'
+open(path, "w").write(text)
+PY
+      if ! "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null || [[ ! -s "$TMP_BEFORE" ]]; then
+        fail "geometry snapshot before the gap change failed"
+      else
+        run reload >/dev/null
+        sleep 0.6
+        if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+          gap_moved="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+          if [[ -n "$gap_moved" ]]; then
+            pass "larger gaps reflowed tiles:$gap_moved"
+          else
+            fail "larger gaps did not move a tile"
+          fi
+        else
+          fail "geometry snapshot after the gap change failed"
+        fi
+      fi
+      rule_before="$(window_ids)"
+      rule_pids_before="$(pgrep -x TextEdit 2>/dev/null | tr '\n' ' ' || true)"
+      open_windows 1
+      rule_id="$(new_textedit_id "$rule_before")"
+      rule_role="$(window_field "$rule_id" role)"
+      if [[ "$rule_role" == "floating" ]]; then
+        pass "window rule floated the new TextEdit ($rule_id)"
+      else
+        fail "window rule left the new TextEdit ${rule_role:-unmanaged} (id ${rule_id:-none})"
+      fi
+      rule_pid="$(window_field "$rule_id" pid)"
+      case " $rule_pids_before " in
+        *" $rule_pid "*)
+          osascript -e 'tell application "TextEdit" to close front window saving no' >/dev/null 2>&1 || true
+          ;;
+        *)
+          kill_test_instance "$rule_pid" >/dev/null 2>&1 || true
+          ;;
+      esac
+      restore_config
+      sleep 0.6
+      verify "after config restore"
+    fi
+
     say "launch concealment: speculative tile"
     set_config_top_level speculative-tile true
     "$LUMINA" reload >/dev/null 2>&1
@@ -1196,6 +1695,67 @@ except Exception: print("")' 2>/dev/null)"
     fi
     restore_config
     sleep 0.6
+
+    say "config: ignore rule and a rejected file"
+    backup_config
+    if [[ -z "$CONFIG_BACKUP" ]]; then
+      fail "could not back up $CONFIG_PATH for the ignore rule"
+    else
+      printf '\n[[window-rule]]\napp-id = "com.apple.TextEdit"\naction = "ignore"\n' >> "$CONFIG_PATH"
+      run reload >/dev/null
+      sleep 0.4
+      ignore_before="$(window_ids)"
+      ignore_pids="$(pgrep -x TextEdit 2>/dev/null | tr '\n' ' ' || true)"
+      open -n -a TextEdit >/dev/null 2>&1 || fail "could not launch TextEdit for the ignore rule"
+      ignore_deadline=$((SECONDS + 4))
+      ignore_id=""
+      while ((SECONDS < ignore_deadline)); do
+        ignore_id="$(new_textedit_id "$ignore_before")"
+        [[ -n "$ignore_id" ]] && break
+        sleep 0.3
+      done
+      if [[ -z "$ignore_id" ]]; then
+        pass "ignore rule left the new TextEdit unmanaged"
+      else
+        fail "ignore rule adopted TextEdit $ignore_id as $(window_field "$ignore_id" role)"
+      fi
+      for ignore_pid in $(pgrep -x TextEdit 2>/dev/null || true); do
+        case " $ignore_pids " in
+          *" $ignore_pid "*) ;;
+          *) kill -9 "$ignore_pid" >/dev/null 2>&1 || true ;;
+        esac
+      done
+      restore_config
+      sleep 0.4
+      backup_config
+      if [[ -z "$CONFIG_BACKUP" ]]; then
+        fail "could not back up $CONFIG_PATH before the broken config"
+      else
+        printf 'this is not toml [\n' > "$CONFIG_PATH"
+        bad_reload=0
+        "$LUMINA" reload >/dev/null 2>&1 || bad_reload=1
+        if [[ "$bad_reload" == "1" ]]; then
+          pass "reload rejected a broken config"
+        else
+          fail "reload accepted a broken config"
+        fi
+        bad_error="$(status_flag configError)"
+        if [[ -n "$bad_error" && "$bad_error" != "None" && "$bad_error" != "null" ]]; then
+          pass "status reports the config error"
+        else
+          fail "status configError is empty after a broken config"
+        fi
+        restore_config
+        sleep 0.4
+        restored_error="$(status_flag configError)"
+        if [[ -z "$restored_error" || "$restored_error" == "None" || "$restored_error" == "null" ]]; then
+          pass "config error cleared after restore"
+        else
+          fail "config error still set after restore ($restored_error)"
+        fi
+        verify "after rejected config"
+      fi
+    fi
   fi
 
   if [[ "${BENCH_STRICT:-0}" == "1" ]]; then
@@ -1421,6 +1981,370 @@ for w in json.load(sys.stdin).get("windows", []):
       verify "after Ghostty new-window cleanup"
     fi
   fi
+fi
+
+# The showcase opens Ghostty across workspaces 2-5 and fills workspace 3 to
+# the largest set that still tiles. This section checks that sequence with
+# assertions and then puts the windows away. It does not quit Lumina.
+# Nine is the measured maximum on a 1454x907 tile area (8pt gaps): the
+# tenth window's live frame overlaps a neighbour.
+if [[ "${GHOSTTY_SPACES_TEST:-1}" != "0" ]]; then
+  say "ghostty across workspaces"
+  GHOSTTY_CROWD=9
+  space1_ids="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+print(" ".join(str(w["cgWindowId"]) for w in json.load(sys.stdin).get("windows", []) if w.get("space") == 1))
+' 2>/dev/null || true)"
+  spawned=""
+  LAST_OPENED_PID=""
+  open_ghostty_on() {
+    local space="$1" pid=""
+    LAST_OPENED_PID=""
+    run workspace "$space" >/dev/null
+    pid="$(open_test_ghostty || true)"
+    if [[ -z "$pid" ]]; then
+      fail "could not open a Ghostty on workspace $space"
+      return 1
+    fi
+    spawned="$spawned $pid"
+    if wait_for_pid_tiled "$pid" "$space"; then
+      LAST_OPENED_PID="$pid"
+      return 0
+    fi
+    fail "Ghostty $pid did not tile on workspace $space"
+    return 1
+  }
+  spawned_on() {
+    "$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+space = int(sys.argv[1])
+pids = set(int(x) for x in sys.argv[2].split())
+print(sum(1 for w in json.load(sys.stdin).get("windows", []) if w.get("space") == space and w.get("pid") in pids and w.get("role") == "tiled"))
+' "$1" "$spawned" 2>/dev/null || echo 0
+  }
+
+  run workspace 1 >/dev/null
+  open_ghostty_on 1 || true
+  if [[ "$(spawned_on 1)" -ge 1 ]]; then
+    pass "a new Ghostty tiled beside the windows already on workspace 1"
+  else
+    fail "no new Ghostty tiled on workspace 1"
+  fi
+
+  open_ghostty_on 2 || true
+  open_ghostty_on 3 || true
+  open_ghostty_on 4 || true
+  ws4_pid="$LAST_OPENED_PID"
+
+  run workspace 5 >/dev/null
+  verify "on empty workspace 5"
+  if [[ "$(spawned_on 5)" == "0" ]]; then
+    pass "workspace 5 has no demo Ghostty"
+  else
+    fail "workspace 5 has $(spawned_on 5) demo Ghosttys"
+  fi
+
+  run workspace 2 >/dev/null
+  for _ in 1 2 3 4; do
+    open_ghostty_on 2 || true
+  done
+  if [[ "$(spawned_on 2)" == "5" ]]; then
+    pass "workspace 2 has 5 tiled Ghosttys"
+  else
+    fail "workspace 2 has $(spawned_on 2) tiled Ghosttys (want 5)"
+  fi
+  focus_before="$(focused_window_id)"
+  run focus right >/dev/null
+  focus_after="$(focused_window_id)"
+  if [[ -n "$focus_before" && "$focus_after" != "$focus_before" ]]; then
+    pass "focus right moved among the five Ghosttys"
+  else
+    run focus down >/dev/null
+    focus_after="$(focused_window_id)"
+    if [[ -n "$focus_before" && "$focus_after" != "$focus_before" ]]; then
+      pass "focus down moved among the five Ghosttys"
+    else
+      fail "focus did not move on the five-Ghostty workspace"
+    fi
+  fi
+  swap_id="$(focused_window_id)"
+  swap_before="$(window_frame "$swap_id")"
+  run swap right >/dev/null
+  swap_after="$(window_frame "$swap_id")"
+  if [[ -n "$swap_before" && "$swap_after" != "$swap_before" ]]; then
+    pass "swap right moved a Ghostty tile"
+  else
+    run swap down >/dev/null
+    swap_after="$(window_frame "$swap_id")"
+    if [[ -n "$swap_before" && "$swap_after" != "$swap_before" ]]; then
+      pass "swap down moved a Ghostty tile"
+    else
+      fail "swap did not move a Ghostty tile on workspace 2"
+    fi
+  fi
+  verify "after ghostty focus and swap"
+
+  if "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null && [[ -s "$TMP_BEFORE" ]]; then
+    run resize grow >/dev/null
+    if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+      grown="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+      if [[ -n "$grown" ]]; then
+        pass "ghostty resize grow moved:$grown"
+      else
+        fail "ghostty resize grow did not move a window"
+      fi
+    else
+      fail "geometry snapshot after ghostty resize grow failed"
+    fi
+    if "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null && [[ -s "$TMP_BEFORE" ]]; then
+      run resize shrink >/dev/null
+      if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+        shrunk="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+        if [[ -n "$shrunk" ]]; then
+          pass "ghostty resize shrink moved:$shrunk"
+        else
+          fail "ghostty resize shrink did not move a window"
+        fi
+      else
+        fail "geometry snapshot after ghostty resize shrink failed"
+      fi
+    fi
+    run resize grow >/dev/null
+    if "$LUMINA" list-windows > "$TMP_BEFORE" 2>/dev/null && [[ -s "$TMP_BEFORE" ]]; then
+      run balance >/dev/null
+      if "$LUMINA" list-windows > "$TMP_AFTER" 2>/dev/null && [[ -s "$TMP_AFTER" ]]; then
+        balanced="$(geometry_moves "$TMP_BEFORE" "$TMP_AFTER")"
+        if [[ -n "$balanced" ]]; then
+          pass "ghostty balance moved:$balanced"
+        else
+          fail "ghostty balance did not move a window"
+        fi
+      else
+        fail "geometry snapshot after ghostty balance failed"
+      fi
+    fi
+  else
+    fail "geometry snapshot before ghostty resize failed"
+  fi
+
+  float_id="$(focused_window_id)"
+  run float-toggle >/dev/null
+  if [[ "$(window_field "$float_id" role)" == "floating" ]]; then
+    pass "ghostty $float_id floated"
+  else
+    fail "ghostty $float_id did not float (role $(window_field "$float_id" role))"
+  fi
+  run float-toggle >/dev/null
+  if [[ "$(window_field "$float_id" role)" == "tiled" ]]; then
+    pass "ghostty $float_id tiled again"
+  else
+    fail "ghostty $float_id did not retile (role $(window_field "$float_id" role))"
+  fi
+
+  fs_id="$(focused_window_id)"
+  run fullscreen lumina >/dev/null
+  sleep 0.5
+  if [[ "$(window_field "$fs_id" role)" == "luminaFS" ]]; then
+    pass "ghostty $fs_id is lumina fullscreen"
+  else
+    fail "ghostty $fs_id did not enter lumina fullscreen (role $(window_field "$fs_id" role))"
+  fi
+  if [[ "$(count_role_on_space 2 stashed)" -ge 1 ]]; then
+    pass "fullscreen parked the other windows"
+  else
+    fail "fullscreen left no stashed window on workspace 2"
+  fi
+  run fullscreen lumina >/dev/null
+  sleep 0.6
+  if [[ "$(window_field "$fs_id" role)" == "tiled" && "$(spawned_on 2)" == "5" ]]; then
+    pass "fullscreen exit restored the five Ghosttys"
+  else
+    fail "fullscreen exit left ghostty $fs_id role $(window_field "$fs_id" role), workspace 2 has $(spawned_on 2)"
+  fi
+  verify "after ghostty resize float and fullscreen"
+
+  move_id="$(focused_window_id)"
+  run move-node-to-workspace 5 >/dev/null
+  sleep 0.5
+  if [[ "$(window_field "$move_id" space)" == "5" ]]; then
+    pass "moved Ghostty $move_id onto the empty workspace"
+  else
+    fail "Ghostty $move_id did not land on workspace 5 (space $(window_field "$move_id" space))"
+  fi
+  run move-node-to-workspace 2 >/dev/null
+  sleep 0.5
+  if [[ "$(window_field "$move_id" space)" == "2" && "$(spawned_on 2)" == "5" && "$(spawned_on 5)" == "0" ]]; then
+    pass "moved Ghostty $move_id back, workspace 5 empty again"
+  else
+    fail "move back failed: space $(window_field "$move_id" space), workspace 2 has $(spawned_on 2), workspace 5 has $(spawned_on 5)"
+  fi
+
+  # A tab is another window inside the same tile. Cmd-N is a new tile.
+  # Ghostty's native fullscreen replaces the window, so this stays on the
+  # ordinary tiled window and never sends keys to any other process.
+  if [[ -n "$ws4_pid" ]]; then
+    run workspace 4 >/dev/null
+    front="$(focus_pid "$ws4_pid")"
+    if [[ "$front" == "$ws4_pid" ]]; then
+      "$LUMINA" debug-ax "$ws4_pid" >/dev/null 2>&1 && pass "debug-ax answered for Ghostty $ws4_pid" || fail "debug-ax failed for Ghostty $ws4_pid"
+      tabs_before="$(pid_count "$ws4_pid")"
+      ghostty_new_tab
+      sleep 1.1
+      if [[ "$(pid_count "$ws4_pid")" == "$tabs_before" ]]; then
+        pass "Cmd-T kept Ghostty $ws4_pid at $tabs_before tile"
+      else
+        fail "Cmd-T changed Ghostty $ws4_pid from $tabs_before windows to $(pid_count "$ws4_pid")"
+      fi
+      ghostty_new_window
+      if wait_for_pid_count "$ws4_pid" "$((tabs_before + 1))"; then
+        pass "Cmd-N opened another tiled window of Ghostty $ws4_pid"
+      else
+        fail "Cmd-N left Ghostty $ws4_pid at $(pid_count "$ws4_pid") windows"
+      fi
+    else
+      fail "could not focus Ghostty $ws4_pid for tabs (frontmost ${front:-none})"
+    fi
+    # Native fullscreen replaces the Ghostty window. Exit has to bring a
+    # normal tile back; a screen-sized leftover is closed so it cannot
+    # overlap the rest of the tour.
+    run workspace 4 >/dev/null
+    run fullscreen native >/dev/null
+    sleep 1.4
+    run fullscreen native >/dev/null
+    if wait_for_pid_tiled "$ws4_pid" 4; then
+      native_w="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+pid = int(sys.argv[1])
+widths = [w.get("w") or 0 for w in json.load(sys.stdin).get("windows", []) if w.get("pid") == pid]
+print(int(max(widths) if widths else 0))
+' "$ws4_pid" 2>/dev/null || echo 0)"
+      if [[ "${native_w:-0}" -lt 1200 ]]; then
+        pass "native fullscreen returned Ghostty $ws4_pid to a tile"
+      else
+        fail "native fullscreen left Ghostty $ws4_pid screen-sized (${native_w}pt wide)"
+        kill -9 "$ws4_pid" >/dev/null 2>&1 || true
+        spawned="${spawned// $ws4_pid/}"
+      fi
+    else
+      fail "native fullscreen did not retile Ghostty $ws4_pid"
+      kill -9 "$ws4_pid" >/dev/null 2>&1 || true
+      spawned="${spawned// $ws4_pid/}"
+    fi
+  fi
+
+  run workspace 3 >/dev/null
+  while [[ "$(spawned_on 3)" -lt "$GHOSTTY_CROWD" ]]; do
+    open_ghostty_on 3 || break
+  done
+  crowd_now="$(spawned_on 3)"
+  if [[ "$crowd_now" == "$GHOSTTY_CROWD" ]]; then
+    pass "workspace 3 has $GHOSTTY_CROWD tiled Ghosttys"
+  else
+    fail "workspace 3 has $crowd_now tiled Ghosttys (want $GHOSTTY_CROWD)"
+  fi
+  if ! wait_for_stable_geometry; then
+    fail "geometry did not settle at $GHOSTTY_CROWD Ghosttys"
+  fi
+  crowd_pids="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+pids = set(int(x) for x in sys.argv[1].split())
+print(" ".join(str(w["pid"]) for w in json.load(sys.stdin).get("windows", []) if w.get("space") == 3 and w.get("pid") in pids))
+' "$spawned" 2>/dev/null || true)"
+  overlap="$(live_overlap_pids "$crowd_pids")"
+  if [[ -z "$overlap" ]]; then
+    pass "nine Ghosttys do not overlap"
+  else
+    fail "nine Ghosttys overlap"
+    printf '%s\n' "$overlap" | sed 's/^/      /'
+  fi
+  verify "after nine ghosttys"
+
+  extra="$(open_test_ghostty || true)"
+  if [[ -n "$extra" ]]; then
+    spawned="$spawned $extra"
+    for _ in 1 2 3 4 5 6 7 8; do
+      [[ "$(pid_count "$extra")" == "1" ]] && break
+      sleep 0.25
+    done
+    sleep 2.2
+    extra_role="$(window_field "$(pid_ids "$extra" | awk '{print $1}')" role)"
+    extra_overlap="$(live_overlap_pids "$crowd_pids $extra")"
+    if [[ "$extra_role" == "floating" || -n "$extra_overlap" ]]; then
+      pass "a tenth Ghostty is past the no-overlap maximum"
+    else
+      fail "a tenth Ghostty still tiles without overlapping (role ${extra_role:-missing})"
+    fi
+    run close >/dev/null
+    if wait_for_pid_count "$extra" 0; then
+      pass "lumina close removed the tenth Ghostty"
+      spawned="${spawned// $extra/}"
+    else
+      fail "lumina close left the tenth Ghostty $extra managed"
+    fi
+    if ! wait_for_stable_geometry; then
+      fail "geometry did not settle after closing the tenth Ghostty"
+    fi
+    rest_pids="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+pids = set(int(x) for x in sys.argv[1].split())
+print(" ".join(str(w["pid"]) for w in json.load(sys.stdin).get("windows", []) if w.get("space") == 3 and w.get("pid") in pids and w.get("role") == "tiled"))
+' "$spawned" 2>/dev/null || true)"
+    rest_overlap="$(live_overlap_pids "$rest_pids")"
+    if [[ "$(spawned_on 3)" == "$GHOSTTY_CROWD" && -z "$rest_overlap" ]]; then
+      pass "closing the extra reflowed the nine Ghosttys"
+    else
+      fail "after closing the extra, workspace 3 has $(spawned_on 3) tiled Ghosttys"
+      [[ -n "$rest_overlap" ]] && printf '%s\n' "$rest_overlap" | sed 's/^/      /'
+    fi
+    reflow_before="$(spawned_on 3)"
+    run close >/dev/null
+    sleep 0.6
+    reflow_after="$(spawned_on 3)"
+    if [[ "$reflow_after" -lt "$reflow_before" ]]; then
+      pass "closing one Ghostty reflowed the rest ($reflow_before -> $reflow_after)"
+    else
+      fail "close did not remove a tiled Ghostty on workspace 3 (still $reflow_after)"
+    fi
+    verify "after ghostty reflow"
+  else
+    fail "could not open the tenth Ghostty"
+  fi
+
+  for p in $spawned; do
+    kill "$p" >/dev/null 2>&1 || true
+  done
+  sleep 0.8
+  for p in $spawned; do
+    kill -9 "$p" >/dev/null 2>&1 || true
+  done
+  gone=1
+  for p in $spawned; do
+    if ! wait_for_pid_count "$p" 0; then
+      gone=0
+      fail "Ghostty $p is still managed after cleanup"
+    fi
+  done
+  if (( gone == 1 )); then
+    pass "demo Ghosttys left the model"
+  fi
+  run workspace 1 >/dev/null
+  missing=""
+  now_ids="$("$LUMINA" list-windows 2>/dev/null | python3 -c '
+import json, sys
+print(" ".join(str(w["cgWindowId"]) for w in json.load(sys.stdin).get("windows", [])))
+' 2>/dev/null || true)"
+  for id in $space1_ids; do
+    case " $now_ids " in
+      *" $id "*) ;;
+      *) missing="$missing $id" ;;
+    esac
+  done
+  if [[ -z "$missing" ]]; then
+    pass "workspace 1 kept its windows through the Ghostty tour"
+  else
+    fail "workspace 1 lost windows:$missing"
+  fi
+  verify "after ghostty workspace cleanup"
 fi
 
 # Shield recovery: a crash or force-quit can leave a hide-until-tiled app
