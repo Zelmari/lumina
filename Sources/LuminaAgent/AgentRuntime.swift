@@ -164,6 +164,9 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var since: Date
     }
     var overflowObservations: [UInt32: OverflowObservation] = [:]
+    /// Windows whose green-button zoom we already pressed. One press only:
+    /// a second would zoom them again.
+    var zoomPresses: Set<UInt32> = []
     let overflowRefusalWindow: TimeInterval = 1.5
     var clampingOverflow = false
     public var resizeDebounce: [UInt32: DispatchWorkItem] = [:]
@@ -1030,12 +1033,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         guard let frame = adapter.frame(of: element), frame.w >= 8, frame.h >= 8, !isStashedAway(frame) else { return }
         // Speculative tile: write a standard window straight to the spiral
         // rect it will occupy, so even a late write lands at the tile with no
-        // corner state. Any doubt falls back to the corner park.
+        // corner state. A predicted tile that does not confirm is left alone;
+        // corner-parking it would be the flash this path exists to avoid.
+        // Only a failed prediction falls through to the corner park.
         if config.speculativeTile,
            let tile = predictedTileFor(element: element, id: id, pid: pid, bundle: bundle, frame: frame, bound: bound)
         {
             var tag = WindowRef(cgWindowId: id, pid: pid, bundleId: bundle, lastOnscreenFrame: frame)
-            if adapter.setFrame(tile, of: element, tag: &tag) == .ok {
+            switch adapter.setFrame(tile, of: element, tag: &tag) {
+            case .ok:
                 preParked[id] = PrePark(
                     pid: pid,
                     frame: frame,
@@ -1048,8 +1054,14 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 // app's move note never reaches reParkIfNeeded.
                 observers.watchWindow(element, pid: pid)
                 log.info("pre-park tile window=\(id) pid=\(pid) rect=\(Int(tile.x)),\(Int(tile.y)) \(Int(tile.w))x\(Int(tile.h))")
-                return
+            case .unknown:
+                // A timeout is not evidence the write failed. Corner-parking
+                // now would flash a stash the speculative path exists to avoid.
+                log.info("pre-park tile timeout window=\(id) pid=\(pid)")
+            case .rejected(_):
+                log.info("pre-park tile skip window=\(id) pid=\(pid) reason=set-frame")
             }
+            return
         }
         let display = DisplayFrame(axFrame: bound.axFrame, axVisibleFrame: bound.axVisibleFrame)
         let dockRight = bound.axVisibleFrame.maxX < bound.axFrame.maxX
@@ -1355,11 +1367,21 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         var live: [LiveWindow] = []
         var modelPids: [UInt32: Int32] = [:]
         var floatingIds: Set<UInt32> = []
-        for space in session.spaces.values {
-            for node in space.tiledLeaves() { if let w = node.leaf { modelPids[w.cgWindowId] = w.pid } }
+        // Stashed windows, and every window on a workspace that is not
+        // focused, are absent from AX on purpose. The removal gate must not
+        // treat that as a close while CoreGraphics still lists them.
+        var parkedIds: Set<UInt32> = []
+        for (spaceId, space) in session.spaces {
+            let hidden = spaceId != session.focusedSpace
+            for node in space.tiledLeaves() {
+                guard let w = node.leaf else { continue }
+                modelPids[w.cgWindowId] = w.pid
+                if hidden || w.role == .stashed { parkedIds.insert(w.cgWindowId) }
+            }
             for w in space.floating {
                 modelPids[w.cgWindowId] = w.pid
                 if w.role == .floating || w.role == .stashed { floatingIds.insert(w.cgWindowId) }
+                if hidden || w.role == .stashed { parkedIds.insert(w.cgWindowId) }
             }
         }
         // Native-fullscreen windows are detached from the tree but still live
@@ -1492,7 +1514,8 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             pidOf: modelPids,
             axFailedPids: failedManaged,
             floatingIds: floatingIds,
-            elementLive: elementLive
+            elementLive: elementLive,
+            parkedIds: parkedIds
         )
         if !removals.deferred.isEmpty {
             log.info("refresh deferring removal ids=\(removals.deferred) (alive or cg still lists them)")
@@ -1569,6 +1592,15 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         // Recompute here, after removals/recycles, so a recycled id is not in
         // the exclusion set when its replacement is adopted.
         var claimed = session.allWindowIds.union(elements.keys)
+        // A launch the refresh discovers before the watch hop has already
+        // painted at the app's own frame. Park it at the predicted tile
+        // before adoption, or speculative-tile never runs for that window.
+        if config.speculativeTile {
+            for id in delta.added + delta.recycled {
+                guard let el = elementsById[id], !ownedAnywhere(id), preParked[id] == nil else { continue }
+                preParkNewWindow(el)
+            }
+        }
         for id in delta.added + delta.recycled {
             guard let el = elementsById[id] else { continue }
             onCreate(el, claimed: &claimed, apply: false, space: space, cgRows: onScreenRows)
@@ -2015,6 +2047,7 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         knownOriginals[id] = nil
         observedMinSizes[id] = nil
         overflowObservations[id] = nil
+        zoomPresses.remove(id)
     }
 
     /// Drop a window that is really gone: close it on the focused space, remove
@@ -2348,7 +2381,16 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                let el = resolvedElement(for: window)
             {
                 // Toggle, like Hyprland's fullscreen: pressing again exits.
-                adapter.setFullscreen(el, !adapter.isFullscreen(el))
+                let entering = !adapter.isFullscreen(el)
+                adapter.setFullscreen(el, entering)
+                if !entering {
+                    // Exit can leave the green-button zoom engaged. setFrame
+                    // is ignored until that zoom is cleared, so the window
+                    // stays one outer-gap larger than its tile. The replacement
+                    // window is handled again from the layout pass.
+                    _ = unzoomIfScreenSized(el, id: id)
+                    applyFrames()
+                }
             }
         case .floatToggle:
             let usable = bound?.usableRect(gaps: config.gaps) ?? Rect(x: 0, y: 0, w: 1, h: 1)
@@ -2385,7 +2427,10 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
         }
         switch cmd {
         case .status, .markCurrent, .quit, .yield, .listWindows, .listWorkspaces, .verify,
-             .accessibilityPrompt, .debugAX, .ping, .subscribe:
+             .accessibilityPrompt, .debugAX, .ping, .subscribe,
+             .pause, .resume, .reload:
+            // Resume and reload have to run while paused. Leaving them in
+            // the guard below swallows `resume` and the agent stays paused.
             break
         default:
             if userPaused || displayGone || !isCurrent { return .success(id: id) }
@@ -2584,6 +2629,12 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                     || (liveBefore?.h ?? 0) > rect.h + 4
                 let stillOverflows = live.w > rect.w + 4 || live.h > rect.h + 4
                 if askedToShrink, stillOverflows {
+                    // A zoomed window ignores setFrame until the green button
+                    // clears zoom. Native-fullscreen exit leaves TextEdit in
+                    // that state, covering every other tile.
+                    if unzoomIfScreenSized(el, id: id) {
+                        _ = adapter.setFrame(rect, of: el, tag: &window)
+                    }
                     if isYoung(id) {
                         // A just-adopted app (Electron especially) may take
                         // seconds to apply the write. Keep observing and give
@@ -2902,6 +2953,22 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
                 session.spaces[spaceId] = space
             }
         }
+    }
+
+    /// Clear green-button zoom when a window is sitting on the screen frame.
+    /// Native-fullscreen exit leaves TextEdit there, and frame writes no-op
+    /// until the zoom button is pressed.
+    @discardableResult
+    func unzoomIfScreenSized(_ element: AXUIElement, id: UInt32) -> Bool {
+        guard !zoomPresses.contains(id), let bound, let frame = adapter.frame(of: element) else { return false }
+        let screen = bound.axFrame
+        // Zoom fills the display width and most of its height. The visible
+        // frame is smaller once the dock is removed, so it does not match.
+        guard frame.w > screen.w - 40, frame.h > screen.h * 0.7 else { return false }
+        zoomPresses.insert(id)
+        log.info("unzoom screen-sized window=\(id) \(Int(frame.w))x\(Int(frame.h)) screen=\(Int(screen.w))x\(Int(screen.h))")
+        adapter.pressZoom(of: element)
+        return true
     }
 
     func stashSiblings() {
@@ -3848,11 +3915,22 @@ public final class AgentRuntime: NSObject, @unchecked Sendable {
             let down = NSEvent.pressedMouseButtons != 0
             let loc = NSEvent.mouseLocation
             let ax = Point(x: Double(loc.x), y: self.menuBarY() - Double(loc.y))
-            MutationQueue.shared.hop {
-                if shouldIgnoreFFM(mouseButtonsDown: down, generationInFlight: inFlight) { return }
-                if let hit = self.spatialWindows().first(where: { $0.frame.contains(point: ax) }), hit.cgWindowId != self.focusedId() {
-                    if let el = self.elements[hit.cgWindowId] { self.adapter.setFocused(el) }
-                }
+            // Form the layout-queue closure in a nonisolated method. One
+            // formed inside this main-queue closure is isolated to the main
+            // actor and traps when the layout queue runs it.
+            self.ffmApply(mouseDown: down, point: ax, generationInFlight: inFlight)
+        }
+    }
+
+    func ffmApply(mouseDown: Bool, point: Point, generationInFlight: Bool) {
+        MutationQueue.shared.queue.async { [weak self] in
+            guard let self else { return }
+            if shouldIgnoreFFM(mouseButtonsDown: mouseDown, generationInFlight: generationInFlight) { return }
+            if let hit = self.spatialWindows().first(where: { $0.frame.contains(point: point) }),
+               hit.cgWindowId != self.focusedId(),
+               let el = self.elements[hit.cgWindowId]
+            {
+                self.adapter.setFocused(el)
             }
         }
     }
