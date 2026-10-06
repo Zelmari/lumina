@@ -703,6 +703,17 @@ focus_pid() {
   osascript -e 'tell application "System Events" to unix id of first process whose frontmost is true' 2>/dev/null || true
 }
 
+focused_window_id() {
+  "$LUMINA" status 2>/dev/null | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin).get("focusedWindow")
+except Exception:
+    value = None
+print("" if value is None else value)
+' 2>/dev/null || true
+}
+
 pid_ids() {
   "$LUMINA" list-windows 2>/dev/null | python3 -c '
 import json, sys
@@ -1294,6 +1305,23 @@ for w in json.load(sys.stdin).get("windows", []):
   if [[ -z "$te_ids" ]]; then
     fail "no tiled TextEdit on the focused workspace to tile beside"
   else
+    # insertSpiral splits the model's focused tiled window. Walk focus onto
+    # a TextEdit so the reflow check has that window as its target.
+    te_flat="$(printf '%s' "$te_ids" | tr '\n' ' ')"
+    focused_te=""
+    now_focus=""
+    aim_deadline=$((SECONDS + 8))
+    while ((SECONDS < aim_deadline)); do
+      now_focus="$(focused_window_id)"
+      case " $te_flat " in
+        *" $now_focus "*) focused_te="$now_focus"; break ;;
+      esac
+      run focus right >/dev/null || true
+      sleep 0.2
+    done
+    if [[ -z "$focused_te" ]]; then
+      fail "could not focus a tiled TextEdit before opening Ghostty (focused ${now_focus:-none})"
+    fi
     if ! wait_for_stable_geometry; then
       fail "geometry did not settle before the Ghostty new-window test"
     fi
@@ -1378,9 +1406,9 @@ for w in json.load(sys.stdin).get("windows", []):
       if [[ -n "$te_moved" ]]; then
         pass "TextEdit still reflowed after Cmd-N:$te_moved"
       else
-        # A spiral split of the Ghostty tile does not move every sibling.
-        # Falling all the way back to the pre-Ghostty frames means the new
-        # windows never joined that tree.
+        # The focused TextEdit is the split target. Later Cmd-N presses
+        # split the Ghostty side, so that TextEdit stays off its original
+        # frame. Matching the snapshot means the new windows never joined.
         fail "TextEdit frames match the pre-Ghostty snapshot after Cmd-N (ids: $te_ids)"
         geometry_table | sed 's/^/      /'
       fi
