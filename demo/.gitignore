@@ -1,0 +1,4 @@
+# Local recordings stay out of git. The showcase script is the public demo.
+*
+!showcase.sh
+!.gitignore

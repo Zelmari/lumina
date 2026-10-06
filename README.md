@@ -1,17 +1,21 @@
 # Lumina
 
-Window / tiling manager for macOS. Spiral tiling (Hyprland dwindle with permanent splits) and emulated workspaces, without disabling SIP.
+Window tiling manager for macOS. Spiral tiling (Hyprland dwindle with permanent splits) and emulated workspaces, without disabling SIP.
 
 Lumina is a guest on macOS. Quitting it restores managed windows to their pre-tiling frames (they may overlap) and leaves apps open.
 
-## For agents
+## Quick start
 
-**The CLI and the test harness are built for automated use by coding agents.**
+Apple silicon, macOS 15.2 or later. Install steps are in [docs/install.md](docs/install.md). How the targets fit together is in [docs/architecture.md](docs/architecture.md). Contributor workflow is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-- Every `lumina` command is non-interactive and prints machine-readable JSON (`list-windows`, `list-workspaces`, `status`, `debug-windows`, `debug-ax`). `verify` is the oracle: exit 0 when the model is consistent, exit 1 with a JSON issue list otherwise. `status` exit 2 means no agent is running on this Space.
-- `scripts/harness.sh` is the end-to-end regression suite: it drives real apps through the full feature set, running `verify` plus an independent CG-window oracle after every step. Run it before and after a change; `RECORD=1` keeps per-step geometry artifacts for post-mortems.
-- Workflow for a bug: reproduce it as a failing harness assertion first, then fix until the harness is green. `plans/macos-native-tabs.md` is a worked example.
-- When touching AX behavior, `debug-ax <pid>` dumps an app's real accessibility attributes, so detection is designed against observed values instead of guesses.
+Layout and IPC tests need no AppKit and run in CI:
+
+```sh
+swift test --filter LuminaLayoutTests
+swift test --filter LuminaIPCTests
+```
+
+On a Mac, `./scripts/bundle.sh` builds an ad-hoc-signed `dist/Lumina.app`. Grant Accessibility to **Lumina Agent**.
 
 ## Requirements
 
@@ -92,7 +96,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 
 ## CLI
 
-`lumina <command>` talks to the agent on the current Space. Exit codes: `0` success, `1` command error or `verify` issues, `2` no agent running on this Space. Output is JSON and stable for scripts and agents:
+`lumina <command>` talks to the agent on the current Space. Exit codes: `0` success, `1` command error or `verify` issues, `2` no agent running on this Space. Commands that return data print one JSON value. Commands with nothing to return print `ok`. Errors go to stderr and are appended to `~/Library/Logs/Lumina.log`.
 
 | Command | Description |
 |---|---|
@@ -119,7 +123,10 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 | `quit` / `exit` | Quit Lumina and untile every window |
 | `open-config` | Open the config file |
 | `grant-accessibility` | Re-show the Accessibility prompt (after `tccutil reset`) |
+| `current-token` | Print this Space's instance id as JSON |
 | `version` | Print the version |
+| `debug` | Print `LUMINA_DEBUG` and exit. Does not contact the agent |
+| `help` | Print command usage (`--help` and `-h` do the same) |
 
 ## Menu extra
 
@@ -128,9 +135,21 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 - The menu has Open Config, Grant Accessibility…, Reload, Pause/Resume, Start on this Space, Launch at Login, Quit this Space, and Quit all.
 - Warnings (Secure Input blocking hotkeys, Accessibility denied, invalid config, hotkey conflict) appear in the strip and its tooltip.
 
+## Automation
+
+The CLI is non-interactive. Commands print JSON. `verify` exits 0 when the model is consistent and 1 with a JSON issue list otherwise. `status` exits 2 when no agent is running on this Space. `lumina debug-ax <pid>` dumps an app's real accessibility attributes.
+
+`scripts/harness.sh` is the end-to-end suite. It needs a running Lumina and Accessibility plus Automation permission, so CI does not run it. Reproduce a bug as a failing harness assertion, then fix until the harness is green. `RECORD=1` keeps per-step geometry under `artifacts/`.
+
 ## Test harness
 
-`scripts/harness.sh` is the agent-facing end-to-end regression suite. It drives the real CLI against the running agent. It opens TextEdit windows and walks through focus, swap, float, fullscreen, resize/balance, opening on a fresh workspace, closing a single window (reflow), two workspace round trips (geometry stability), move-to-workspace, the menu-extra workspace count, config reload, a latency section (`lumina bench` IPC round trips plus the agent's recorded refresh-to-frame p95), native tabs on a dedicated Ghostty instance, and Ghostty Cmd-N opening new tiled windows beside the apps already on the workspace, then cleans up. It asserts that no tracked window leaves the model and that geometry converges.
+`scripts/harness.sh` drives the real CLI against a running agent. It opens TextEdit, checks `lumina verify` and live window frames after every step, then cleans up. It does not quit Lumina. No tracked window may leave the model, and geometry has to converge.
+
+The walk covers focus, swap, resize, balance, float, Lumina fullscreen and native fullscreen, close and reflow, workspace round trips, `workspace 0` as workspace 10, pause and resume, config reload, the menu-extra workspace count, and the CLI commands in the table above. A Ghostty section checks native tabs, Cmd-N as a new tile, and a multi-workspace tour: five windows with focus and swap, a move onto an empty workspace and back, nine tiles, a tenth that no longer fits, and `lumina close`. Resize grow, shrink, and balance each have to move a tile.
+
+`FEATURE_TEST` reloads a temporary config (gaps, float and ignore rules, a rejected file, focus-follows-mouse, launch-tiling, speculative tile, hide-until-tiled) and restores the config file. It runs even when `BENCH=0`. It is skipped, and the run can still pass, when `cgwindows` or the config file is missing.
+
+`demo/showcase.sh` is a separate Ghostty-only recording, not a test. Each workspace is visited once: five windows with focus, one swap, resize, balance, float, and Lumina fullscreen; a window moved onto the empty workspace; one tab, one new window, and native fullscreen; then nine tiles, one that no longer fits, and two closes that reflow the layout. Run it from inside Ghostty. It keeps the launching window, closes every Ghostty it opened, and quits Lumina. The crowd of nine was measured on 2026-10-06 for a 1454×907 tile area with 8 pt gaps. The harness covers the same behaviors with assertions and does not quit.
 
 `lumina verify` runs after every step and checks: duplicate windows, windows visible on an inactive workspace, tiles overlapping or outside the display, a layout hole that does not span the usable rect, stale focus, a retained dead AX element, a tiled window not at its tile, and a hidden-workspace window still on screen.
 
@@ -148,16 +167,18 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 | `VERBOSE=1` | Print the per-window geometry table every step |
 | `TABS_TEST=0` | Skip the native-tabs section |
 | `NEW_WINDOW_TEST=0` | Skip the Ghostty Cmd-N new-window section |
+| `GHOSTTY_SPACES_TEST=0` | Skip the multi-workspace Ghostty section |
 | `BENCH=0` | Skip the latency section |
 | `BENCH_COUNT` / `BENCH_WARMUP` | Pings and warmup for `lumina bench` (default 50 / 5) |
 | `BENCH_MAX_P95_MS` | Fail when IPC round-trip p95 exceeds this (default 25) |
 | `BENCH_STRICT=1` | Gate on launch-to-frame (default 500ms) and menu-push latency (default 250ms) |
 | `BENCH_LAUNCH_MAX_MS` / `BENCH_MENU_MAX_MS` | Thresholds for the strict gates |
 | `BENCH_COLD_MAX_MS` | Strict gate for the CG-measured cold launch, including the app's own launch time (default 3000ms) |
-| `LAUNCH_TEST=0` | Skip the cold-launch CG measurement |
-| `FEATURE_TEST=0` | Skip the speculative-tile and hide-until-tiled checks (they temporarily add config keys and restore the file) |
+| `LAUNCH_TEST=0` | Skip the cold-launch CG measurement. Runs even when `BENCH=0` |
+| `FEATURE_TEST=0` | Skip the config checks (gaps, float and ignore rules, a rejected config file, focus-follows-mouse, launch-tiling, speculative-tile, hide-until-tiled). They edit the config and restore the file. Runs even when `BENCH=0` |
 | `SHIELD_BOOT_TEST=1` | Also quit and restart Lumina to check a hidden app is revealed at boot |
 | `LUMINA_LOG` | Agent log path (default `~/Library/Logs/Lumina.log`) |
+| `CONFIG_PATH` | Config the feature sections edit and restore (default `~/.config/lumina/lumina.toml`) |
 
 ## Known behavior
 
@@ -170,28 +191,27 @@ Requirements: macOS, Accessibility and Automation permission for the process run
 
 ## Status
 
-Layout and IPC are unit-tested with SwiftPM (236 tests; Linux toolchain is fine). The menu extra, agent, and CLI are macOS-only and are not compiled by CI. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
+Layout and IPC are unit-tested with SwiftPM. Linux CI runs those suites. macOS CI compiles the menu extra, agent, and CLI and runs the same tests. The harness stays local. The ad-hoc-signed `.app` (extra + nested agent + CLI) is assembled with `scripts/bundle.sh` on Apple silicon; SwiftPM does not emit that bundle layout by itself.
 
 On macOS, `swift test` needs the Xcode toolchain (`export DEVELOPER_DIR=/Applications/Xcode.app`); Command Line Tools lack the `Testing` module.
 
 ## Layout
 
 ```
-Sources/Lumina/          menu extra
-Sources/LuminaAgent/     agent
-Sources/LuminaCLI/       socket client (`lumina`)
+Sources/Lumina/          menu extra (SwiftPM product LuminaExtra)
+Sources/LuminaAgent/     per-display agent
+Sources/LuminaCLI/       `lumina` socket client
 Sources/LuminaLayout/    pure tree, config, verify (no AppKit)
 Sources/LuminaIPC/       JSON-lines protocol
-Tests/LuminaLayoutTests/ pure tree, config, verify tests
-Tests/LuminaIPCTests/    protocol tests
+Tests/                   layout and IPC tests (what both CI jobs run)
 scripts/bundle.sh        assemble and sign dist/Lumina.app
-scripts/harness.sh       end-to-end harness
-scripts/cgwindows.swift  CG oracle used by the harness
-docs/                    install and compatibility notes
-plans/                   engineering notes (gitignored)
-artifacts/               harness output (gitignored)
+scripts/harness.sh       macOS end-to-end harness (not in CI)
+scripts/cgwindows.swift  CG window oracle used by the harness
+demo/showcase.sh         Ghostty showcase
+docs/                    install, compatibility, architecture
+CONTRIBUTING.md          how to build, test, and send a change
 ```
 
 ## License
 
-MIT.
+MIT. See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).

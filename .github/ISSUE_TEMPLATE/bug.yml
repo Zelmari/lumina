@@ -1,0 +1,31 @@
+name: Bug
+description: A window, workspace, or command did the wrong thing
+title: "fix: "
+labels: []
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, and what Lumina did. Leave out window titles and document contents.
+    validations:
+      required: true
+  - type: textarea
+    id: expect
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: macOS version, Lumina commit or build, and the app that misbehaved (bundle id is enough).
+      placeholder: macOS 26.0, lumina 53ad5db, com.mitchellh.ghostty
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: A trimmed `lumina verify` or `lumina status` is useful. Do not attach Accessibility dumps.
