@@ -36,6 +36,9 @@
 #                balance, float, and Lumina fullscreen, a move to workspace 5
 #                and back, a tab versus Cmd-N, native fullscreen, nine on 3,
 #                a tenth that floats or overlaps, and lumina close)
+#   STRIP_CLICK_TEST set to 0 to skip the menu-extra digit click (default 1).
+#                A System Events mouse click on the digit must switch the
+#                focused workspace. The section restores the original workspace.
 #   BENCH        set to 0 to skip the latency section (default 1)
 #   BENCH_COUNT  pings for `lumina bench` (default 50)
 #   BENCH_WARMUP warmup pings (default 5)
@@ -800,6 +803,40 @@ except Exception: print(0)
 ' 2>/dev/null || echo 0
 }
 
+# Frames from `lumina strip-buttons` are already System Events top-left
+# screen points. Click the center; do not use an accessibility press.
+click_menu_digit() {
+  local space="$1" xy x y
+  xy="$("$LUMINA" strip-buttons | python3 -c '
+import json, sys
+want = int(sys.argv[1])
+try:
+    buttons = json.load(sys.stdin).get("buttons") or []
+except Exception:
+    sys.exit(1)
+for button in buttons:
+    if int(button.get("space") or 0) == want:
+        print("%s %s" % (
+            float(button["x"]) + float(button["w"]) / 2,
+            float(button["y"]) + float(button["h"]) / 2,
+        ))
+        sys.exit(0)
+sys.exit(1)
+' "$space")" || return 1
+  read -r x y <<<"$xy"
+  [[ -n "$x" && -n "$y" ]] || return 1
+  osascript -e "tell application \"System Events\" to click at {$x, $y}"
+}
+
+wait_focused_workspace() {
+  local want="$1" deadline=$((SECONDS + 2))
+  while ((SECONDS < deadline)); do
+    if [[ "$(focused_workspace)" == "$want" ]]; then return 0; fi
+    sleep 0.1
+  done
+  [[ "$(focused_workspace)" == "$want" ]]
+}
+
 count_role_on_space() {
   "$LUMINA" list-windows 2>/dev/null | python3 -c '
 import json, sys
@@ -1306,6 +1343,32 @@ if [[ "$(status_space_count)" -ge 10 ]]; then
   verify "back from workspace 10"
 else
   pass "space count is $(status_space_count); workspace 0 is workspace 10 only when that space exists"
+fi
+
+say "menu extra digit click switches workspace"
+if [[ "${STRIP_CLICK_TEST:-1}" == "0" ]]; then
+  pass "STRIP_CLICK_TEST=0; skipping menu extra digit click"
+else
+  origin="$(focused_workspace)"
+  if [[ "$origin" == "1" ]]; then
+    target=2
+  else
+    target=1
+  fi
+  if click_menu_digit "$target"; then
+    if wait_focused_workspace "$target"; then
+      pass "digit $target switched the workspace"
+    else
+      fail "digit $target did not switch the workspace (focused $(focused_workspace))"
+    fi
+    verify "after strip click"
+  else
+    fail "menu extra digit click failed for workspace $target"
+  fi
+  if [[ "$(focused_workspace)" != "$origin" ]]; then
+    run workspace "$origin" >/dev/null
+  fi
+  verify "after strip click restored"
 fi
 
 say "reload config"
