@@ -390,6 +390,17 @@ final class ExtraController: NSObject, @unchecked Sendable {
             return .success(id: id)
         case .status:
             return .success(id: id, data: currentStatusJSON())
+        case .stripButtons:
+            let buttons: [JSONValue] = status.digitClickFrames().map { item in
+                .object([
+                    "space": .int(item.space),
+                    "x": .double(Double(item.rect.origin.x)),
+                    "y": .double(Double(item.rect.origin.y)),
+                    "w": .double(Double(item.rect.width)),
+                    "h": .double(Double(item.rect.height)),
+                ])
+            }
+            return .success(id: id, data: .object(["buttons": .array(buttons)]))
         }
     }
 

@@ -99,6 +99,14 @@ struct CodecTests {
         #expect(id == "z")
     }
 
+    @Test func extraStripButtons() {
+        let line = #"{"v":2,"id":"s","cmd":"strip-buttons","args":{}}"#
+        #expect(parseLine(line, as: .extra) == .extra(.stripButtons, id: "s"))
+        #expect(CLIArgs.parse(["lumina", "strip-buttons"])?.cmd == "strip-buttons")
+        #expect(CLIArgs.isExtraCommand("strip-buttons"))
+        #expect(CLIArgs.usage.contains("strip-buttons"))
+    }
+
     @Test func debugWindowsParses() {
         let line = #"{"v":2,"id":"d","cmd":"debug-windows","args":{}}"#
         let parsed = parseLine(line)

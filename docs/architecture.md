@@ -36,7 +36,7 @@ The product name is `lumina-agent`. `scripts/bundle.sh` nests it at `Contents/He
 
 ## Lumina (menu extra)
 
-SwiftPM target `Lumina`, product `LuminaExtra`. The product cannot be named `Lumina`: on a case-insensitive disk it would collide with the `lumina` CLI. The menu extra draws the workspace strip, starts and stops the agent, and serves the few commands that are not layout commands (`start`, `quit`, `open-config`, `grant-accessibility`, `current-token`).
+SwiftPM target `Lumina`, product `LuminaExtra`. The product cannot be named `Lumina`: on a case-insensitive disk it would collide with the `lumina` CLI. The menu extra draws the workspace strip, starts and stops the agent, and serves the few commands that are not layout commands (`start`, `quit`, `open-config`, `grant-accessibility`, `current-token`, `strip-buttons`).
 
 ## What CI does not run
 

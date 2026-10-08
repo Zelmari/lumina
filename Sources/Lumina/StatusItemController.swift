@@ -103,6 +103,10 @@ final class StatusItemController {
         )
     }
 
+    func digitClickFrames() -> [(space: Int, rect: CGRect)] {
+        stripView?.digitClickFrames() ?? []
+    }
+
     private func apply(_ model: StatusStripModel, tooltip: String?) {
         stripView?.warningTooltip = warning.tooltip
         stripView?.inactiveTooltip = loginNote

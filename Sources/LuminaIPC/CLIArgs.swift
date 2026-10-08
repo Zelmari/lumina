@@ -36,6 +36,7 @@ public enum CLIArgs {
     grant-accessibility          re-show the Accessibility grant prompt
                                  (reset TCC first to get the prompt again)
     current-token                print this Space's instance id as JSON
+    strip-buttons                print menu-extra digit frames as JSON
     version                      print the version
     debug                        print LUMINA_DEBUG; does not contact the agent
     help                         print this help
@@ -99,7 +100,8 @@ public enum CLIArgs {
             return IPCRequest(id: id, cmd: "debug-ax", args: ["pid": .int(pid)])
         case "float-toggle", "balance", "close", "pause", "resume", "reload",
              "list-windows", "list-workspaces", "verify", "status", "debug-windows",
-             "ping", "start", "quit-all", "open-config", "current-token", "grant-accessibility":
+             "ping", "start", "quit-all", "open-config", "current-token", "grant-accessibility",
+             "strip-buttons":
             return IPCRequest(id: id, cmd: head)
         case "quit", "exit":
             // `quit` exits Lumina entirely, like Hyprland's `exit`. Quitting
@@ -111,7 +113,7 @@ public enum CLIArgs {
     }
 
     public static func isExtraCommand(_ cmd: String) -> Bool {
-        ["start", "quit", "exit", "quit-all", "open-config", "current-token", "grant-accessibility"].contains(cmd)
+        ["start", "quit", "exit", "quit-all", "open-config", "current-token", "grant-accessibility", "strip-buttons"].contains(cmd)
     }
 
     /// Options for `lumina bench`. Kept in LuminaIPC so the parsing rules are

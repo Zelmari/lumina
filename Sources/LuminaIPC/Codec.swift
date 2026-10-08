@@ -212,6 +212,7 @@ private func parseExtraCmd(cmd: String, args: [String: JSONValue]) -> CmdParse<E
     case "open-config": return .ok(.openConfig)
     case "grant-accessibility": return .ok(.grantAccessibility)
     case "status": return .ok(.status)
+    case "strip-buttons": return .ok(.stripButtons)
     default: return .unknown
     }
 }
