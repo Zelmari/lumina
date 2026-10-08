@@ -40,8 +40,9 @@ final class StatusItemController {
         view.onRightClick = { [weak self] in self?.showMenu() }
         if let button = statusItem.button {
             button.title = ""
-            button.target = nil
-            button.action = nil
+            button.target = self
+            button.action = #selector(stripClicked(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleNone
             button.setAccessibilityLabel("Lumina workspaces")
@@ -225,6 +226,16 @@ final class StatusItemController {
             entry.attributedTitle = text
         }
         return entry
+    }
+
+    @objc func stripClicked(_ sender: Any?) {
+        guard item?.button != nil, let view = stripView, let event = NSApp.currentEvent else { return }
+        let right = event.type == .rightMouseUp || event.type == .rightMouseDown || event.modifierFlags.contains(.control)
+        if right {
+            showMenu()
+            return
+        }
+        view.click(at: view.convert(event.locationInWindow, from: nil))
     }
 
     @objc func pickSpace(_ sender: NSMenuItem) { onDigit?(sender.tag) }
