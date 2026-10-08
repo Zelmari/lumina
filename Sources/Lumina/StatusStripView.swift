@@ -127,6 +127,11 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
         }
     }
 
+    override func mouseDown(with event: NSEvent) {
+        // Forwarding starts NSStatusBarButton's tracking loop, which consumes
+        // mouseUp and then sends a nil action.
+    }
+
     override func mouseUp(with event: NSEvent) {
         if event.modifierFlags.contains(.control) {
             onRightClick?()
