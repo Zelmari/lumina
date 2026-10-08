@@ -28,6 +28,9 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
     private var segmentRects: [NSRect] = []
     private var segmentTrackingAreas: [NSTrackingArea] = []
     private var tooltipTagIndices: [NSView.ToolTipTag: Int] = [:]
+    /// Tips are registered on the status button. This view's hitTest returns
+    /// nil, so a tip attached here would never appear.
+    private var tooltipHost: NSView?
     private var accessibilitySegments: [StatusSegmentAccessibilityElement] = []
     /// Geometry the accessibility elements were built for; rebuilding for an
     /// identical state only posts a spurious .layoutChanged.
@@ -127,21 +130,10 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
         }
     }
 
-    override func mouseDown(with event: NSEvent) {
-        // Forwarding starts NSStatusBarButton's tracking loop, which consumes
-        // mouseUp and then sends a nil action.
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        if event.modifierFlags.contains(.control) {
-            onRightClick?()
-            return
-        }
-        activate(at: convert(event.locationInWindow, from: nil))
-    }
-
-    override func rightMouseUp(with event: NSEvent) {
-        onRightClick?()
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // The status button must remain the hit target. If this view accepts
+        // the click, NSControl never tracks and the digit action does not fire.
+        nil
     }
 
     /// Digit hit targets in System Events screen points (origin top-left of the
@@ -247,10 +239,14 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
     }
 
     private func syncToolTips() {
-        for tag in tooltipTagIndices.keys { removeToolTip(tag) }
+        if let tooltipHost {
+            for tag in tooltipTagIndices.keys { tooltipHost.removeToolTip(tag) }
+        }
         tooltipTagIndices.removeAll()
+        let host = superview ?? self
+        tooltipHost = host
         for (index, rect) in segmentRects.enumerated() {
-            let tag = addToolTip(rect, owner: self, userData: nil)
+            let tag = host.addToolTip(convert(rect, to: host), owner: self, userData: nil)
             tooltipTagIndices[tag] = index
         }
     }
@@ -258,6 +254,10 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
     private func trackedIndex(for event: NSEvent) -> Int? {
         guard let area = event.trackingArea else { return nil }
         return segmentTrackingAreas.firstIndex(where: { $0 === area })
+    }
+
+    func click(at point: NSPoint) {
+        activate(at: point)
     }
 
     private func activate(at point: NSPoint) {
