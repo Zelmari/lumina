@@ -124,6 +124,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 | `open-config` | Open the config file |
 | `grant-accessibility` | Re-show the Accessibility prompt (after `tccutil reset`) |
 | `current-token` | Print this Space's instance id as JSON |
+| `strip-buttons` | Print menu-extra digit frames as JSON (screen points, top-left) |
 | `version` | Print the version |
 | `debug` | Print `LUMINA_DEBUG` and exit. Does not contact the agent |
 | `help` | Print command usage (`--help` and `-h` do the same) |

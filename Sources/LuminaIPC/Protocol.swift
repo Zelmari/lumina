@@ -133,6 +133,7 @@ public enum ExtraCmd: Equatable, Sendable {
     case openConfig
     case grantAccessibility
     case status
+    case stripButtons
 }
 
 public enum JSONValue: Equatable, Sendable, Codable {

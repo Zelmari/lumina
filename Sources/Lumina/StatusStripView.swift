@@ -144,6 +144,28 @@ final class StatusStripView: NSView, NSViewToolTipOwner {
         onRightClick?()
     }
 
+    /// Digit hit targets in System Events screen points (origin top-left of the
+    /// primary display). Used by `lumina strip-buttons` so the harness can post
+    /// a real click. Warning and pause icons are omitted.
+    func digitClickFrames() -> [(space: Int, rect: CGRect)] {
+        guard let window else { return [] }
+        if segmentRects.isEmpty { recomputeGeometry() }
+        guard let primary = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main else {
+            return []
+        }
+        let top = primary.frame.maxY
+        var frames: [(space: Int, rect: CGRect)] = []
+        for (index, segment) in model.segments.enumerated() {
+            guard let space = segment.space, segment.enabled, index < segmentRects.count else { continue }
+            let appKit = window.convertToScreen(convert(segmentRects[index], to: nil))
+            frames.append((
+                space: space,
+                rect: CGRect(x: appKit.minX, y: top - appKit.maxY, width: appKit.width, height: appKit.height)
+            ))
+        }
+        return frames
+    }
+
     func view(
         _ view: NSView,
         stringForToolTip tag: NSView.ToolTipTag,
