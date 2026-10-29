@@ -130,6 +130,7 @@ extension AgentStatus {
             hotkeyError: obj["hotkeyError"]?.string,
             spaceCount: obj["spaceCount"]?.int,
             visibleSpaceCount: obj["visibleSpaceCount"]?.int,
+            visibleSpaces: obj["visibleSpaces"]?.array?.compactMap(\.int),
             isCurrent: obj["isCurrent"]?.bool ?? false,
             hasOnScreenIncludingSlivers: obj["hasOnScreenIncludingSlivers"]?.bool ?? false,
             skylightSpaceId: obj["skylightSpaceId"]?.int.map { UInt64($0) }
