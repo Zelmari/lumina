@@ -16,7 +16,8 @@ final class StatusItemController {
     var onQuitAll: (() -> Void)?
     private var current = false
     private var paused = false
-    private var spaceCount = 5
+    private var spaces: [Int] = [1, 2, 3, 4, 5]
+    private var pendingSpace: Int?
     private var focused = 1
     private var warning: ExtraWarning = .none
     private var loginEnabled = false
@@ -25,6 +26,15 @@ final class StatusItemController {
     private var rendered: RenderState?
     private var renderedWidth: CGFloat = 0
     var pausedNow: Bool { paused }
+
+    private var displayedSpaces: [Int] {
+        guard let pending = pendingSpace, !spaces.contains(pending) else {
+            return spaces
+        }
+        var result = spaces
+        result.append(pending)
+        return result.sorted()
+    }
 
     private struct RenderState: Equatable {
         var model: StatusStripModel
@@ -59,29 +69,28 @@ final class StatusItemController {
         current = false
         self.loginEnabled = loginEnabled
         warning = .none
-        apply(
-            statusStrip(spaceCount: spaceCount, focused: focused, paused: false, warning: false, current: false),
-            tooltip: loginNote
-        )
+        pendingSpace = nil
+        renderStrip()
     }
 
-    func updateCurrent(spaceCount: Int, focused: Int, paused: Bool, loginEnabled: Bool = false, warning: ExtraWarning) {
+    func updateCurrent(spaces: [Int], focused: Int, paused: Bool, loginEnabled: Bool = false, warning: ExtraWarning) {
         current = true
-        self.spaceCount = spaceCount
+        self.spaces = spaces.isEmpty ? [1] : spaces
         self.focused = focused
         self.paused = paused
         self.loginEnabled = loginEnabled
         self.warning = warning
-        let tip = [warning.tooltip, loginNote].compactMap { $0 }.joined(separator: "\n")
-        apply(
-            statusStrip(
-                spaceCount: spaceCount,
-                focused: focused,
-                paused: paused,
-                warning: warning != .none,
-                current: true
-            ),
-            tooltip: tip.isEmpty ? nil : tip
+        self.pendingSpace = nil
+        renderStrip()
+    }
+
+    func updateCurrent(spaceCount: Int, focused: Int, paused: Bool, loginEnabled: Bool = false, warning: ExtraWarning) {
+        updateCurrent(
+            spaces: Array(1...max(spaceCount, 1)),
+            focused: focused,
+            paused: paused,
+            loginEnabled: loginEnabled,
+            warning: warning
         )
     }
 
@@ -91,21 +100,30 @@ final class StatusItemController {
     func showPendingSpace(_ n: Int) {
         guard current, n != focused else { return }
         focused = n
-        let tip = [warning.tooltip, loginNote].compactMap { $0 }.joined(separator: "\n")
-        apply(
-            statusStrip(
-                spaceCount: spaceCount,
-                focused: n,
-                paused: paused,
-                warning: warning != .none,
-                current: true
-            ),
-            tooltip: tip.isEmpty ? nil : tip
-        )
+        if !spaces.contains(n) {
+            pendingSpace = n
+        } else {
+            pendingSpace = nil
+        }
+        renderStrip()
     }
 
     func digitClickFrames() -> [(space: Int, rect: CGRect)] {
         stripView?.digitClickFrames() ?? []
+    }
+
+    private func renderStrip() {
+        let tip = [warning.tooltip, loginNote].compactMap { $0 }.joined(separator: "\n")
+        apply(
+            statusStrip(
+                spaces: displayedSpaces,
+                focused: focused,
+                paused: paused,
+                warning: warning != .none,
+                current: current
+            ),
+            tooltip: tip.isEmpty ? nil : tip
+        )
     }
 
     private func apply(_ model: StatusStripModel, tooltip: String?) {
@@ -149,9 +167,8 @@ final class StatusItemController {
 
     private func rebuildMenu() {
         let menu = NSMenu()
-        let count = max(spaceCount, 1)
         if current {
-            for i in 1...count {
+            for i in displayedSpaces {
                 let entry = menuItem(
                     title: "Space \(i)",
                     symbol: "\(i).circle.fill",

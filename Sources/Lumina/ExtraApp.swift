@@ -565,14 +565,14 @@ final class ExtraController: NSObject, @unchecked Sendable {
             }
             // The strip shows at least five workspaces and grows with use;
             // fall back to the configured count for older agents.
-            let spaceCount = st.visibleSpaceCount ?? st.spaceCount ?? 10
+            let spaces = st.visibleSpaces ?? Array(1...(st.visibleSpaceCount ?? st.spaceCount ?? 10))
             let focused = st.space ?? 1
             let paused = st.paused
             let warning = extraWarning(status: st)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.status.updateCurrent(
-                    spaceCount: spaceCount,
+                    spaces: spaces,
                     focused: focused,
                     paused: paused,
                     loginEnabled: self.loginEnabled(),
