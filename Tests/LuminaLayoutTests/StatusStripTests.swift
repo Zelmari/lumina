@@ -98,4 +98,47 @@ struct StatusStripTests {
         #expect(model.segments[0].state == .active)
         #expect(model.segments[0].space == 1)
     }
+
+    @Test func visibleWorkspacesDefaultsToFive() {
+        #expect(visibleWorkspaces(configured: 10, focused: 1, used: []) == [1, 2, 3, 4, 5])
+        #expect(visibleWorkspaces(configured: 10, focused: 3, used: [3]) == [1, 2, 3, 4, 5])
+    }
+
+    @Test func visibleWorkspacesHidesEmptyWorkspacesBeyondFive() {
+        #expect(visibleWorkspaces(configured: 10, focused: 1, used: [7]) == [1, 2, 3, 4, 5, 7])
+        #expect(visibleWorkspaces(configured: 10, focused: 7, used: []) == [1, 2, 3, 4, 5, 7])
+        #expect(visibleWorkspaces(configured: 10, focused: 2, used: [4, 6]) == [1, 2, 3, 4, 5, 6])
+        #expect(visibleWorkspaces(configured: 10, focused: 9, used: [7]) == [1, 2, 3, 4, 5, 7, 9])
+    }
+
+    @Test func visibleWorkspacesNeverExceedsConfigured() {
+        #expect(visibleWorkspaces(configured: 3, focused: 2, used: [3]) == [1, 2, 3])
+        #expect(visibleWorkspaces(configured: 3, focused: 5, used: [7]) == [1, 2, 3])
+        #expect(visibleWorkspaces(configured: 1, focused: 1, used: []) == [1])
+        #expect(visibleWorkspaces(configured: 0, focused: 1, used: []) == [1])
+    }
+
+    @Test func nonContiguousSpacesRendersExactDigitsAndHighlight() {
+        let model = statusStrip(spaces: [1, 2, 3, 4, 5, 7], focused: 7, paused: false, warning: false, current: true)
+        #expect(!model.compact)
+        #expect(model.segments.map(\.label) == ["1", "2", "3", "4", "5", "7"])
+        #expect(model.segments.map(\.space) == [1, 2, 3, 4, 5, 7])
+        #expect(model.segments.map(\.state) == [.idle, .idle, .idle, .idle, .idle, .active])
+        #expect(model.segments.allSatisfy { $0.enabled })
+    }
+
+    @Test func nonContiguousSpacesFocusedInPersistentRange() {
+        let model = statusStrip(spaces: [1, 2, 3, 4, 5, 7], focused: 3, paused: false, warning: false, current: true)
+        #expect(model.segments.map(\.state) == [.idle, .idle, .active, .idle, .idle, .idle])
+    }
+
+    @Test func nonContiguousSpacesPausedDimsAllDigits() {
+        let model = statusStrip(spaces: [1, 2, 3, 4, 5, 7], focused: 7, paused: true, warning: false, current: true)
+        #expect(model.segments.count == 7)
+        #expect(model.segments[0].symbol == "pause.fill")
+        #expect(model.segments[0].state == .paused)
+        #expect(!model.segments[0].enabled)
+        #expect(model.segments.dropFirst().allSatisfy { $0.state == .paused })
+        #expect(model.segments.dropFirst().map(\.space) == [1, 2, 3, 4, 5, 7])
+    }
 }
