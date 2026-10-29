@@ -41,7 +41,7 @@ public struct StatusStripModel: Equatable, Sendable {
 }
 
 public func statusStrip(
-    spaceCount: Int,
+    spaces: [Int],
     focused: Int,
     paused: Bool,
     warning: Bool,
@@ -60,8 +60,17 @@ public func statusStrip(
             compact: false
         )
     }
-    let count = max(spaceCount, 1)
-    let focus = min(max(focused, 1), count)
+    let spaces = spaces.isEmpty ? [1] : spaces
+    let focus: Int
+    if spaces.contains(focused) {
+        focus = focused
+    } else if let first = spaces.first, focused < first {
+        focus = first
+    } else if let last = spaces.last, focused > last {
+        focus = last
+    } else {
+        focus = spaces.min(by: { abs($0 - focused) < abs($1 - focused) }) ?? focused
+    }
     var segments: [StatusSegment] = []
     if warning {
         segments.append(
@@ -84,13 +93,49 @@ public func statusStrip(
         )
     }
     // Every workspace the caller asked for is a digit. The caller passes the
-    // visible count (five minimum, growing with use), so collapsing the
+    // visible spaces (five minimum, growing with use/focus), so collapsing the
     // digits into ellipses would hide exactly the workspaces that are used.
-    for space in 1...count {
+    for space in spaces {
         let state: StatusSegmentState = paused ? .paused : (space == focus ? .active : .idle)
         segments.append(StatusSegment(label: "\(space)", state: state, enabled: true, space: space))
     }
     return StatusStripModel(segments: segments, compact: false)
+}
+
+public func statusStrip(
+    spaceCount: Int,
+    focused: Int,
+    paused: Bool,
+    warning: Bool,
+    current: Bool
+) -> StatusStripModel {
+    let count = max(spaceCount, 1)
+    return statusStrip(
+        spaces: Array(1...count),
+        focused: focused,
+        paused: paused,
+        warning: warning,
+        current: current
+    )
+}
+
+/// Workspaces the menu extra should show: at least persistent `1...minimum`
+/// (up to configured), plus any used workspaces and the focused workspace,
+/// never exceeding configured.
+public func visibleWorkspaces(
+    configured: Int,
+    focused: Int,
+    used: [Int],
+    minimum: Int = 5
+) -> [Int] {
+    let configured = max(configured, 1)
+    let persistentMax = min(max(minimum, 1), configured)
+    var visible = Set(1...persistentMax)
+    visible.insert(min(max(focused, 1), configured))
+    for u in used where u >= 1 && u <= configured {
+        visible.insert(u)
+    }
+    return visible.sorted()
 }
 
 /// Workspaces the menu extra should show: at least `minimum`, one past the
