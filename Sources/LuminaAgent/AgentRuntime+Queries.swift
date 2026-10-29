@@ -167,6 +167,11 @@ extension AgentRuntime {
             focused: session.focusedSpace.raw,
             used: usedIndices
         )
+        let visibleSpaces = visibleWorkspaces(
+            configured: session.spaceCount,
+            focused: session.focusedSpace.raw,
+            used: usedIndices
+        )
         var payload: [String: JSONValue] = [
             "secureInput": .bool(secureInput),
             "axTrusted": .bool(axTrusted),
@@ -177,6 +182,7 @@ extension AgentRuntime {
             "space": .int(session.focusedSpace.raw),
             "spaceCount": .int(session.spaceCount),
             "visibleSpaceCount": .int(visible),
+            "visibleSpaces": .array(visibleSpaces.map { .int($0) }),
             "isCurrent": .bool(isCurrent),
             "lastRefreshMs": lastRefreshSummary.map { .int($0.durationMs) } ?? .null,
             "refreshLatencyMs": refreshLatency.last.map { .double($0) } ?? .null,
