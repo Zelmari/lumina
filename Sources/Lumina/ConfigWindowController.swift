@@ -246,7 +246,7 @@ private struct ConfigEditorView: View {
     private var general: some View {
         Form {
             Stepper("Workspaces: \(store.config.spaceCount)", value: SwiftUI.Binding(get: { store.config.spaceCount }, set: { store.set("space-count", literal: String($0)) }), in: 1...10)
-            Text("Reducing the workspace count moves windows from removed workspaces into the final remaining workspace.")
+            Text("Reducing the workspace count moves windows from removed workspaces into the workspace 1.")
                 .font(.caption).foregroundStyle(.secondary)
             toggle("Focus follows mouse", key: "focus-follows-mouse", value: store.config.focusFollowsMouse)
             toggle("Park new windows before tiling", key: "pre-park-new-windows", value: store.config.preParkNewWindows)
