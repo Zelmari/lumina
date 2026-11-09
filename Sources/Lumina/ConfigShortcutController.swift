@@ -29,7 +29,7 @@ final class ConfigShortcutController: @unchecked Sendable {
             var id = EventHotKeyID()
             GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID), nil,
                               MemoryLayout<EventHotKeyID>.size, nil, &id)
-            guard id.signature == OSType(0x4C554D43), id.id == 1 else { return eventNotHandledErr }
+            guard id.signature == OSType(0x4C554D43), id.id == 1 else { return OSStatus(eventNotHandledErr) }
             Unmanaged<ConfigShortcutController>.fromOpaque(context).takeUnretainedValue().onOpen()
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handler)
