@@ -1,5 +1,6 @@
 #if os(macOS)
 import Foundation
+import AppKit
 import Testing
 import LuminaLayout
 @testable import Lumina
@@ -12,6 +13,22 @@ struct ConfigEditorTests {
         let file = directory.appendingPathComponent("lumina.toml")
         try text.write(to: file, atomically: true, encoding: .utf8)
         return file
+    }
+
+    @Test func configWindowCanBeReopenedWithoutLosingItsInstance() throws {
+        _ = NSApplication.shared
+        let file = try temporaryConfig("space-count = 7\n")
+        defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        let controller = ConfigWindowController(path: file.path, openFile: {})
+        let originalWindow = try #require(controller.window)
+        #expect(originalWindow.title == "Lumina Config")
+        controller.show()
+        #expect(originalWindow.isVisible)
+        originalWindow.close()
+        controller.show()
+        #expect(controller.window === originalWindow)
+        #expect(originalWindow.isVisible)
+        originalWindow.close()
     }
 
     @Test func autosavePreservesCommentsAndPartialDefaults() async throws {
