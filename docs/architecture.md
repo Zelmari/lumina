@@ -38,6 +38,18 @@ The product name is `lumina-agent`. `scripts/bundle.sh` nests it at `Contents/He
 
 SwiftPM target `Lumina`, product `LuminaExtra`. The product cannot be named `Lumina`: on a case-insensitive disk it would collide with the `lumina` CLI. The menu extra draws the workspace strip, starts and stops the agent, and serves the few commands that are not layout commands (`start`, `quit`, `open-config`, `grant-accessibility`, `current-token`, `strip-buttons`).
 
+## Configuration editing
+
+The menu extra owns a single retained `ConfigWindowController`, hosting a SwiftUI form. Menu, CLI `open-config`, and the supervisor's Carbon shortcut all open that window. The shortcut is separate from agents' tiling hotkeys so it remains available while tiling is paused or no agent exists.
+
+`ConfigEditorStore` keeps an on-disk baseline and an editable TOML draft. Valid edits debounce for 300 ms, compare the latest file with the baseline, and replace the file atomically. A changed baseline blocks the write and asks the user to reload after preserving their draft. An 800 ms poll imports external changes into a clean editor. This first version treats any external document edit during a dirty draft as a conflict, including changes to unrelated fields.
+
+`LuminaLayout.ConfigDocument` changes supported bare keys without re-encoding untouched text. It preserves comments outside the edited value and unknown settings. Unsupported quoted/dotted spellings of edited fields require the advanced TOML editor. Startup and reload resolve omitted values from bundled defaults, while invalid reloads retain the last good runtime config.
+
+Agents already watch both the file and parent directory and reload after 50 ms. The editor reports saving separately from agent error status; those status snapshots do not acknowledge a particular saved revision. Startup options do not rerun the startup pipeline on reload. Lumina's own bundled windows are excluded from window management.
+
+The macOS-only `LuminaExtraTests` suite exercises editor persistence and conflict behaviour with temporary files; CI runs it alongside the shared suites.
+
 ## What CI does not run
 
 Linux CI runs the layout and IPC tests. A macOS job compiles `lumina`, `lumina-agent`, and `LuminaExtra` and runs the same tests. Neither job runs `scripts/harness.sh`. The harness needs a logged-in session, Accessibility, and Automation permission.
