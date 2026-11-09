@@ -67,7 +67,7 @@ final class ConfigShortcutController: @unchecked Sendable {
             registeredChord = chord
             report(nil)
         } catch {
-            report("Config shortcut unchanged: \(error.localizedDescription)")
+            report("Config shortcut unchanged: \(error)")
         }
     }
 
