@@ -32,7 +32,7 @@ public enum CLIArgs {
     pause | resume               stop / resume managing windows
     start                        start Lumina on this Space
     quit | exit | quit-all       quit Lumina and untile every window
-    open-config                  open the config file
+    open-config                  open the configuration window
     grant-accessibility          re-show the Accessibility grant prompt
                                  (reset TCC first to get the prompt again)
     current-token                print this Space's instance id as JSON

@@ -181,7 +181,7 @@ final class StatusItemController {
             }
             menu.addItem(.separator())
         }
-        menu.addItem(menuItem(title: "Open Config", symbol: "gearshape", action: #selector(openConfig)))
+        menu.addItem(menuItem(title: "Config…", symbol: "gearshape", action: #selector(openConfig)))
         menu.addItem(
             menuItem(
                 title: "Grant Accessibility…",

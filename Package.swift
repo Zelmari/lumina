@@ -42,6 +42,7 @@ let appleTargets: [Target] = [
         dependencies: ["LuminaLayout", "LuminaIPC"],
         exclude: ["Info.plist", "LuminaAgent.entitlements"]
     ),
+    .testTarget(name: "LuminaExtraTests", dependencies: ["Lumina", "LuminaLayout"]),
     .executableTarget(
         name: "Lumina",
         dependencies: ["LuminaIPC", "LuminaLayout"],

@@ -117,6 +117,7 @@ public struct Binding: Equatable, Sendable {
 public struct Config: Equatable, Sendable {
     public var spaceCount: Int
     public var focusFollowsMouse: Bool
+    public var configShortcut: String
     public var launchTiling: LaunchTiling
     public var launchApps: [String]
     public var gaps: Gaps
@@ -141,6 +142,7 @@ public struct Config: Equatable, Sendable {
     public init(
         spaceCount: Int = 5,
         focusFollowsMouse: Bool = false,
+        configShortcut: String = "ctrl-alt-space",
         launchTiling: LaunchTiling = .zOrder,
         launchApps: [String] = [],
         gaps: Gaps = .default,
@@ -155,6 +157,7 @@ public struct Config: Equatable, Sendable {
     ) {
         self.spaceCount = spaceCount
         self.focusFollowsMouse = focusFollowsMouse
+        self.configShortcut = configShortcut
         self.launchTiling = launchTiling
         self.launchApps = launchApps
         self.gaps = gaps
@@ -236,6 +239,7 @@ public func parseChord(_ raw: String) -> Chord? {
 private struct RawConfig: Decodable {
     var spaceCount: Int?
     var focusFollowsMouse: Bool?
+    var configShortcut: String?
     var launchTiling: String?
     var launchApps: [String]?
     var gaps: RawGaps?
@@ -249,6 +253,7 @@ private struct RawConfig: Decodable {
     enum CodingKeys: String, CodingKey {
         case spaceCount = "space-count"
         case focusFollowsMouse = "focus-follows-mouse"
+        case configShortcut = "config-shortcut"
         case launchTiling = "launch-tiling"
         case launchApps = "launch-apps"
         case gaps
@@ -285,6 +290,7 @@ private struct RawWindowRule: Decodable {
 public let knownTopLevelKeys: Set<String> = [
     "space-count",
     "focus-follows-mouse",
+    "config-shortcut",
     "launch-tiling",
     "launch-apps",
     "gaps",
@@ -388,6 +394,14 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
         bindings = base.bindings
     }
 
+    let configShortcut = raw.configShortcut ?? base.configShortcut
+    guard let shortcut = parseChord(configShortcut) else {
+        return .failure(ConfigError("config-shortcut must be a supported key with alt, cmd, or ctrl"))
+    }
+    guard !bindings.contains(where: { $0.chord == shortcut }) else {
+        return .failure(ConfigError("config-shortcut conflicts with a window command binding"))
+    }
+
     var rules: [WindowRule] = []
     if let rawRules = raw.windowRule {
         for rule in rawRules {
@@ -422,6 +436,7 @@ public func parseConfig(text: String, defaults: Config? = nil) -> Result<Config,
         Config(
             spaceCount: spaceCount,
             focusFollowsMouse: ffm,
+            configShortcut: configShortcut,
             launchTiling: launch,
             launchApps: raw.launchApps ?? base.launchApps,
             gaps: Gaps(inner: inner, outer: outer),
@@ -456,7 +471,7 @@ public func loadOrDefault(text: String?, bundledDefault: String = Config.bundled
 }
 
 public func applyReload(current: Config, newText: String) -> (config: Config, error: String?) {
-    switch parseConfig(text: newText, defaults: current) {
+    switch parseConfig(text: newText, defaults: Config.bundledDefault) {
     case .success(let c):
         return (c, nil)
     case .failure(let e):
@@ -600,6 +615,7 @@ extension Config {
     public static let bundledDefaultTOML: String = """
     space-count = 10
     focus-follows-mouse = false
+    config-shortcut = "ctrl-alt-space"
     # Park a new window in the stash corner until its tile lands, so the app's
     # own default frame is not visible.
     pre-park-new-windows = true

@@ -30,7 +30,11 @@ v1 manages **one display**. See [docs/install.md](docs/install.md) to build and 
 
 ## Configuration
 
-Config lives at `~/.config/lumina/lumina.toml`. It hot-reloads on save, including in-place writes; `lumina reload` reports parse errors.
+Right-click the menu extra and choose **Config…**, press **⌃⌥Space**, or run `lumina open-config` to open the configuration window. It works while tiling is paused or no agent is running. General and application controls edit the same file as the advanced TOML editor; **Open Config File…** opens it in a text editor.
+
+Config lives at `~/.config/lumina/lumina.toml`. Valid GUI edits save automatically after 300 ms, using an atomic replacement. Invalid input stays in the window without overwriting the file. Form edits preserve untouched comments and unknown settings; unusual TOML spellings can be edited in the advanced editor. **Reset Form Defaults** restores general and application settings while preserving custom bindings, rules, comments and unknown settings. External file changes refresh a clean window. If there are unsaved edits, saving stops and **Reload File** lets you discard the draft after copying anything you want to keep.
+
+Agents hot-reload saves, including in-place writes; `lumina reload` reports parse errors. The window reports file-save state separately from agent config errors. Startup options take effect on the next relevant launch. Reducing workspace count moves windows from removed workspaces into workspace 1.
 
 A partial file **merges onto the shipped defaults**: omit a key and its default stays. Invalid values (`space-count` out of range, bad `gaps` or `launch-tiling`) reject the file and keep the last good config. An unknown chord or command skips just that binding, with a diagnostic you can read in `lumina status`.
 
@@ -38,6 +42,7 @@ A partial file **merges onto the shipped defaults**: omit a key and its default 
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
+| `config-shortcut` | chord string | `"ctrl-alt-space"` | Global shortcut to open Config; must differ from window-management bindings. |
 | `space-count` | 1–10 | `10` | Workspaces. The menu strip always shows at least 5 and grows with use. |
 | `focus-follows-mouse` | bool | `false` | Focus the tile under the pointer. |
 | `launch-tiling` | `z-order`, `float-existing`, `new-only` | `z-order` | What happens to windows already open when Lumina starts. |
@@ -121,7 +126,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 | `pause` / `resume` | Stop / resume managing windows |
 | `start` | Start Lumina on this Space |
 | `quit` / `exit` | Quit Lumina and untile every window |
-| `open-config` | Open the config file |
+| `open-config` | Open the configuration window |
 | `grant-accessibility` | Re-show the Accessibility prompt (after `tccutil reset`) |
 | `current-token` | Print this Space's instance id as JSON |
 | `strip-buttons` | Print menu-extra digit frames as JSON (screen points, top-left) |
@@ -133,7 +138,7 @@ Native tabs (Terminal, Ghostty): macOS implements each tab as a separate window.
 
 - The workspace strip shows digits 1…N, where N is `max(5, highest used workspace)` capped at `space-count`. Click a digit to switch.
 - The strip updates immediately: a click highlights the digit on the spot, and the agent pushes every workspace/pause/current change over a subscription (with a 250ms–3s adaptive poll as a safety net).
-- The menu has Open Config, Grant Accessibility…, Reload, Pause/Resume, Start on this Space, Launch at Login, Quit this Space, and Quit all.
+- The menu has Config…, Grant Accessibility…, Reload, Pause/Resume, Start on this Space, Launch at Login, Quit this Space, and Quit all.
 - Warnings (Secure Input blocking hotkeys, Accessibility denied, invalid config, hotkey conflict) appear in the strip and its tooltip.
 
 ## Automation

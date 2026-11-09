@@ -37,6 +37,9 @@ final class ExtraController: NSObject, @unchecked Sendable {
     let spawner = AgentSpawner()
     var menuServer: MenuSocketServer?
     var firstRun: FirstRunController?
+    private var configWindow: ConfigWindowController?
+    private var configShortcut: ConfigShortcutController?
+    private var configRuntimeStatus = "No agents running. Settings will apply when Lumina starts."
     var launchAtLoginWanted = false
     let supportRoot: String
     let uid: uid_t
@@ -78,6 +81,13 @@ final class ExtraController: NSObject, @unchecked Sendable {
     func start() {
         log.info("menu extra start")
         writeDefaultConfigIfNeeded()
+        let configPath = LuminaPaths.configPath(home: FileManager.default.homeDirectoryForCurrentUser.path)
+        let shortcut = ConfigShortcutController(path: configPath) { [weak self] in self?.openConfig() }
+        shortcut.onError = { [weak self] error in
+            MainActor.assumeIsolated { self?.configWindow?.updateShortcutError(error) }
+        }
+        configShortcut = shortcut
+        shortcut.start()
         status.onDigit = { [weak self] n in self?.selectSpace(n) }
         status.onOpenConfig = { [weak self] in self?.openConfig() }
         status.onGrantAccessibility = { [weak self] in self?.grantAccessibility() }
@@ -548,6 +558,19 @@ final class ExtraController: NSObject, @unchecked Sendable {
     /// persist it, and update the strip.
     func applyStatuses(_ statuses: [(InstanceRecord, AgentStatus)], yieldLosers: Bool) {
         let reg = registry.load()
+        let errors = statuses.compactMap { pair in
+            pair.1.configError.map { "Agent \(pair.0.instanceId.uuidString.prefix(8)): \($0)" }
+        }
+        let configSummary = statuses.isEmpty
+            ? "No agents reporting. Saved settings apply when an agent starts."
+            : errors.isEmpty
+                ? "\(statuses.count) agent(s) reporting no config errors. File changes reload automatically."
+                : errors.joined(separator: " · ")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.configRuntimeStatus = configSummary
+            MainActor.assumeIsolated { self.configWindow?.updateRuntimeStatus(configSummary) }
+        }
         let claimants = statuses.filter { $0.1.isCurrent }
         let winnerId = pickCurrentAgent(claimants: claimants.map(\.0.instanceId), lastCurrent: reg.lastCurrentInstanceId)
         if let winnerId, let pair = claimants.first(where: { $0.0.instanceId == winnerId }) {
@@ -661,6 +684,18 @@ final class ExtraController: NSObject, @unchecked Sendable {
     }
 
     func openConfig() {
+        MainActor.assumeIsolated {
+            if configWindow == nil {
+                let path = LuminaPaths.configPath(home: FileManager.default.homeDirectoryForCurrentUser.path)
+                configWindow = ConfigWindowController(path: path) { [weak self] in self?.openConfigFile() }
+            }
+            configWindow?.updateRuntimeStatus(configRuntimeStatus)
+            configWindow?.updateShortcutError(configShortcut?.error)
+            configWindow?.show()
+        }
+    }
+
+    func openConfigFile() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let path = LuminaPaths.configPath(home: home)
         // Never wait on `open` from the main thread: a cold TextEdit launch

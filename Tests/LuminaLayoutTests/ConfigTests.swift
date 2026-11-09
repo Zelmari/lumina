@@ -343,13 +343,37 @@ struct ConfigTests {
         #expect(config.spaceCount == 10)
     }
 
-    @Test func applyReloadBlankTextKeepsCurrent() throws {
+    @Test func applyReloadBlankTextResetsToBundledDefaults() throws {
         var current = try parseConfig(text: Config.bundledDefaultTOML).get()
         current.spaceCount = 7
         let (config, error) = applyReload(current: current, newText: "   \n\n")
         #expect(error == nil)
-        #expect(config.spaceCount == 7)
-        #expect(config == current)
+        #expect(config == Config.bundledDefault)
+    }
+
+    @Test func configShortcutDefaultsAndParses() throws {
+        #expect(Config.bundledDefault.configShortcut == "ctrl-alt-space")
+        let custom = try parseConfig(text: "config-shortcut = \"cmd-space\"").get()
+        #expect(custom.configShortcut == "cmd-space")
+        #expect(parseConfig(text: "config-shortcut = \"space\"").isFail)
+        #expect(parseConfig(text: "config-shortcut = \"shift-space\"").isFail)
+        #expect(parseConfig(text: "config-shortcut = \"alt-unknown\"").isFail)
+    }
+
+    @Test func configShortcutRejectsBindingConflict() {
+        let (_, error) = loadOrDefault(text: "config-shortcut = \"alt-h\"")
+        #expect(error?.contains("conflicts") == true)
+    }
+
+    @Test func reloadOmittedFieldsResetToBundledDefaults() {
+        var current = Config.bundledDefault
+        current.focusFollowsMouse = true
+        current.gaps.inner = 24
+        let (config, error) = applyReload(current: current, newText: "space-count = 3")
+        #expect(error == nil)
+        #expect(config.spaceCount == 3)
+        #expect(config.focusFollowsMouse == Config.bundledDefault.focusFollowsMouse)
+        #expect(config.gaps == Config.bundledDefault.gaps)
     }
 
     @Test func keycodesMatchDesignTable() {

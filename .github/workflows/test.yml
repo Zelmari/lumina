@@ -66,3 +66,4 @@ jobs:
           swift build -c release --product lumina --product lumina-agent --product LuminaExtra
           swift test --filter LuminaLayoutTests
           swift test --filter LuminaIPCTests
+          swift test --filter LuminaExtraTests
