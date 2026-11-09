@@ -145,7 +145,7 @@ final class ConfigEditorStore: ObservableObject {
 
     func editApps(_ key: String, table: String? = nil, text: String) {
         let apps = text.split(whereSeparator: { $0.isNewline }).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-        let literal = "[" + apps.map(ConfigDocument.quote).joined(separator: ", ") + "]"
+        let literal = "[" + apps.map { ConfigDocument.quote($0) }.joined(separator: ", ") + "]"
         set(key, table: table, literal: literal)
         // Preserve the user's in-progress trailing newline while typing.
         if table == "native-tabs" { nativeTabs = text }
@@ -197,7 +197,7 @@ private struct ConfigEditorView: View {
                 VStack(alignment: .leading) {
                     Text("Edit bindings, window rules, and advanced options here. Valid changes save automatically; comments and unknown keys remain in the file.")
                         .font(.callout).foregroundStyle(.secondary)
-                    TextEditor(text: SwiftUI.Binding(get: { store.draft }, set: store.editRaw))
+                    TextEditor(text: SwiftUI.Binding(get: { store.draft }, set: { store.editRaw($0) }))
                         .font(.system(.body, design: .monospaced))
                         .border(Color.secondary.opacity(0.3))
                 }.padding().tabItem { Text("Advanced TOML") }
@@ -208,7 +208,7 @@ private struct ConfigEditorView: View {
                 HStack {
                     Text("Reload the file to discard unsaved edits, or copy your TOML first.").font(.callout)
                     Spacer()
-                    Button("Reload File", action: store.reloadFromDisk)
+                    Button("Reload File", action: { store.reloadFromDisk() })
                 }
             }
             HStack {
@@ -217,7 +217,7 @@ private struct ConfigEditorView: View {
                     Text(store.runtimeStatus).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Restore Defaults", action: store.restoreDefaults)
+                Button("Restore Defaults", action: { store.restoreDefaults() })
                 Button("Open Config File…", action: openFile)
             }
             Text(store.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
@@ -239,7 +239,7 @@ private struct ConfigEditorView: View {
             }
             Stepper("Inner gap: \(store.config.gaps.inner)", value: SwiftUI.Binding(get: { Int(store.config.gaps.inner) }, set: { store.set("inner", table: "gaps", literal: String($0)) }), in: 0...128)
             Stepper("Outer gap: \(store.config.gaps.outer)", value: SwiftUI.Binding(get: { Int(store.config.gaps.outer) }, set: { store.set("outer", table: "gaps", literal: String($0)) }), in: 0...128)
-            TextField("Open Config shortcut", text: SwiftUI.Binding(get: { store.shortcut }, set: store.editShortcut))
+            TextField("Open Config shortcut", text: SwiftUI.Binding(get: { store.shortcut }, set: { store.editShortcut($0) }))
             Text("Use chord names such as ctrl-alt-space. Changes save after 300 ms. Layout and binding changes reload automatically; launch options affect the next launch.")
                 .font(.caption).foregroundStyle(.secondary)
         }.formStyle(.grouped)
