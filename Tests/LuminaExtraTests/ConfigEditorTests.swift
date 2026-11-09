@@ -15,6 +15,15 @@ struct ConfigEditorTests {
         return file
     }
 
+    private func waitForSave(_ store: ConfigEditorStore) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !store.status.hasPrefix("Saved to file"), ContinuousClock.now < deadline {
+            if store.error != nil || store.conflict { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        try #require(store.status.hasPrefix("Saved to file"))
+    }
+
     @Test func configWindowCanBeReopenedWithoutLosingItsInstance() throws {
         _ = NSApplication.shared
         let file = try temporaryConfig("space-count = 7\n")
@@ -38,7 +47,7 @@ struct ConfigEditorTests {
         #expect(store.config.nativeTabs == Config.bundledDefault.nativeTabs)
         #expect(store.config.bindings == Config.bundledDefault.bindings)
         store.set("inner", table: "gaps", literal: "24")
-        try await Task.sleep(for: .milliseconds(600))
+        try await waitForSave(store)
         let saved = try String(contentsOf: file, encoding: .utf8)
         #expect(saved.contains("# Keep this comment"))
         let config = try parseConfig(text: saved, defaults: .bundledDefault).get()
@@ -100,7 +109,7 @@ struct ConfigEditorTests {
         defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
         let store = ConfigEditorStore(path: file.path)
         store.restoreDefaults()
-        try await Task.sleep(for: .milliseconds(600))
+        try await waitForSave(store)
         let saved = try String(contentsOf: file, encoding: .utf8)
         #expect(store.error == nil)
         #expect(saved.contains("# My settings"))
