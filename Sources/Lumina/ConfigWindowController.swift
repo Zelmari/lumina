@@ -121,7 +121,25 @@ final class ConfigEditorStore: ObservableObject {
     }
 
     func restoreDefaults() {
-        editRaw(Config.bundledDefaultTOML)
+        // Reset only the fields exposed by the form, preserving custom rules,
+        // bindings, comments, and settings unknown to this version.
+        let defaults = ConfigDocument(text: Config.bundledDefaultTOML)
+        let fields = [
+            ConfigField("space-count"), ConfigField("focus-follows-mouse"),
+            ConfigField("pre-park-new-windows"), ConfigField("speculative-tile"),
+            ConfigField("launch-tiling"), ConfigField("launch-apps"),
+            ConfigField("hide-until-tiled-apps"), ConfigField("config-shortcut"),
+            ConfigField("inner", table: "gaps"), ConfigField("outer", table: "gaps"),
+            ConfigField("apps", table: "native-tabs"),
+        ]
+        do {
+            var reset = draft
+            for field in fields {
+                guard let literal = try defaults.value(for: field) else { continue }
+                reset = try ConfigDocument(text: reset).setting(literal, for: field)
+            }
+            editRaw(reset)
+        } catch { self.error = String(describing: error) }
     }
 
     func editRaw(_ text: String) {
@@ -217,7 +235,8 @@ private struct ConfigEditorView: View {
                     Text(store.runtimeStatus).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Restore Defaults", action: { store.restoreDefaults() })
+                Button("Reset Form Defaults", action: { store.restoreDefaults() })
+                    .help("Reset general and application settings to shipped defaults.")
                 Button("Open Config File…", action: openFile)
             }
             Text(store.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)

@@ -85,6 +85,33 @@ struct ConfigEditorTests {
         #expect(store.config.spaceCount == 9)
     }
 
+    @Test func formResetPreservesRulesBindingsAndUnknownSettings() async throws {
+        let original = """
+        # My settings
+        space-count = 3
+        custom-setting = 'keep'
+        [bindings]
+        alt-h = "focus right"
+        [[window-rule]]
+        app-id = "com.example.test"
+        action = "float"
+        """
+        let file = try temporaryConfig(original)
+        defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        let store = ConfigEditorStore(path: file.path)
+        store.restoreDefaults()
+        try await Task.sleep(for: .milliseconds(600))
+        let saved = try String(contentsOf: file, encoding: .utf8)
+        #expect(store.error == nil)
+        #expect(saved.contains("# My settings"))
+        #expect(saved.contains("custom-setting = 'keep'"))
+        let config = try parseConfig(text: saved, defaults: .bundledDefault).get()
+        #expect(config.spaceCount == Config.bundledDefault.spaceCount)
+        #expect(config.bindings.count == 1)
+        #expect(config.bindings.first?.command == .focus(.right))
+        #expect(config.windowRules.first?.appId == "com.example.test")
+    }
+
     @Test func externalEditRefreshesCleanForm() throws {
         let file = try temporaryConfig("space-count = 7\n")
         defer { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
