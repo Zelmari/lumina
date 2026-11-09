@@ -105,6 +105,11 @@ final class ConfigEditorStore: ObservableObject {
     private func validateAndHydrate() {
         switch parseConfig(text: draft, defaults: .bundledDefault) {
         case .success(let parsed):
+            let rejected = parsed.diagnostics.filter { !$0.hasPrefix("unknown key:") }
+            guard rejected.isEmpty else {
+                error = rejected.joined(separator: "\n")
+                return
+            }
             config = parsed
             shortcut = parsed.configShortcut
             launchApps = parsed.launchApps.joined(separator: "\n")
@@ -113,6 +118,10 @@ final class ConfigEditorStore: ObservableObject {
             error = nil
         case .failure(let failure): error = failure.description
         }
+    }
+
+    func restoreDefaults() {
+        editRaw(Config.bundledDefaultTOML)
     }
 
     func editRaw(_ text: String) {
@@ -208,6 +217,7 @@ private struct ConfigEditorView: View {
                     Text(store.runtimeStatus).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Restore Defaults", action: store.restoreDefaults)
                 Button("Open Config File…", action: openFile)
             }
             Text(store.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
@@ -217,6 +227,8 @@ private struct ConfigEditorView: View {
     private var general: some View {
         Form {
             Stepper("Workspaces: \(store.config.spaceCount)", value: SwiftUI.Binding(get: { store.config.spaceCount }, set: { store.set("space-count", literal: String($0)) }), in: 1...10)
+            Text("Reducing the workspace count moves windows from removed workspaces into the final remaining workspace.")
+                .font(.caption).foregroundStyle(.secondary)
             toggle("Focus follows mouse", key: "focus-follows-mouse", value: store.config.focusFollowsMouse)
             toggle("Park new windows before tiling", key: "pre-park-new-windows", value: store.config.preParkNewWindows)
             toggle("Predict new window tiles", key: "speculative-tile", value: store.config.speculativeTile)
