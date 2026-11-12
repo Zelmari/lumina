@@ -4,7 +4,18 @@ Apple silicon, macOS 15.2 or later. Do not run another tiling WM. Turn Stage Man
 
 ## Homebrew
 
-Not yet. Shipping path is a personal tap after Developer ID + notarization. Official `homebrew/cask` comes later (Gatekeeper requires a signed + notarized binary; a quarantine-strip `postflight` will not be accepted).
+The personal tap is `Zelmari/tap`. Once the first release and cask are published:
+
+```sh
+brew tap Zelmari/tap
+brew install --cask Zelmari/tap/lumina
+```
+
+The cask installs Lumina.app into Applications and links the CLI. Open Lumina from Applications or Spotlight. It runs in the menu bar without a Dock icon.
+
+These builds are ad-hoc signed, not notarized. If macOS blocks launch, review System Settings → Privacy & Security → Open Anyway. Grant Accessibility to **Lumina Agent** when prompted. No Apple Developer membership is needed for this personal tap.
+
+For a direct install, download the app ZIP from [GitHub Releases](https://github.com/Zelmari/lumina/releases), extract it, and move Lumina.app into Applications. Quit all before upgrading. See [releasing.md](releasing.md) for the maintainer workflow.
 
 ## From source
 

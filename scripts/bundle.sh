@@ -38,6 +38,12 @@ if cmp -s "${MACOS}/LuminaExtra" "${MACOS}/lumina"; then
 fi
 cp "${ROOT}/Sources/Lumina/Info.plist" "${CONTENTS}/Info.plist"
 cp "${ROOT}/Sources/LuminaAgent/Info.plist" "${HELPER}/Contents/Info.plist"
+if [[ -n "${LUMINA_VERSION:-}" ]]; then
+  for plist in "${CONTENTS}/Info.plist" "${HELPER}/Contents/Info.plist"; do
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${LUMINA_VERSION}" "$plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${LUMINA_BUILD_NUMBER:-1}" "$plist"
+  done
+fi
 cp "${ROOT}/Sources/Lumina/Resources/lumina.toml" "${RES}/lumina.toml"
 python3 "${ROOT}/scripts/make-agent-icon.py" "${HELPER_RES}/AppIcon.icns"
 

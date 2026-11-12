@@ -14,7 +14,11 @@ enum LuminaCLI {
         if let early = CLIArgs.earlyExit(argv) {
             switch early {
             case .version:
-                writeOut("lumina 0.1.0")
+                let appURL = URL(fileURLWithPath: CommandLine.arguments[0])
+                    .resolvingSymlinksInPath().deletingLastPathComponent()
+                    .deletingLastPathComponent().deletingLastPathComponent()
+                let version = Bundle(url: appURL)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+                writeOut("lumina \(version ?? "0.1.0")")
             case .help:
                 writeOut(CLIArgs.usage)
             case .debug:

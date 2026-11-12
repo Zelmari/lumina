@@ -15,6 +15,8 @@ swift test --filter LuminaLayoutTests
 swift test --filter LuminaIPCTests
 ```
 
+Release packaging and the personal Homebrew tap workflow are documented in [docs/releasing.md](docs/releasing.md).
+
 On a Mac, `./scripts/bundle.sh` builds an ad-hoc-signed `dist/Lumina.app`. Grant Accessibility to **Lumina Agent**.
 
 ## Requirements
